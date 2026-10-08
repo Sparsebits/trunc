@@ -181,3 +181,112 @@ fn killed_consume_resumes() {
         );
     }
 }
+
+fn write_zip(path: &Path, seed: u64) -> Vec<(String, Vec<u8>)> {
+    use trunc_testkit::zipbuild::{Spec, ZipBuilder};
+    let mut rng = trunc_testkit::Rng::new(seed);
+    let files = vec![
+        (
+            "pkg/readme.txt".to_string(),
+            fixtures::text_bytes(&mut rng, 20_000),
+        ),
+        (
+            "pkg/data/big.txt".to_string(),
+            fixtures::text_bytes(&mut rng, 3 << 20),
+        ),
+        (
+            "pkg/data/noise.bin".to_string(),
+            fixtures::noise_bytes(&mut rng, 500_000),
+        ),
+        ("top.txt".to_string(), b"top level".to_vec()),
+    ];
+    let mut b = ZipBuilder::new();
+    for (n, d) in &files {
+        b.add(Spec::file(n, d));
+    }
+    std::fs::write(path, b.build()).unwrap();
+    files
+}
+
+fn assert_files(root: &Path, files: &[(String, Vec<u8>)]) {
+    for (n, d) in files {
+        assert_eq!(&std::fs::read(root.join(n)).unwrap(), d, "{n}");
+    }
+}
+
+#[test]
+fn zip_inspect_verify_plan_extract_consume() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let files = write_zip(&w.join("a.zip"), 1);
+
+    let s = ok(&trunc(&["inspect", "a.zip", "--entries"], w));
+    assert!(s.contains("(ZIP)") && s.contains("pkg/data/big.txt"), "{s}");
+    assert!(ok(&trunc(&["verify", "a.zip"], w)).starts_with("ok:"));
+    let s = ok(&trunc(&["plan", "a.zip", "-C", "out"], w));
+    assert!(s.contains("consume (--consume)"), "{s}");
+
+    ok(&trunc(&["x", "a.zip", "-C", "copy"], w));
+    assert_files(&w.join("copy"), &files);
+    assert!(w.join("a.zip").exists());
+
+    let s = ok(&trunc(
+        &["x", "a.zip", "-C", "out", "--consume", "--yes"],
+        w,
+    ));
+    assert!(s.contains("consumed and removed"), "{s}");
+    assert_files(&w.join("out"), &files);
+    assert!(!w.join("a.zip").exists() && !w.join("a.zip.trncj").exists());
+}
+
+/// Kill a punch-mode ZIP consume at arbitrary points; `trunc resume` (finding the destination
+/// in the journal) must finish with identical files.
+#[test]
+fn killed_zip_consume_resumes() {
+    for (round, delay_ms) in [10u64, 60, 150, 400].into_iter().enumerate() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        let files = write_zip(&w.join("a.zip"), 10 + round as u64);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trunc"))
+            .args([
+                "x",
+                "a.zip",
+                "-C",
+                "out",
+                "--consume",
+                "--yes",
+                "--punch-min",
+                "1",
+                "--checkpoint-every",
+                "64K",
+            ])
+            .current_dir(w)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+        let punch = ["--yes", "--punch-min", "1", "--checkpoint-every", "64K"];
+        if w.join("a.zip.trncj").exists() {
+            // Resume without -C: the destination comes from the journal.
+            ok(&trunc(&[&["resume", "a.zip"][..], &punch].concat(), w));
+        } else if w.join("a.zip").exists() {
+            // Killed before anything was recorded or destroyed: just run the command again.
+            ok(&trunc(
+                &[&["x", "a.zip", "-C", "out", "--consume"][..], &punch].concat(),
+                w,
+            ));
+        }
+        assert_files(&w.join("out"), &files);
+        assert!(
+            !w.join("a.zip").exists(),
+            "round {round}: archive left behind"
+        );
+        assert!(
+            !w.join("a.zip.trncj").exists(),
+            "round {round}: journal left behind"
+        );
+    }
+}

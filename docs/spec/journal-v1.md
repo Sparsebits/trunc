@@ -1,42 +1,26 @@
 # Journal format, version 1 (`<archive>.trncj`)
 
-Status: **draft**, implemented in plan phase 4.2. Only legacy ZIP consumption uses it, recording every state transition. Native-format consumption needs no journal (ADR-0007).
+Status: implemented in `trunc-journal`. Used only by legacy ZIP consumption (ADR-0008). Native `.trnc` consumption needs no journal (ADR-0007).
 
-## Layout
+The journal holds one immutable **preamble** and a **latest checkpoint**. An append-only log was considered (the earlier draft) and rejected: punch mode writes a ~33 KiB checkpoint every 64 MiB of output, so a log would grow without bound on large entries.
+
+## Layout (little-endian)
 
 ```text
-[SUPERBLOCK A 4096][SUPERBLOCK B 4096][RECORD][RECORD]...
+HEADER 64     magic "TRNCJ\0\x01\0" | version u16 | slot_cap u32 | preamble_len u64 |
+              preamble_blake3 [32] | reserved [6] | crc32c u32 over bytes 0..60
+PREAMBLE      preamble_len bytes
+SLOT A        generation u64 | len u32 | crc32c u32 (over generation, len, payload) | payload [slot_cap]
+SLOT B        same
 ```
 
-Superblock: `magic "TRNCJSB\0"` | `generation u64` | `log_committed_len u64` | `last_seq u64` | `archive_identity [32]` | zero padding | `crc32c u32` (final 4 bytes, over the preceding 4092).
+## Protocol
 
-Record: `len u32` (length of the payload) | `seq u64` | `type u16` | `payload (CBOR, len bytes)` | `crc32c u32` (over len, seq, type and payload).
+- **Create:** write the whole file to `<path>.tmp`, flush it, rename it to `<path>`, flush the directory. A crash during creation never leaves a partial journal at `<path>`. A leftover `.tmp` is discarded on the next start.
+- **Write:** put the next generation into the slot holding the older one, then flush. A torn write damages only that slot.
+- **Open:** check the header CRC and the preamble's BLAKE3; the valid slot with the highest generation is the latest checkpoint. Generation 0 means empty.
 
-## Commit protocol
+## Contents for ZIP consumption
 
-1. Append records to the log.
-2. Flush the log file's data.
-3. Write the superblock with the *lower* generation, now holding `generation = max + 1` and the new `log_committed_len`.
-4. Flush again.
-
-## Open protocol
-
-1. Read both superblocks. Use the one with the highest generation whose CRC is valid.
-2. Replay records up to `log_committed_len`. Each record's CRC and `seq` (strictly increasing by 1) are checked.
-3. Ignore anything after `log_committed_len`. It is a torn tail from an uncommitted append.
-4. Compare `archive_identity` (BLAKE3 of: archive file ID, archive size at BEGIN, manifest or central-directory hash) with the file on disk. Refuse on mismatch, because the archive was replaced.
-
-## Record types
-
-| Type | Name | Payload |
-|---|---|---|
-| 1 | BEGIN | archive file ID, size, manifest/CD hash, mode, destination, staging dir |
-| 2 | CD_COPY | legacy: raw central directory bytes, so the archive tail can be freed |
-| 3 | ENTRY | entry id, state (`Started`, `Done`) |
-| 4 | CKPT | legacy: entry id, inflate checkpoint, output offset, CRC state |
-| 5 | RELEASE | byte range of the archive released (truncated or punched) |
-| 6 | PAUSED | reason (`NoSpace { needed }`, `Mapped`) |
-| 7 | RENAME_BEGIN | list of top-level staging entries and their targets |
-| 8 | RENAME_ITEM | index of an item renamed |
-| 9 | RENAME_DONE | — |
-| 10 | END | — |
+- **Preamble:** `"TZJP1"` | archive id [16] | original length u64 | file id (volume u64, file u128) | destination (u32 length + UTF-8) | serialized ZIP layout.
+- **Slot:** entry index u32 | inflate checkpoint (bit position u64, output total u64, CRC u32, window length u32, window).

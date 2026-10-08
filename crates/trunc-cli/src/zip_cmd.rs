@@ -1,0 +1,193 @@
+//! ZIP support for `x`, `inspect`, `verify` and `plan`.
+
+use std::path::Path;
+use std::process::ExitCode;
+use std::time::Instant;
+
+use anyhow::Result;
+use trunc_core::space::SpaceParams;
+use trunc_engine::consume::ConsumeOptions;
+use trunc_engine::preflight::{self, Severity};
+use trunc_engine::zipconsume::{self, PunchPolicy, ZipOptions};
+use trunc_fs::{FsBackend, OsFs};
+use trunc_legacy::zip::{Kind, Method};
+
+use crate::fmt::bytes;
+
+pub fn extract(archive: &Path, dest: &Path, overwrite: bool) -> Result<ExitCode> {
+    let t = Instant::now();
+    let s = zipconsume::extract_zip(&OsFs::new(), archive, dest, overwrite)?;
+    println!(
+        "extracted {} files, {} directories, {} into {}",
+        s.files,
+        s.dirs,
+        bytes(s.bytes_written),
+        dest.display()
+    );
+    if s.symlinks_skipped > 0 {
+        println!("symlinks  {} skipped", s.symlinks_skipped);
+    }
+    println!("time      {:.2}s", t.elapsed().as_secs_f64());
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn verify(archive: &Path) -> Result<ExitCode> {
+    let t = Instant::now();
+    let (entries, total) = zipconsume::verify_zip(&OsFs::new(), archive)?;
+    println!(
+        "ok: {entries} entries, {} CRC-checked in {:.2}s",
+        bytes(total),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn inspect(archive: &Path, list: bool) -> Result<ExitCode> {
+    let fs = OsFs::new();
+    if let Some(dest) = zipconsume::journal_dest(&fs, archive) {
+        println!(
+            "archive    {} (ZIP, being consumed into {})",
+            archive.display(),
+            dest.display()
+        );
+        println!(
+            "state      partially consumed; run `trunc resume {}`",
+            archive.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let l = zipconsume::open_layout(&fs, archive)?;
+    let files = l.entries.iter().filter(|e| e.kind == Kind::File).count();
+    let total: u64 = l.entries.iter().map(|e| e.size).sum();
+    let stored: u64 = l.entries.iter().map(|e| e.compressed_size).sum();
+    let deflated = l
+        .entries
+        .iter()
+        .filter(|e| e.method == Method::Deflate)
+        .count();
+    println!("archive    {} (ZIP)", archive.display());
+    println!(
+        "entries    {files} files, {} directories/links",
+        l.entries.len() - files
+    );
+    println!("content    {}", bytes(total));
+    println!(
+        "stored     {} ({deflated} deflated, {} stored)",
+        bytes(stored),
+        l.entries.len() - deflated
+    );
+    println!("file size  {}", bytes(l.file_len));
+    if !l.overlaps.is_empty() {
+        println!(
+            "WARNING    {} overlapping entries (zip-bomb technique)",
+            l.overlaps.len()
+        );
+    }
+    if list {
+        println!();
+        for e in &l.entries {
+            let size = match e.kind {
+                Kind::File => format!("{:>12}", e.size),
+                Kind::Dir => format!("{:>12}", "<dir>"),
+                Kind::Symlink => format!("{:>12}", "<link>"),
+            };
+            println!("{size}  {}", e.name);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn plan(archive: &Path, dest: &Path, punch: bool) -> Result<ExitCode> {
+    let fs = OsFs::new();
+    let layout = zipconsume::open_layout(&fs, archive)?;
+    let largest = layout
+        .entries
+        .iter()
+        .max_by_key(|e| e.size)
+        .map(|e| (e.name.as_str(), e.size));
+    let vc = preflight::check_volumes(&fs, archive, dest, largest)?;
+    let opts = ConsumeOptions {
+        zip: ZipOptions {
+            punch: if punch {
+                PunchPolicy::Auto
+            } else {
+                PunchPolicy::Never
+            },
+            ..ZipOptions::default()
+        },
+        ..ConsumeOptions::default()
+    };
+    let can_dealloc = vc.archive_volume.supports_sparse && vc.archive_volume.sparse_granularity > 0;
+    let params = SpaceParams {
+        cluster_size: u64::from(vc.destination.cluster_size.max(1)),
+        ..SpaceParams::default()
+    };
+    let len = fs
+        .open(archive, trunc_fs::OpenMode::Read, trunc_fs::Share::Shared)?
+        .size()?;
+    let sp = zipconsume::zip_space(
+        &layout,
+        len,
+        &opts,
+        can_dealloc,
+        u64::from(vc.archive_volume.sparse_granularity.max(1)),
+        &params,
+    );
+    let consume_needs = if vc.same_volume {
+        sp.consume_extra
+    } else {
+        sp.extract_extra
+    };
+    let fits = |need: u64| match vc.destination.free_bytes {
+        Some(f) if f >= need => "fits",
+        Some(_) => "DOES NOT FIT",
+        None => "unknown",
+    };
+    println!("archive       {} (ZIP, {})", archive.display(), bytes(len));
+    println!("content       {} to write", bytes(sp.remaining_u));
+    if let Some(free) = vc.destination.free_bytes {
+        println!(
+            "destination   {} ({}), {} free",
+            dest.display(),
+            vc.destination.fs_name,
+            bytes(free)
+        );
+    }
+    println!();
+    println!("free space needed at the destination:");
+    println!(
+        "  extract (keeps archive)   {:>12}   {}",
+        bytes(sp.extract_extra),
+        fits(sp.extract_extra)
+    );
+    println!(
+        "  consume (--consume)       {:>12}   {}",
+        bytes(consume_needs),
+        fits(consume_needs)
+    );
+    if punch && can_dealloc && sp.consume_peak < sp.consume_peak_guaranteed {
+        println!(
+            "  (punch mode frees space inside large entries; without it consuming needs up to {})",
+            bytes(sp.consume_peak_guaranteed.saturating_sub(len))
+        );
+    }
+    for f in &vc.findings {
+        let tag = match f.severity() {
+            Severity::Blocker => "blocks --consume",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        };
+        println!("[{tag}] {f}");
+    }
+    if !layout.overlaps.is_empty() {
+        println!(
+            "[blocks --consume] {} entries overlap; pass --allow-overlap to process them",
+            layout.overlaps.len()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn is_zip(path: &Path) -> bool {
+    zipconsume::is_zip(&OsFs::new() as &dyn FsBackend, path)
+}

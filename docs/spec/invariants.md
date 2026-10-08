@@ -57,6 +57,16 @@ An interrupted batch is always redone rather than verified and skipped. Its bloc
 
 All 40 output files were identical to the source. `--consume` took 53 s; a normal extract took 60 s.
 
+## ZIP archives (ADR-0008)
+
+The same invariants hold for ZIP consumption, with these differences:
+
+- **Order:** entries are processed in descending order of where their bytes end. After each entry, the archive is truncated to the furthest region end among entries still to do, then flushed.
+- **Journal:** the journal (layout, identity, destination) is created atomically before the first truncation.
+- **Punch mode:** within an entry, the order is: flush output → journal the inflate checkpoint → deallocate consumed input. The entry's CRC is verified before anything in it is deallocated.
+- **Sweeps:** `crates/trunc-engine/tests/zipconsume.rs` crashes entry mode and punch mode at every operation under all three crash models, and with torn writes.
+- **Mutation checks:** removing the output flush is caught by data loss. Deallocating before the checkpoint is journaled is caught by a corrupt stream on resume.
+
 ## What these invariants do not cover
 
 - **Filesystems without a journal** (FAT32, exFAT): a crash during truncation can leave the size and cluster chain inconsistent. Destructive mode on them is opt-in (`--allow-unjournaled`).

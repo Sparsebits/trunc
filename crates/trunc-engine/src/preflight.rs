@@ -153,39 +153,30 @@ impl Preflight {
     }
 }
 
-/// Assess extracting or consuming `archive` into `dest`.
-/// `batch_max_u` and other allowances come from `params`; the cluster size is taken from the
-/// destination volume.
-pub fn assess(
+/// Facts about the archive's and destination's volumes, with the findings they imply.
+#[derive(Debug, Clone)]
+pub struct VolumeCheck {
+    pub destination: VolumeInfo,
+    pub archive_volume: VolumeInfo,
+    pub same_volume: bool,
+    pub findings: Vec<Finding>,
+}
+
+/// Probe both volumes and collect the format-independent findings. `largest_file` is the size
+/// of the biggest entry (checked against the destination's file-size limit).
+pub fn check_volumes(
     fs: &dyn FsBackend,
-    archive: &Archive,
+    archive_path: &Path,
     dest: &Path,
-    params: SpaceParams,
-) -> Result<Preflight> {
+    largest_file: Option<(&str, u64)>,
+) -> Result<VolumeCheck> {
     let fsr = |e: trunc_fs::FsError| Error::Input(e.to_string());
     let destination = fs.probe_volume(dest).map_err(fsr)?;
-    let archive_volume = fs.probe_volume(archive.path()).map_err(fsr)?;
+    let archive_volume = fs.probe_volume(archive_path).map_err(fsr)?;
     let same_volume = match (destination.volume_id, archive_volume.volume_id) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     };
-    let params = SpaceParams {
-        cluster_size: u64::from(destination.cluster_size.max(1)),
-        ..params
-    };
-    let m = archive.manifest();
-    let bound = space::bound(
-        m,
-        archive.header().first_block_off(),
-        archive.consumed(),
-        &params,
-    );
-    let consume_needs = if same_volume {
-        bound.consume_extra
-    } else {
-        bound.extract_extra
-    };
-
     let mut findings = Vec::new();
     if !same_volume {
         findings.push(Finding::DifferentVolumes);
@@ -206,20 +197,60 @@ pub fn assess(
         SnapshotHint::Present(why) => findings.push(Finding::SnapshotsPresent(why.clone())),
         SnapshotHint::Unknown(why) => findings.push(Finding::SnapshotsUnknown(why.clone())),
     }
-    if let Some(e) = m
-        .entries
-        .iter()
-        .find(|e| e.size > destination.max_file_size)
-    {
+    if let Some((path, size)) = largest_file.filter(|(_, s)| *s > destination.max_file_size) {
         findings.push(Finding::FileTooLarge {
-            path: e.path.clone(),
-            size: e.size,
+            path: path.to_owned(),
+            size,
             max: destination.max_file_size,
         });
     }
     if destination.free_bytes.is_none() {
         findings.push(Finding::FreeSpaceUnknown);
     }
+    Ok(VolumeCheck {
+        destination,
+        archive_volume,
+        same_volume,
+        findings,
+    })
+}
+
+/// Assess extracting or consuming `archive` into `dest`.
+/// `batch_max_u` and other allowances come from `params`; the cluster size is taken from the
+/// destination volume.
+pub fn assess(
+    fs: &dyn FsBackend,
+    archive: &Archive,
+    dest: &Path,
+    params: SpaceParams,
+) -> Result<Preflight> {
+    let m = archive.manifest();
+    let largest = m
+        .entries
+        .iter()
+        .max_by_key(|e| e.size)
+        .map(|e| (e.path.as_str(), e.size));
+    let VolumeCheck {
+        destination,
+        archive_volume,
+        same_volume,
+        mut findings,
+    } = check_volumes(fs, archive.path(), dest, largest)?;
+    let params = SpaceParams {
+        cluster_size: u64::from(destination.cluster_size.max(1)),
+        ..params
+    };
+    let bound = space::bound(
+        m,
+        archive.header().first_block_off(),
+        archive.consumed(),
+        &params,
+    );
+    let consume_needs = if same_volume {
+        bound.consume_extra
+    } else {
+        bound.extract_extra
+    };
     if archive.consumed() > 0 {
         findings.push(Finding::PartiallyConsumed {
             consumed: archive.consumed(),

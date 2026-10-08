@@ -8,7 +8,17 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+trunc-core.workspace = true
+trunc-fs.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
 
+[dev-dependencies]
+flate2.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+trunc-testkit.workspace = true
 
 [lints]
 workspace = true

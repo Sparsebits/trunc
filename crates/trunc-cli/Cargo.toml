@@ -17,6 +17,7 @@ trunc-codec.workspace = true
 trunc-core.workspace = true
 trunc-engine.workspace = true
 trunc-fs.workspace = true
+trunc-legacy.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

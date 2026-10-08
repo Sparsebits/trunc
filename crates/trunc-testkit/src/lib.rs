@@ -16,6 +16,7 @@ pub use faultfs::{CrashModel, Fault, FaultFs};
 pub mod faultfs;
 pub mod fixtures;
 pub mod tree;
+pub mod zipbuild;
 
 /// Small deterministic PRNG (xorshift64*), so fixtures are identical on every run and platform.
 #[derive(Debug, Clone)]

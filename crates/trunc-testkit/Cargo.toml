@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 trunc-fs.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
 
 [lints]
 workspace = true

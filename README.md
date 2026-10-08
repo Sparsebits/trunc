@@ -2,7 +2,7 @@
 
 Self-consuming archives. A `.trnc` archive stores its blocks in reverse order, so an extractor can decode the block at the end of the file, make its output durable, and truncate the archive past it. Extraction then needs roughly *output size − archive size* of free space instead of the full output size.
 
-> **Status: early development (plan phases 0–3 done).** Create, inspect, verify, plan, extract, and destructive extraction (`--consume`) with crash recovery all work on Windows/NTFS. Linux runs everything except the volume probing and sparse-file features (phase 5).
+> **Status: early development (plan phases 0–4 done).** Create, inspect, verify, plan, extract and destructive extraction (`--consume`) with crash recovery work for `.trnc` and for existing ZIP archives, including punch mode, which frees space inside huge ZIP entries as they decompress. Windows/NTFS is the primary platform; Linux runs everything except volume probing and sparse-file features (phase 5).
 
 ## Build
 
@@ -24,6 +24,7 @@ trunc plan data.trnc -C ./out                  # filesystem, free space, extract
 trunc x data.trnc -C ./out                     # non-destructive extract
 trunc x data.trnc -C ./out --consume           # destructive: frees the archive as it extracts
 trunc resume data.trnc                         # continue after a crash, kill or pause
+trunc x big.zip -C ./out --consume             # existing ZIPs too (Stored/Deflate, Zip64)
 
 trunc key gen me.key                           # signing
 trunc create data.trnc ./data --sign me.key
@@ -42,8 +43,10 @@ trunc verify data.trnc --trust-key <hex public key>
 | `crates/trunc-cli` | The `trunc` binary |
 | `crates/trunc-fs` | Filesystem backend trait; OS backend (NTFS sparse files, file ids, volume probing, no-replace rename); cloud-sync detection |
 | `crates/trunc-testkit` | Deterministic fixtures, tree comparison, `FaultFs` in-memory crash-injection filesystem |
-| `crates/trunc-journal`, `-legacy`, `-adapter` | Placeholders for phases 4 and 7 |
-| `docs/spec` | Normative format spec, crash-safety invariants, journal draft |
+| `crates/trunc-legacy` | ZIP parser (Zip64, descriptors, CP437/UTF-8 names) and a checkpointable DEFLATE decoder |
+| `crates/trunc-journal` | Crash-safe preamble + two-slot checkpoint store used by ZIP consumption |
+| `crates/trunc-adapter` | Placeholder for phase 7 |
+| `docs/spec` | Normative format spec, crash-safety invariants, journal format |
 | `docs/adr` | Design decisions |
 | `fuzz/` | cargo-fuzz targets (needs nightly) |
 

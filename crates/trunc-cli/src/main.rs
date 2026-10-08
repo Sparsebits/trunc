@@ -15,6 +15,7 @@ use trunc_engine::{Archive, keys};
 
 mod consume_cmd;
 mod fmt;
+mod zip_cmd;
 use fmt::{bytes, parse_size};
 
 #[derive(Debug, Parser)]
@@ -281,6 +282,12 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
             a.threads,
         );
     }
+    if zip_cmd::is_zip(&a.archive) {
+        if a.allow_symlinks {
+            anyhow::bail!("--allow-symlinks is not supported for ZIP archives");
+        }
+        return zip_cmd::extract(&a.archive, &a.dest, a.overwrite);
+    }
     let archive = Archive::open(&a.archive)?;
     let opts = ExtractOptions {
         overwrite: a.overwrite,
@@ -319,6 +326,9 @@ fn signer_line(archive: &Archive) -> String {
 }
 
 fn inspect(a: InspectArgs) -> Result<ExitCode> {
+    if zip_cmd::is_zip(&a.archive) {
+        return zip_cmd::inspect(&a.archive, a.entries);
+    }
     let archive = Archive::open(&a.archive)?;
     let m = archive.manifest();
     let h = archive.header();
@@ -405,6 +415,9 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
 }
 
 fn verify(a: VerifyArgs) -> Result<ExitCode> {
+    if zip_cmd::is_zip(&a.archive) {
+        return zip_cmd::verify(&a.archive);
+    }
     let archive = Archive::open(&a.archive)?;
     let t = Instant::now();
     let s = trunc_engine::extract::verify(&archive, &a.trust.policy()?, a.threads)?;
@@ -452,6 +465,9 @@ fn fits(f: Option<bool>) -> &'static str {
 }
 
 fn plan(a: PlanArgs) -> Result<ExitCode> {
+    if zip_cmd::is_zip(&a.archive) {
+        return zip_cmd::plan(&a.archive, &a.dest, true);
+    }
     use trunc_engine::preflight::{self, Severity};
     let archive = Archive::open(&a.archive)?;
     let params = SpaceParams {

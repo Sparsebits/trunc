@@ -1,6 +1,6 @@
 [package]
 name = "trunc-journal"
-description = "Append-only write-ahead journal with alternating superblocks."
+description = "Crash-safe preamble + two-slot checkpoint store for legacy archive consumption."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+trunc-fs.workspace = true
+trunc-hash.workspace = true
+thiserror.workspace = true
 
+[dev-dependencies]
+trunc-testkit.workspace = true
 
 [lints]
 workspace = true

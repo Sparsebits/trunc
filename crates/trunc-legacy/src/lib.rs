@@ -1,5 +1,10 @@
-//! Destructive extraction for existing archive formats.
+//! Destructive extraction support for existing archive formats.
 //!
-//! Phase 4 implements the ZIP parser (EOCD, Zip64, central directory cross-checked against
-//! local headers, refcounted extent map), entry-granularity consumption by truncation in
-//! descending offset order, and intra-entry hole punching driven by checkpointable inflate.
+//! - [`inflate`]: a DEFLATE decoder that checkpoints at block boundaries, so decoding can resume
+//!   after the compressed bytes before the checkpoint have been deallocated (punch mode).
+//! - [`zip`]: ZIP parsing (EOCD, Zip64, central directory cross-checked against local headers)
+//!   into entries with byte extents.
+
+mod cp437;
+pub mod inflate;
+pub mod zip;

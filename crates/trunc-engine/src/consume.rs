@@ -29,6 +29,10 @@ use crate::error::{Error, PauseReason, Result};
 use crate::extract::TrustPolicy;
 use crate::io::len_usize;
 use crate::preflight::{self, Finding};
+use crate::stage::{
+    Item, ItemKind, all_exist, build_structure, ensure_dir, first_existing, ignore_not_found,
+    join_rel, parent_of, rename_into_place, top_level_names, truncate_with_retry,
+};
 use crate::walk::system_time;
 
 /// How hard to retry truncating an archive that another process has memory-mapped.
@@ -65,6 +69,8 @@ pub struct ConsumeOptions {
     /// Keep the archive's remaining header + manifest as `<archive>.receipt`.
     pub keep_receipt: bool,
     pub retry: RetryPolicy,
+    /// ZIP-specific settings (ignored for `.trnc`).
+    pub zip: crate::zipconsume::ZipOptions,
 }
 
 impl Default for ConsumeOptions {
@@ -78,6 +84,7 @@ impl Default for ConsumeOptions {
             skip_space_check: false,
             keep_receipt: true,
             retry: RetryPolicy::default(),
+            zip: crate::zipconsume::ZipOptions::default(),
         }
     }
 }
@@ -168,60 +175,6 @@ pub fn read_resume_note(fs: &dyn FsBackend, archive: &Path) -> Option<ResumeNote
     })
 }
 
-/// Parent directory; `.` for a bare file name, the path itself for a root.
-fn parent_of(p: &Path) -> PathBuf {
-    match p.parent() {
-        Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
-        Some(parent) => parent.to_path_buf(),
-        None => p.to_path_buf(),
-    }
-}
-
-fn join_rel(base: &Path, rel: &str) -> PathBuf {
-    let mut p = base.to_path_buf();
-    for c in rel.split('/') {
-        p.push(c);
-    }
-    p
-}
-
-fn top_level_names(m: &Manifest) -> Vec<String> {
-    let set: BTreeSet<String> = m
-        .entries
-        .iter()
-        .map(|e| e.path.split('/').next().unwrap_or(&e.path).to_owned())
-        .collect();
-    set.into_iter().collect()
-}
-
-fn ignore_not_found(r: std::result::Result<(), FsError>) -> Result<()> {
-    match r {
-        Ok(()) | Err(FsError::NotFound { .. }) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Create `dir` and any missing ancestors, flushing each new entry's parent.
-fn ensure_dir(fs: &dyn FsBackend, dir: &Path) -> Result<()> {
-    match fs.metadata(dir)? {
-        Some(m) if m.kind == NodeKind::Dir => return Ok(()),
-        Some(_) => {
-            return Err(Error::Refused(format!(
-                "{} exists and is not a directory",
-                dir.display()
-            )));
-        }
-        None => {}
-    }
-    let parent = parent_of(dir);
-    if parent != dir {
-        ensure_dir(fs, &parent)?;
-    }
-    fs.create_dir(dir)?;
-    fs.flush_dir(&parent)?;
-    Ok(())
-}
-
 fn write_note(fs: &dyn FsBackend, archive: &Path, note: &ResumeNote) -> Result<()> {
     let p = resume_note_path(archive);
     let text = format!(
@@ -235,22 +188,6 @@ fn write_note(fs: &dyn FsBackend, archive: &Path, note: &ResumeNote) -> Result<(
     drop(h);
     fs.flush_dir(&parent_of(archive))?;
     Ok(())
-}
-
-fn truncate_with_retry(h: &dyn FileHandle, len: u64, retry: RetryPolicy) -> Result<()> {
-    let mut delay = retry.initial_delay;
-    for attempt in 0..=retry.attempts {
-        match h.set_len(len) {
-            Ok(()) => return Ok(()),
-            Err(FsError::Mapped { .. }) if attempt < retry.attempts => {
-                std::thread::sleep(delay);
-                delay = delay.saturating_mul(2);
-            }
-            Err(FsError::Mapped { .. }) => return Err(Error::Paused(PauseReason::Mapped)),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    unreachable!("loop returns on its last attempt")
 }
 
 /// Consume `archive_path` into `dest`: extract everything while truncating the archive.
@@ -301,7 +238,8 @@ pub fn consume(
     let n = m.blocks.len();
     let fbo = archive.header().first_block_off();
     let stage = stage_dir(&dest, &m.archive_id);
-    let tops = top_level_names(&m);
+    let items = items_of(&m);
+    let tops = top_level_names(&items);
 
     // Preflight: refuse unsafe situations before touching anything.
     let pre = preflight::assess(fs, &archive, &dest, opts.space)?;
@@ -388,7 +326,7 @@ pub fn consume(
         blocks_total: n,
     });
 
-    build_structure(fs, &m, &dest, &stage, &mut summary)?;
+    build_structure(fs, &items, &dest, &stage, &mut summary)?;
     consume_blocks(
         fs,
         &mut archive,
@@ -402,33 +340,7 @@ pub fn consume(
 
     // Rename phase: every block is consumed and every output is durable.
     progress(Progress::Renaming);
-    for e in m
-        .entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::File))
-    {
-        ignore_not_found(fs.set_mode(&join_rel(&stage, &e.path), e.mode))?;
-    }
-    for name in &tops {
-        let from = stage.join(name);
-        if fs.metadata(&from)?.is_none() {
-            continue; // already moved by an earlier run
-        }
-        match fs.rename(&from, &dest.join(name)) {
-            Ok(()) => {}
-            Err(FsError::AlreadyExists { path }) => {
-                return Err(Error::Refused(format!(
-                    "{} appeared during extraction; move it away and resume",
-                    path.display()
-                )));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    fs.flush_dir(&stage)?;
-    fs.flush_dir(&dest)?;
-    fs.remove_dir(&stage)?;
-    fs.flush_dir(&dest)?;
+    rename_into_place(fs, &items, &dest, &stage)?;
     summary.receipt = finish(fs, archive, archive_path, opts)?;
     Ok(summary)
 }
@@ -447,92 +359,8 @@ fn completed_receipt(
     let m = receipt.manifest();
     let done = receipt.consumed() == m.blocks.len()
         && fs.metadata(&stage_dir(dest, &m.archive_id))?.is_none()
-        && all_exist(fs, dest, &top_level_names(m))?;
+        && all_exist(fs, dest, &top_level_names(&items_of(m)))?;
     Ok(done.then_some(r))
-}
-
-fn all_exist(fs: &dyn FsBackend, dest: &Path, names: &[String]) -> Result<bool> {
-    for name in names {
-        if fs.metadata(&dest.join(name))?.is_none() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn first_existing(fs: &dyn FsBackend, dest: &Path, names: &[String]) -> Result<Option<PathBuf>> {
-    for name in names {
-        let p = dest.join(name);
-        if fs.metadata(&p)?.is_some() {
-            return Ok(Some(p));
-        }
-    }
-    Ok(None)
-}
-
-/// True if the entry's top-level item was already moved into the destination by an earlier run.
-fn already_moved(fs: &dyn FsBackend, dest: &Path, stage: &Path, rel: &str) -> Result<bool> {
-    let top = rel.split('/').next().unwrap_or(rel);
-    Ok(fs.metadata(&stage.join(top))?.is_none() && fs.metadata(&dest.join(top))?.is_some())
-}
-
-/// Create directories and empty files in the staging area (idempotent).
-fn build_structure(
-    fs: &dyn FsBackend,
-    m: &Manifest,
-    dest: &Path,
-    stage: &Path,
-    summary: &mut ConsumeSummary,
-) -> Result<()> {
-    let mut to_flush: BTreeSet<PathBuf> = BTreeSet::new();
-    for d in m.all_dirs() {
-        if already_moved(fs, dest, stage, &d)? {
-            continue;
-        }
-        let p = join_rel(stage, &d);
-        match fs.metadata(&p)?.map(|m| m.kind) {
-            None => {
-                fs.create_dir(&p)?;
-                to_flush.insert(parent_of(&p));
-            }
-            Some(NodeKind::Dir) => {}
-            Some(_) => {
-                return Err(Error::Refused(format!(
-                    "{} is not a directory",
-                    p.display()
-                )));
-            }
-        }
-        summary.dirs += 1;
-    }
-    for e in &m.entries {
-        match &e.kind {
-            EntryKind::Symlink { .. } => summary.symlinks_skipped += 1,
-            EntryKind::File => summary.files += 1,
-            EntryKind::Dir => {}
-        }
-        if !matches!(e.kind, EntryKind::File)
-            || e.size > 0
-            || already_moved(fs, dest, stage, &e.path)?
-        {
-            continue;
-        }
-        let p = join_rel(stage, &e.path);
-        match fs.metadata(&p)?.map(|m| m.kind) {
-            None => {
-                let h = fs.open(&p, OpenMode::CreateNew, Share::Exclusive)?;
-                h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
-                h.flush_data()?;
-                to_flush.insert(parent_of(&p));
-            }
-            Some(NodeKind::File) => {}
-            Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
-        }
-    }
-    for d in &to_flush {
-        fs.flush_dir(d)?;
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -688,4 +516,23 @@ fn finish(
     ignore_not_found(fs.remove_file(&resume_note_path(archive_path)))?;
     fs.flush_dir(&dir)?;
     Ok(receipt)
+}
+
+/// Format-neutral view of a manifest's entries.
+fn items_of(m: &Manifest) -> Vec<Item> {
+    m.entries
+        .iter()
+        .map(|e| Item {
+            path: e.path.clone(),
+            kind: match e.kind {
+                EntryKind::File => ItemKind::File,
+                EntryKind::Dir => ItemKind::Dir,
+                EntryKind::Symlink { .. } => ItemKind::Symlink,
+            },
+            size: e.size,
+            mode: Some(e.mode),
+            mtime_unix: e.mtime_unix,
+            mtime_nanos: e.mtime_nanos,
+        })
+        .collect()
 }

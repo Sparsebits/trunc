@@ -10,6 +10,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 trunc-core = { path = "../crates/trunc-core" }
+trunc-fs = { path = "../crates/trunc-fs" }
+trunc-legacy = { path = "../crates/trunc-legacy" }
+trunc-testkit = { path = "../crates/trunc-testkit" }
 
 [[bin]]
 name = "header"
@@ -28,6 +31,20 @@ bench = false
 [[bin]]
 name = "manifest"
 path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip"
+path = "fuzz_targets/zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
 test = false
 doc = false
 bench = false

@@ -13,6 +13,9 @@ trunc-codec.workspace = true
 trunc-core.workspace = true
 trunc-fs.workspace = true
 trunc-hash.workspace = true
+trunc-journal.workspace = true
+trunc-legacy.workspace = true
+crc32fast.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 hex.workspace = true
@@ -22,6 +25,7 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
+trunc-legacy.workspace = true
 trunc-testkit.workspace = true
 proptest.workspace = true
 
