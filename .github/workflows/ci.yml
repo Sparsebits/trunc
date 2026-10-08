@@ -62,6 +62,8 @@ jobs:
       - name: mount FAT32 and exFAT images
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq dosfstools exfatprogs
+          # The runner kernel ships the exFAT driver in the extra modules package.
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" && sudo modprobe exfat
           for k in vfat exfat; do
             truncate -s 1G "$RUNNER_TEMP/$k.img"
             if [ "$k" = vfat ]; then mkfs.vfat -F 32 "$RUNNER_TEMP/$k.img"; else mkfs.exfat "$RUNNER_TEMP/$k.img"; fi
