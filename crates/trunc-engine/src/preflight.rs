@@ -33,6 +33,8 @@ pub enum Finding {
     /// The archive's filesystem does not journal metadata (FAT32, exFAT): a crash during
     /// truncation can corrupt it. Overridable with `--allow-unjournaled`.
     NotJournaled(String),
+    /// The filesystem could not be identified, so whether it journals metadata is unknown.
+    JournalingUnknown,
     SnapshotsPresent(String),
     SnapshotsUnknown(String),
     /// A file is larger than the destination filesystem allows.
@@ -56,6 +58,7 @@ impl Finding {
                 Severity::Blocker
             }
             Finding::DifferentVolumes
+            | Finding::JournalingUnknown
             | Finding::DestinationSynced(_)
             | Finding::SnapshotsPresent(_)
             | Finding::FreeSpaceUnknown => Severity::Warning,
@@ -99,6 +102,10 @@ impl fmt::Display for Finding {
                 f,
                 "the archive's filesystem ({fs}) does not journal metadata; a crash during \
                  --consume can corrupt it (override with --allow-unjournaled)"
+            ),
+            Finding::JournalingUnknown => write!(
+                f,
+                "the archive's filesystem could not be identified, so crash safety of --consume                  depends on it journaling metadata (most modern filesystems do)"
             ),
             Finding::SnapshotsPresent(why) => write!(
                 f,
@@ -189,7 +196,9 @@ pub fn assess(
     if destination.sync != SyncHint::None {
         findings.push(Finding::DestinationSynced(destination.sync.clone()));
     }
-    if !archive_volume.journaled() {
+    if archive_volume.fs == trunc_fs::FsKind::Unknown {
+        findings.push(Finding::JournalingUnknown);
+    } else if !archive_volume.journaled() {
         findings.push(Finding::NotJournaled(archive_volume.fs_name.clone()));
     }
     match &archive_volume.snapshots {

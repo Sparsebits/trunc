@@ -230,4 +230,7 @@ pub trait FsBackend: Send + Sync + Debug {
     fn read_dir(&self, path: &Path) -> Result<Vec<String>>;
     /// Describe the volume holding `path` (or its nearest existing ancestor).
     fn probe_volume(&self, path: &Path) -> Result<VolumeInfo>;
+    /// Apply Unix permission bits (lower 9 only; Windows honours just the write bits, as the
+    /// read-only attribute). Never follows links.
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()>;
 }

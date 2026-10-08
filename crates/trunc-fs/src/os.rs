@@ -215,6 +215,28 @@ impl FsBackend for OsFs {
         Ok(names)
     }
 
+    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        if self.metadata(path)?.map(|m| m.kind) == Some(NodeKind::Link) {
+            return Err(FsError::Link {
+                path: path.to_path_buf(),
+            });
+        }
+        #[cfg(unix)]
+        let perms = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::Permissions::from_mode(mode & 0o777)
+        };
+        #[cfg(not(unix))]
+        let perms = {
+            let mut p = fs::metadata(path)
+                .map_err(err("reading metadata of", path))?
+                .permissions();
+            p.set_readonly(mode & 0o222 == 0);
+            p
+        };
+        fs::set_permissions(path, perms).map_err(err("setting permissions of", path))
+    }
+
     fn probe_volume(&self, path: &Path) -> Result<VolumeInfo> {
         let at = existing_ancestor(path)?;
         let sync = crate::sync::detect_sync(&at);
@@ -368,7 +390,14 @@ impl FileHandle for OsFile {
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
-        self.file.set_len(len).map_err(self.e("resizing"))
+        #[cfg(windows)]
+        let shrinking = len < self.size()?;
+        self.file.set_len(len).map_err(self.e("resizing"))?;
+        #[cfg(windows)]
+        if shrinking {
+            crate::win::set_allocation(&self.file, len).map_err(self.e("releasing space of"))?;
+        }
+        Ok(())
     }
 
     fn preallocate(&self, len: u64) -> Result<()> {

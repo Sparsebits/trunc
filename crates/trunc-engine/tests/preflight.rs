@@ -93,6 +93,9 @@ impl<B: FsBackend> FsBackend for FakeVolume<B> {
     fn read_dir(&self, p: &Path) -> Result<Vec<String>> {
         self.inner.read_dir(p)
     }
+    fn set_mode(&self, p: &Path, mode: u32) -> Result<()> {
+        self.inner.set_mode(p, mode)
+    }
     fn probe_volume(&self, p: &Path) -> Result<VolumeInfo> {
         Ok(if p == self.archive_path {
             self.archive_vol.clone()

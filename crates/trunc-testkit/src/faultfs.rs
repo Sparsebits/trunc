@@ -46,7 +46,7 @@ pub enum Fault {
     TornWrite { op: u64, keep: usize },
     /// The operation fails with `NoSpace` and has no effect.
     NoSpaceAt(u64),
-    /// If the operation is a resize, it fails with `Mapped` and has no effect.
+    /// If the operation is a `set_len`, it fails with `Mapped` and has no effect.
     MappedAt(u64),
 }
 
@@ -349,10 +349,8 @@ impl State {
         Ok(())
     }
 
-    fn recompute_used(&mut self) {
-        let live: BTreeSet<u64> = self
-            .tree
-            .values()
+    fn live_ids(tree: &BTreeMap<String, Node>) -> BTreeSet<u64> {
+        tree.values()
             .filter_map(|n| {
                 if let Node::File(id) = n {
                     Some(*id)
@@ -360,9 +358,19 @@ impl State {
                     None
                 }
             })
-            .collect();
-        self.files.retain(|id, _| live.contains(id));
-        self.used = self.files.values().map(|f| f.cur.allocated()).sum();
+            .collect()
+    }
+
+    /// Recount occupancy over files visible in the current view. File data is kept even when
+    /// unlinked: until the removal is durable, a crash can bring the entry back.
+    fn recompute_used(&mut self) {
+        let live = Self::live_ids(&self.tree);
+        self.used = self
+            .files
+            .iter()
+            .filter(|(id, _)| live.contains(id))
+            .map(|(_, f)| f.cur.allocated())
+            .sum();
     }
 
     fn node(&self, k: &str) -> Option<Node> {
@@ -487,6 +495,8 @@ impl FaultFs {
         }
         s.durable_tree = tree.clone();
         s.tree = tree;
+        let live = State::live_ids(&s.tree);
+        s.files.retain(|id, _| live.contains(id));
         s.recompute_used();
         s.crashed = false;
         s.epoch += 1;
@@ -741,6 +751,17 @@ impl FsBackend for FaultFs {
             .collect())
     }
 
+    fn set_mode(&self, path: &Path, _mode: u32) -> Result<()> {
+        let k = key(path)?;
+        let mut s = self.st();
+        s.alive()?;
+        if s.node(&k).is_none() {
+            return Err(not_found(path));
+        }
+        s.begin(Kind::Other, path)?;
+        Ok(())
+    }
+
     fn probe_volume(&self, _path: &Path) -> Result<VolumeInfo> {
         let s = self.st();
         s.alive()?;
@@ -870,7 +891,7 @@ impl FileHandle for MemHandle {
     fn preallocate(&self, len: u64) -> Result<()> {
         self.writable()?;
         let mut s = self.st()?;
-        s.begin(Kind::Resize, &self.path)?;
+        s.begin(Kind::Other, &self.path)?;
         if len > s.files[&self.id].cur.data.len() as u64 {
             s.data_op(self.id, &self.path, DataOp::SetLen(len))?;
         }

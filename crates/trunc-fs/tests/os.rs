@@ -294,3 +294,34 @@ fn truncating_a_mapped_file_is_retryable() {
     assert!(matches!(e, FsError::Mapped { .. }), "{e}");
     assert!(e.is_retryable());
 }
+
+/// Shrinking must return space to the volume immediately, while the handle stays open. (Setting
+/// only the end-of-file marker leaves the allocation in place until the handle closes, which would
+/// make --consume hold the whole archive until the end.)
+#[cfg(windows)]
+#[test]
+fn shrinking_frees_space_while_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("big");
+    let mib = 1usize << 20;
+    let f = fs()
+        .open(&p, OpenMode::CreateNew, Share::Exclusive)
+        .unwrap();
+    let chunk = vec![0xA5u8; 16 * mib];
+    for i in 0..32u64 {
+        f.write_all_at(&chunk, i * 16 * mib as u64).unwrap();
+    }
+    f.flush_data().unwrap();
+    let free = || fs().probe_volume(d.path()).unwrap().free_bytes.unwrap();
+    let before = free();
+    f.set_len(0).unwrap();
+    f.flush_data().unwrap();
+    let after = free();
+    let freed = after.saturating_sub(before);
+    eprintln!("freed {} MiB while open", freed >> 20);
+    assert!(
+        freed >= 400 << 20,
+        "only {} MiB returned after shrinking 512 MiB",
+        freed >> 20
+    );
+}

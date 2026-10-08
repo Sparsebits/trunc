@@ -182,7 +182,7 @@ A consumer that has made blocks `0..k` durable at their destinations truncates t
 - `file length == first_block_off`: everything consumed; only header, manifest and dictionary remain;
 - any other length: the file is torn or corrupt, and readers MUST refuse it.
 
-The consume protocol itself (ordering of data flush, directory flush and truncation; staging; recovery) is specified in `invariants.md`. It is implemented in plan phase 3.
+The consume protocol itself (ordering of data flush, directory flush, truncation and archive flush; staging; recovery) is specified in `invariants.md` and implemented in `trunc-engine::consume`.
 
 ## 11. Limits summary
 

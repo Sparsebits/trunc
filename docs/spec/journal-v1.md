@@ -1,6 +1,6 @@
 # Journal format, version 1 (`<archive>.trncj`)
 
-Status: **draft**, implemented in plan phase 4.2. Native-format consumption uses it only for the final rename phase and for space-exhaustion pauses. Legacy ZIP consumption records every state transition in it.
+Status: **draft**, implemented in plan phase 4.2. Only legacy ZIP consumption uses it, recording every state transition. Native-format consumption needs no journal (ADR-0007).
 
 ## Layout
 

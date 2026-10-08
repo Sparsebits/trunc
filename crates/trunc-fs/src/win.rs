@@ -15,8 +15,9 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ID_INFO, FileIdInfo, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, GetVolumePathNameW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    FILE_ALLOCATION_INFO, FILE_ID_INFO, FileAllocationInfo, FileIdInfo, GetDiskFreeSpaceExW,
+    GetDiskFreeSpaceW, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    GetVolumePathNameW, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -149,6 +150,25 @@ pub(crate) fn allocated_ranges(f: &File, len: u64) -> io::Result<Vec<Range<u64>>
         from = out.last().map_or(len, |r| r.end);
         buf.clear();
     }
+}
+
+/// Set the file's allocation size. After shrinking the end of file, this releases the clusters
+/// beyond it immediately; with only the end-of-file change, NTFS keeps them allocated until the
+/// last handle closes (measured: `tests/os.rs::shrinking_frees_space_while_open`).
+pub(crate) fn set_allocation(f: &File, len: u64) -> io::Result<()> {
+    let info = FILE_ALLOCATION_INFO {
+        AllocationSize: i64::try_from(len).map_err(|_| io::ErrorKind::InvalidInput)?,
+    };
+    // SAFETY: valid handle; input pointer/size describe `info`, which outlives the call.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle(f),
+            FileAllocationInfo,
+            (&raw const info).cast::<c_void>(),
+            u32_len::<FILE_ALLOCATION_INFO>(),
+        )
+    };
+    check(ok)
 }
 
 /// Volume serial and 128-bit file id.

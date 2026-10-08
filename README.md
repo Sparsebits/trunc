@@ -2,7 +2,7 @@
 
 Self-consuming archives. A `.trnc` archive stores its blocks in reverse order, so an extractor can decode the block at the end of the file, make its output durable, and truncate the archive past it. Extraction then needs roughly *output size − archive size* of free space instead of the full output size.
 
-> **Status: early development (plan phases 0–2 done).** Creating, inspecting, verifying and non-destructively extracting `.trnc` archives works, and `trunc plan` probes the real destination volume. Destructive extraction (`--consume`) arrives in phase 3 and currently refuses to run.
+> **Status: early development (plan phases 0–3 done).** Create, inspect, verify, plan, extract, and destructive extraction (`--consume`) with crash recovery all work on Windows/NTFS. Linux runs everything except the volume probing and sparse-file features (phase 5).
 
 ## Build
 
@@ -22,6 +22,8 @@ trunc inspect data.trnc --entries --blocks
 trunc verify data.trnc
 trunc plan data.trnc -C ./out                  # filesystem, free space, extract vs consume, warnings
 trunc x data.trnc -C ./out                     # non-destructive extract
+trunc x data.trnc -C ./out --consume           # destructive: frees the archive as it extracts
+trunc resume data.trnc                         # continue after a crash, kill or pause
 
 trunc key gen me.key                           # signing
 trunc create data.trnc ./data --sign me.key
@@ -45,7 +47,16 @@ trunc verify data.trnc --trust-key <hex public key>
 | `docs/adr` | Design decisions |
 | `fuzz/` | cargo-fuzz targets (needs nightly) |
 
-## Measured (phase 1, Ryzen 7 5800H, NVMe, 1 GiB synthetic: ¾ text-like, ¼ random)
+## Measured
+
+**Destructive extraction** (10 GiB dataset, 5.81 GiB lz4 archive, NTFS):
+
+| | Peak extra free space used | Time |
+|---|---|---|
+| `trunc x --consume` | **4.32 GiB** (bound predicted 4.39 GiB) | 53 s |
+| `trunc x` (keeps archive) | 10.00 GiB | 60 s |
+
+**Codecs** (phase 1, Ryzen 7 5800H, NVMe, 1 GiB synthetic: ¾ text-like, ¼ random)
 
 | Codec | Ratio | Create | Extract | Verify |
 |---|---|---|---|---|

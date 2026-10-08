@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use trunc_codec::CodecChoice;
 use trunc_core::space::SpaceParams;
@@ -13,6 +13,7 @@ use trunc_engine::extract::{ExtractOptions, TrustPolicy};
 use trunc_engine::producer::{CreateOptions, DictMode};
 use trunc_engine::{Archive, keys};
 
+mod consume_cmd;
 mod fmt;
 use fmt::{bytes, parse_size};
 
@@ -34,6 +35,8 @@ enum Cmd {
     /// Extract an archive (non-destructive unless --consume).
     #[command(alias = "x")]
     Extract(ExtractArgs),
+    /// Continue an interrupted or paused --consume.
+    Resume(ResumeArgs),
     /// Show an archive's header, manifest summary and space requirements.
     Inspect(InspectArgs),
     /// Check every block and entry hash without extracting.
@@ -101,15 +104,33 @@ struct ExtractArgs {
     /// Destination directory.
     #[arg(short = 'C', long = "dest", default_value = ".")]
     dest: PathBuf,
-    /// Destructive mode: consume the archive while extracting (phase 3).
+    /// Destructive mode: truncate the archive as files are extracted, so extraction needs
+    /// only about (output size - archive size) of free space. The archive is gone afterwards.
     #[arg(long)]
     consume: bool,
+    #[command(flatten)]
+    consume_flags: consume_cmd::ConsumeFlags,
     /// Replace existing files at destination paths.
     #[arg(long)]
     overwrite: bool,
     /// Create symlink entries that resolve inside the destination.
     #[arg(long)]
     allow_symlinks: bool,
+    #[command(flatten)]
+    trust: TrustArgs,
+    /// Decode threads (0 = all cores).
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+}
+
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    archive: PathBuf,
+    /// Destination directory (default: the one recorded when the consume started).
+    #[arg(short = 'C', long = "dest")]
+    dest: Option<PathBuf>,
+    #[command(flatten)]
+    consume_flags: consume_cmd::ConsumeFlags,
     #[command(flatten)]
     trust: TrustArgs,
     /// Decode threads (0 = all cores).
@@ -190,6 +211,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.cmd {
         Cmd::Create(a) => create(a),
         Cmd::Extract(a) => extract(a),
+        Cmd::Resume(a) => {
+            let dest = consume_cmd::resume_dest(&a.archive, a.dest)?;
+            consume_cmd::run(
+                &a.archive,
+                &dest,
+                &a.consume_flags,
+                a.trust.policy()?,
+                a.threads,
+            )
+        }
         Cmd::Inspect(a) => inspect(a),
         Cmd::Verify(a) => verify(a),
         Cmd::Plan(a) => plan(a),
@@ -239,7 +270,16 @@ fn create(a: CreateArgs) -> Result<ExitCode> {
 
 fn extract(a: ExtractArgs) -> Result<ExitCode> {
     if a.consume {
-        bail!("--consume (destructive extraction) is not implemented yet; it arrives in phase 3");
+        if a.overwrite || a.allow_symlinks {
+            anyhow::bail!("--overwrite and --allow-symlinks are not supported with --consume");
+        }
+        return consume_cmd::run(
+            &a.archive,
+            &a.dest,
+            &a.consume_flags,
+            a.trust.policy()?,
+            a.threads,
+        );
     }
     let archive = Archive::open(&a.archive)?;
     let opts = ExtractOptions {

@@ -3,6 +3,7 @@ use std::path::Path;
 
 use trunc_codec::CodecError;
 use trunc_core::FormatError;
+use trunc_fs::FsError;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -27,6 +28,36 @@ pub enum Error {
     /// The operation would be unsafe and was not attempted.
     #[error("refused: {0}")]
     Refused(String),
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    /// Consumption stopped safely and can be resumed later; nothing was lost.
+    #[error("paused: {0}")]
+    Paused(PauseReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseReason {
+    /// The destination ran out of space mid-batch. Free at least `needed` bytes and resume.
+    NoSpace { needed: u64 },
+    /// Another process kept the archive memory-mapped, so it could not be truncated.
+    Mapped,
+}
+
+impl std::fmt::Display for PauseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PauseReason::NoSpace { needed } => {
+                write!(
+                    f,
+                    "out of space; free at least {needed} more bytes, then resume"
+                )
+            }
+            PauseReason::Mapped => write!(
+                f,
+                "another program (often an antivirus or indexer) has the archive mapped; close                  it, then resume"
+            ),
+        }
+    }
 }
 
 /// Attach context to I/O errors.

@@ -1,21 +1,22 @@
 //! Opening and reading `.trnc` archives, including partially consumed ones.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use trunc_codec::Dict;
 use trunc_core::manifest::OpenedManifest;
 use trunc_core::stream::LogicalStream;
 use trunc_core::{FOOTER_LEN, Footer, HEADER_LEN, Header, Manifest, SignedManifest};
+use trunc_fs::{FileHandle, FsBackend, OpenMode, OsFs, Share};
 
-use crate::error::{Error, IoContext, Result, at};
-use crate::io::{len_usize, read_exact_at};
+use crate::error::{Error, Result};
+use crate::io::len_usize;
 
-/// An open archive. Holds a read-only handle; the file must not change while it is open.
+/// An open archive. All reads go through a [`FileHandle`], so the same code runs on the real
+/// filesystem and on the fault-injecting test filesystem.
 #[derive(Debug)]
 pub struct Archive {
     path: PathBuf,
-    file: File,
+    handle: Box<dyn FileHandle>,
     header: Header,
     opened: OpenedManifest,
     dict: Option<Dict>,
@@ -26,11 +27,21 @@ pub struct Archive {
 }
 
 impl Archive {
+    /// Open read-only on the real filesystem and fully validate it (see [`Archive::open_with`]).
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(&OsFs::new(), path, OpenMode::Read, Share::Shared)
+    }
+
     /// Open and fully validate the header, manifest (incl. signature) and dictionary, and work
     /// out how many blocks have been consumed from the current file length.
-    pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).ctx(at("opening", path))?;
-        let file_len = file.metadata().ctx(at("reading metadata of", path))?.len();
+    pub fn open_with(
+        fs: &dyn FsBackend,
+        path: &Path,
+        mode: OpenMode,
+        share: Share,
+    ) -> Result<Self> {
+        let handle = fs.open(path, mode, share)?;
+        let file_len = handle.size()?;
         if file_len < HEADER_LEN as u64 {
             return Err(Error::Integrity(format!(
                 "{} is too short to be a .trnc archive ({file_len} bytes)",
@@ -38,7 +49,7 @@ impl Archive {
             )));
         }
         let mut hb = [0u8; HEADER_LEN];
-        read_exact_at(&file, &mut hb, 0).ctx(at("reading header of", path))?;
+        handle.read_exact_at(&mut hb, 0)?;
         let header = Header::decode(&hb)?;
         if header.first_block_off() > file_len {
             return Err(Error::Integrity(format!(
@@ -48,8 +59,7 @@ impl Archive {
         }
 
         let mut mb = vec![0u8; len_usize(header.manifest_len)];
-        read_exact_at(&file, &mut mb, header.manifest_off())
-            .ctx(at("reading manifest of", path))?;
+        handle.read_exact_at(&mut mb, header.manifest_off())?;
         header.check_manifest(&mb)?;
         let opened = SignedManifest::open(&mb)?;
         let m = &opened.manifest;
@@ -58,8 +68,7 @@ impl Archive {
             (None, 0) => None,
             (Some(info), len) if info.len == len => {
                 let mut db = vec![0u8; len_usize(len)];
-                read_exact_at(&file, &mut db, header.dict_off())
-                    .ctx(at("reading dictionary of", path))?;
+                handle.read_exact_at(&mut db, header.dict_off())?;
                 if trunc_hash::blake3(&db) != info.blake3 {
                     return Err(Error::Integrity("dictionary hash mismatch".into()));
                 }
@@ -75,8 +84,7 @@ impl Archive {
         let fbo = header.first_block_off();
         let consumed = m.consumed_blocks(fbo, file_len).ok_or_else(|| {
             Error::Integrity(format!(
-                "archive length {file_len} is not at a block boundary (expected {} when complete); \
-                 the file is truncated, extended or corrupt",
+                "archive length {file_len} is not at a block boundary (expected {} when complete);                  the file is truncated, extended or corrupt",
                 m.archive_len(fbo)
             ))
         })?;
@@ -84,7 +92,7 @@ impl Archive {
         let stream = LogicalStream::new(m);
         Ok(Self {
             path: path.to_path_buf(),
-            file,
+            handle,
             header,
             opened,
             dict,
@@ -93,6 +101,19 @@ impl Archive {
             consumed,
             stream,
         })
+    }
+
+    /// The underlying handle (the consumer truncates and flushes through it).
+    pub(crate) fn handle(&self) -> &dyn FileHandle {
+        self.handle.as_ref()
+    }
+
+    /// Record that the file was truncated to just past `consumed` blocks.
+    pub(crate) fn note_consumed(&mut self, consumed: usize) {
+        self.consumed = consumed;
+        self.file_len = self
+            .manifest()
+            .len_after_consuming(self.header.first_block_off(), consumed);
     }
 
     pub fn path(&self) -> &Path {
@@ -158,8 +179,8 @@ impl Archive {
         self.check_present(i)?;
         let b = &self.manifest().blocks[i];
         let mut fb = [0u8; FOOTER_LEN];
-        read_exact_at(&self.file, &mut fb, self.offsets[i] + b.c_len)
-            .ctx(at(&format!("reading footer of block {i} in"), &self.path))?;
+        self.handle
+            .read_exact_at(&mut fb, self.offsets[i] + b.c_len)?;
         let f = Footer::decode(&fb)?;
         self.manifest().check_footer(i, &f)?;
         Ok(f)
@@ -169,8 +190,7 @@ impl Archive {
     pub fn read_payload(&self, i: usize) -> Result<Vec<u8>> {
         let f = self.read_footer(i)?;
         let mut payload = vec![0u8; len_usize(f.c_len)];
-        read_exact_at(&self.file, &mut payload, self.offsets[i])
-            .ctx(at(&format!("reading block {i} of"), &self.path))?;
+        self.handle.read_exact_at(&mut payload, self.offsets[i])?;
         if trunc_hash::blake3(&payload) != f.blake3_c {
             return Err(Error::Integrity(format!("block {i} payload hash mismatch")));
         }

@@ -57,11 +57,23 @@ fn create_inspect_verify_plan_extract() {
     assert!(!again.status.success());
     ok(&trunc(&["x", "data.trnc", "-C", "out", "--overwrite"], w));
 
-    // Destructive mode is not available yet and must say so rather than do anything.
+    // Destructive mode refuses to run non-interactively without --yes, touching nothing.
     let consume = trunc(&["x", "data.trnc", "-C", "out2", "--consume"], w);
     assert!(!consume.status.success());
-    assert!(String::from_utf8_lossy(&consume.stderr).contains("phase 3"));
-    assert!(w.join("data.trnc").exists());
+    assert!(String::from_utf8_lossy(&consume.stderr).contains("--yes"));
+    assert!(w.join("data.trnc").exists() && !w.join("out2").exists());
+
+    let s = ok(&trunc(
+        &["x", "data.trnc", "-C", "out2", "--consume", "--yes"],
+        w,
+    ));
+    assert!(s.contains("receipt kept"), "{s}");
+    tree::assert_same(&w.join("data"), &w.join("out2/data"));
+    assert!(!w.join("data.trnc").exists());
+    assert!(w.join("data.trnc.receipt").exists());
+    // The receipt is a valid, fully consumed archive.
+    let s = ok(&trunc(&["inspect", "data.trnc.receipt"], w));
+    assert!(s.contains("partially consumed"), "{s}");
 }
 
 #[test]
@@ -112,4 +124,60 @@ fn bad_arguments_fail_cleanly() {
     );
     assert!(!trunc(&["inspect", "missing.trnc"], w).status.success());
     assert!(!trunc(&["inspect", "f"], w).status.success());
+}
+
+/// Kill the process at arbitrary points of a consume; `trunc resume` must always finish the job
+/// with a byte-identical tree. (Process death, not power loss: the in-memory FaultFs sweep in
+/// trunc-engine covers lost unflushed writes.)
+#[test]
+fn killed_consume_resumes() {
+    for (round, delay_ms) in [5u64, 40, 120, 400].into_iter().enumerate() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        fixtures::mixed(&w.join("data"), 100 + round as u64);
+        fixtures::large_file(&w.join("data/more"), 6 << 20, 7);
+        ok(&trunc(
+            &[
+                "create",
+                "a.trnc",
+                "data",
+                "--block-size",
+                "64K",
+                "--codec",
+                "lz4",
+            ],
+            w,
+        ));
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trunc"))
+            .args([
+                "x",
+                "a.trnc",
+                "-C",
+                "out",
+                "--consume",
+                "--yes",
+                "--batch",
+                "64K",
+            ])
+            .current_dir(w)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        ok(&trunc(&["resume", "a.trnc", "-C", "out", "--yes"], w));
+        tree::assert_same(&w.join("data"), &w.join("out/data"));
+        assert!(
+            !w.join("a.trnc").exists(),
+            "round {round}: archive left behind"
+        );
+        assert!(
+            !w.join("a.trnc.trncr").exists(),
+            "round {round}: resume note left behind"
+        );
+    }
 }

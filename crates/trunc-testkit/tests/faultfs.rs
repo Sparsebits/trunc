@@ -296,3 +296,20 @@ fn orphans_are_pruned_after_crash() {
     assert!(fs.get_file(p("/d/f")).is_none());
     assert!(fs.snapshot().is_empty());
 }
+
+#[test]
+fn unflushed_removal_is_undone_with_its_data() {
+    let fs = FaultFs::new(CrashModel::LoseUnflushed);
+    fs.put_file(p("/d/f"), b"precious");
+    fs.remove_file(p("/d/f")).unwrap();
+    assert!(fs.get_file(p("/d/f")).is_none());
+    assert_eq!(fs.used(), 0);
+    fs.recover();
+    assert_eq!(fs.get_file(p("/d/f")).unwrap(), b"precious");
+    assert_eq!(fs.used(), 8);
+
+    fs.remove_file(p("/d/f")).unwrap();
+    fs.flush_dir(p("/d")).unwrap();
+    fs.recover();
+    assert!(fs.get_file(p("/d/f")).is_none());
+}

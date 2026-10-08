@@ -5,10 +5,10 @@
 //! - [`extract`] performs non-destructive extraction and verification.
 //! - [`keys`] manages Ed25519 signing keys.
 //! - [`preflight`] checks space and safety for a destination before extracting or consuming.
-//!
-//! The destructive consumer, staging and recovery arrive in phase 3 on top of `trunc-fs`.
+//! - [`consume`] extracts destructively, truncating the archive as outputs become durable.
 
 pub mod archive;
+pub mod consume;
 pub mod error;
 pub mod extract;
 mod io;
@@ -18,7 +18,7 @@ pub mod producer;
 mod walk;
 
 pub use archive::Archive;
-pub use error::{Error, Result};
+pub use error::{Error, PauseReason, Result};
 pub use trunc_core::space::{SpaceBound, SpaceParams};
 
 /// Producer string written into new manifests.
