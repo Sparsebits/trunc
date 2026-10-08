@@ -214,7 +214,7 @@ fn find_eocd(src: &dyn FileHandle, len: u64) -> Result<Eocd> {
                 let loc = read(src, pos - 20, 20)?;
                 if le32(&loc, 0) == SIG_ZIP64_LOCATOR {
                     let z_off = le64(&loc, 8);
-                    if z_off + 56 > pos {
+                    if z_off.checked_add(56).is_none_or(|end| end > pos) {
                         return Err(corrupt("Zip64 end record out of range"));
                     }
                     let z = read(src, z_off, 56)?;
@@ -351,7 +351,10 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
         let region_start = lho
             .checked_add(shift)
             .ok_or_else(|| corrupt("offset overflow"))?;
-        if region_start + 30 > cd_start {
+        if region_start
+            .checked_add(30)
+            .is_none_or(|end| end > cd_start)
+        {
             return Err(corrupt(format!(
                 "local header of {name:?} outside the data area"
             )));
@@ -407,7 +410,9 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
                     "data descriptor of {name:?} disagrees on CRC"
                 )));
             }
-            region_end = data_end + sig + want as u64;
+            region_end = data_end
+                .checked_add(sig + want as u64)
+                .ok_or_else(|| corrupt("size overflow"))?;
         }
         if region_end > cd_start {
             return Err(corrupt(format!(

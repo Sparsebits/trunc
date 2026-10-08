@@ -272,3 +272,28 @@ proptest! {
         }
     }
 }
+
+/// Regression (found by cargo-fuzz): a Zip64 locator pointing near u64::MAX overflowed.
+#[test]
+fn zip64_locator_offset_near_max_is_an_error() {
+    let mut bytes = ZipBuilder::new().zip64_eocd().build();
+    let loc = bytes
+        .windows(4)
+        .rposition(|w| w == [0x50, 0x4b, 0x06, 0x07])
+        .unwrap();
+    bytes[loc + 8..loc + 16].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+    assert!(matches!(parse(&bytes), Err(ZipError::Corrupt(_))));
+}
+
+/// Huge Zip64 local-header offsets must not overflow either.
+#[test]
+fn zip64_header_offset_near_max_is_an_error() {
+    let mut bytes = build(&[Spec::file("a.txt", b"hello").zip64()]);
+    let cd = bytes
+        .windows(4)
+        .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+        .unwrap();
+    let lho = cd + 46 + "a.txt".len() + 4 + 16; // zip64 extra: usize, csize, then offset
+    bytes[lho..lho + 8].copy_from_slice(&(u64::MAX - 5).to_le_bytes());
+    assert!(parse(&bytes).is_err());
+}

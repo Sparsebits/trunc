@@ -210,7 +210,7 @@ impl<'a> BitReader<'a> {
         }
         let v = u32::try_from(self.bits & ((1u64 << n) - 1)).expect("n <= 32");
         self.consume(n);
-        if self.consumed > self.len * 8 {
+        if self.consumed > self.len.saturating_mul(8) {
             return Err(InflateError::Overrun);
         }
         Ok(v)
@@ -297,7 +297,7 @@ impl Huffman {
         let e = self.fast[usize::try_from(br.bits & ((1 << FAST_BITS) - 1)).expect("small")];
         if e != 0 {
             br.consume(u32::from(e & 15));
-            if br.consumed > br.len * 8 {
+            if br.consumed > br.len.saturating_mul(8) {
                 return Err(InflateError::Overrun);
             }
             return Ok(e >> 4);
