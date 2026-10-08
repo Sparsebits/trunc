@@ -1,5 +1,7 @@
 # trunc
 
+*By [Headroom Labs](https://github.com/headroom-labs).*
+
 Self-consuming archives. A `.trnc` archive stores its blocks in reverse order, so an extractor can decode the block at the end of the file, make its output durable, and truncate the archive past it. Extraction then needs roughly *output size − archive size* of free space instead of the full output size.
 
 > **Status: early development (plan phases 0–4 done).** Create, inspect, verify, plan, extract and destructive extraction (`--consume`) with crash recovery work for `.trnc` and for existing ZIP archives, including punch mode, which frees space inside huge ZIP entries as they decompress. Windows/NTFS is the primary platform; Linux runs everything except volume probing and sparse-file features (phase 5).
