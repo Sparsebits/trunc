@@ -1,0 +1,129 @@
+name: release
+
+# A pushed `v*` tag builds every target, smoke-tests it, and creates a *draft* GitHub release with
+# the archives, per-file .sha256 files and SHA256SUMS. Publishing the draft is a manual step.
+# Running the workflow by hand builds and uploads the archives as artifacts only (a dry run).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      TRUNC_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux binaries are static (musl), so they run on any distribution. zig provides the C
+      # cross-compiler for zstd and the musl libc for both architectures.
+      - name: install zig
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSfL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-zigbuild
+      - name: build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then build=zigbuild; else build=build; fi
+          cargo $build --locked --profile dist --target ${{ matrix.target }} -p trunc-cli
+
+      - name: smoke test
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          bin="$PWD/target/${{ matrix.target }}/dist/trunc"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --version
+          mkdir -p smoke/data && echo hello > smoke/data/a.txt && cd smoke
+          "$bin" create a.trnc data
+          "$bin" x a.trnc -C out --consume --yes
+          test "$(cat out/data/a.txt)" = hello
+
+      - name: package
+        shell: bash
+        run: |
+          name="trunc-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/${{ matrix.target }}/dist/trunc.exe" "dist/$name/"
+            asset="$name.zip"
+            (cd dist && 7z a -tzip -bso0 "$asset" "$name")
+          else
+            cp "target/${{ matrix.target }}/dist/trunc" "dist/$name/"
+            asset="$name.tar.gz"
+            tar -C dist -czf "dist/$asset" "$name"
+          fi
+          (cd dist && sha256sum "$asset" > "$asset.sha256" && cat "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag matches the crate version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"; exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums and release notes
+        run: |
+          (cd dist && sha256sum *.zip *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          # The CHANGELOG section for this version, without its heading.
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            /^## / && on { exit }
+            on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"; exit 1; }
+      # Signed build provenance (Sigstore). GitHub offers attestations on public repositories.
+      - uses: actions/attest-build-provenance@v2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-path: "dist/*.zip, dist/*.tar.gz"
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "trunc $GITHUB_REF_NAME" --notes-file notes.md

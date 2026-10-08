@@ -1,0 +1,53 @@
+# Changelog
+
+All notable changes to trunc. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
+change the command line; the `.trnc` v1 format is frozen.
+
+## [0.1.0] - 2026-10-09
+
+The first release.
+
+### Archives
+- `trunc create` packs files and directories into a `.trnc` archive. Blocks are independent zstd
+  (default level 9), lz4 or uncompressed frames, 8 MiB by default, with an optional trained
+  dictionary.
+- Every block and entry is hashed with BLAKE3 under a Merkle root. Archives can be signed with
+  Ed25519 (`trunc key gen`, `--sign`, `--require-signed`, `--trust-key`).
+- `trunc inspect`, `trunc verify` and `trunc plan` show what is inside, check every hash, and work
+  out the free space each kind of extraction needs.
+
+### Extracting while freeing the archive
+- `trunc x --consume` extracts a `.trnc` archive and shrinks it as each batch of files reaches the
+  disk, so it needs about *output size minus archive size* of free space. On a 10 GiB test it
+  peaked at 4.32 GiB, where a normal extract needs 10 GiB.
+- It is crash-safe: data is flushed before the archive bytes holding it are released, and the
+  archive's length records progress. `trunc resume` continues after a crash, a kill or a full disk
+  (exit code 75).
+- Files are written to a hidden staging folder and moved into place at the end.
+  `--verify-media` re-reads them from the disk, not the cache, before anything is released.
+
+### Existing ZIP files
+- `trunc x big.zip --consume` works on Stored and Deflate ZIPs, including Zip64 and data
+  descriptors. Every CRC is checked before anything is deleted, and the layout is kept in a small
+  journal.
+- Punch mode frees space inside large entries while they decompress, using a Deflate decoder that
+  saves its position every 64 MiB of output.
+- Overlapping entries (a zip-bomb technique) are refused unless you pass `--allow-overlap`.
+
+### Safety checks
+- Hostile paths are refused: absolute paths, `..`, drive letters, device names, alternate data
+  streams. Links are never followed when writing, and outputs that are hard links to the archive
+  are refused.
+- Destructive mode refuses archives in OneDrive, Dropbox, Google Drive or iCloud folders, and on
+  FAT32 and exFAT (override with `--allow-sync` or `--allow-unjournaled`). It warns about
+  snapshots, which keep freed space allocated.
+
+### Platforms
+- Windows (NTFS) and Linux (ext4, XFS, btrfs, ZFS), both with every feature. Prebuilt binaries
+  for Windows x64, Linux x64 and Linux ARM64. The Linux builds are static and run on any
+  distribution.
+- Install scripts: `install.sh` (Linux) and `install.ps1` (Windows). Both verify the download's
+  SHA-256 before installing.
+
+[0.1.0]: https://github.com/Sparsebits/trunc/releases/tag/v0.1.0

@@ -50,13 +50,26 @@ halfway, nothing is lost: run `trunc resume` and it carries on from where it sto
 
 ## Install
 
-There are no prebuilt releases yet. With Rust 1.85 or newer:
+On Linux (x86-64 or ARM64, any distribution):
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/Sparsebits/trunc/main/install.sh | sh
+```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Sparsebits/trunc/main/install.ps1 | iex"
+```
+
+Both scripts download the latest release, check its SHA-256, and install `trunc` to `~/.local/bin`
+or `%LOCALAPPDATA%\Programs	runc`. Set `TRUNC_VERSION=v0.1.0` to pin a version. You can also
+download the archives yourself from [Releases](https://github.com/Sparsebits/trunc/releases), or
+build from source with Rust 1.85 or newer:
 
 ```sh
 cargo install --git https://github.com/Sparsebits/trunc trunc-cli
 ```
-
-This installs a binary called `trunc`.
 
 ## Quick start
 

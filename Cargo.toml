@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -72,6 +72,13 @@ unwrap_used = "warn"
 [profile.release]
 debug = 1
 lto = "thin"
+
+# Published binaries: smaller and a little faster, no debug info.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+codegen-units = 1
 
 [profile.test]
 opt-level = 1

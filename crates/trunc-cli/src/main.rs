@@ -21,7 +21,7 @@ use fmt::{bytes, parse_size};
 #[derive(Debug, Parser)]
 #[command(
     name = "trunc",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("TRUNC_COMMIT"), ")"),
     about = "Self-consuming archives: extract using only the space the output needs"
 )]
 struct Cli {

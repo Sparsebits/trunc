@@ -899,15 +899,15 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "trunc-adapter"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "trunc-chunk"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "trunc-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-codec"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "lz4_flex",
  "proptest",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crc32fast",
  "ed25519-dalek",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-fs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "rustix",
  "tempfile",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-hash"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-journal"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "thiserror",
  "trunc-fs",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-legacy"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "trunc-testkit"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crc32fast",
  "flate2",
