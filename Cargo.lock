@@ -973,6 +973,7 @@ dependencies = [
 name = "trunc-fs"
 version = "0.0.1"
 dependencies = [
+ "rustix",
  "tempfile",
  "thiserror",
  "windows-sys 0.59.0",

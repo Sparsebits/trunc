@@ -252,13 +252,17 @@ impl FsBackend for OsFs {
         {
             probe_windows(&at, sync)
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            probe_unix(&at, sync)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Ok(VolumeInfo {
                 fs: FsKind::Unknown,
                 fs_name: "unknown".into(),
                 root: None,
-                volume_id: unix_dev(&at),
+                volume_id: None,
                 cluster_size: 4096,
                 free_bytes: None,
                 total_bytes: None,
@@ -266,12 +270,72 @@ impl FsBackend for OsFs {
                 sparse_granularity: 0,
                 max_file_size: u64::MAX,
                 sync,
-                snapshots: SnapshotHint::Unknown(
-                    "filesystem probing on this platform arrives with the Linux backend".into(),
-                ),
+                snapshots: SnapshotHint::Unknown("filesystem probing is not supported here".into()),
             })
         }
     }
+}
+
+/// Filesystem kind from a Linux `statfs` magic number.
+#[cfg(target_os = "linux")]
+fn linux_fs_kind(magic: u32) -> (FsKind, &'static str) {
+    match magic {
+        0xEF53 => (FsKind::Ext4, "ext4"),
+        0x5846_5342 => (FsKind::Xfs, "xfs"),
+        0x9123_683E => (FsKind::Btrfs, "btrfs"),
+        0x2FC1_2FC1 => (FsKind::Zfs, "zfs"),
+        0x2011_BAB0 => (FsKind::ExFat, "exfat"),
+        0x4D44 => (FsKind::Fat32, "vfat"),
+        0x7366_746E => (FsKind::Ntfs, "ntfs3"),
+        0x0102_1994 => (FsKind::Unknown, "tmpfs"),
+        0x794C_7630 => (FsKind::Unknown, "overlayfs"),
+        _ => (FsKind::Unknown, "unknown"),
+    }
+}
+
+#[cfg(unix)]
+fn probe_unix(at: &Path, sync: crate::SyncHint) -> Result<VolumeInfo> {
+    let vfs = rustix::fs::statvfs(at).map_err(|e| err("querying volume of", at)(e.into()))?;
+    let unit = if vfs.f_frsize > 0 {
+        vfs.f_frsize
+    } else {
+        vfs.f_bsize
+    };
+    #[cfg(target_os = "linux")]
+    let (fs, name) = {
+        let st = rustix::fs::statfs(at).map_err(|e| err("querying volume of", at)(e.into()))?;
+        // The magic is a 32-bit value stored in a signed or wider field depending on the ABI.
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let magic = st.f_type as u32;
+        linux_fs_kind(magic)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (fs, name) = (FsKind::Unknown, "unknown");
+    let snapshots = match fs {
+        FsKind::Btrfs | FsKind::Zfs => SnapshotHint::Unknown(format!(
+            "{name} snapshots can keep truncated data allocated; not checked"
+        )),
+        _ => SnapshotHint::None,
+    };
+    Ok(VolumeInfo {
+        fs,
+        fs_name: name.into(),
+        root: None,
+        volume_id: unix_dev(at),
+        cluster_size: u32::try_from(unit).unwrap_or(4096).max(512),
+        free_bytes: Some(vfs.f_bavail.saturating_mul(unit)),
+        total_bytes: Some(vfs.f_blocks.saturating_mul(unit)),
+        // Range deallocation on Linux (fallocate PUNCH_HOLE) arrives with the full backend.
+        supports_sparse: false,
+        sparse_granularity: 0,
+        max_file_size: if fs == FsKind::Fat32 {
+            (4u64 << 30) - 1
+        } else {
+            u64::MAX
+        },
+        sync,
+        snapshots,
+    })
 }
 
 #[cfg(windows)]
@@ -329,11 +393,6 @@ fn probe_windows(at: &Path, sync: crate::SyncHint) -> Result<VolumeInfo> {
 fn unix_dev(p: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     fs::metadata(p).ok().map(|m| m.dev())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn unix_dev(_p: &Path) -> Option<u64> {
-    None
 }
 
 impl OsFile {

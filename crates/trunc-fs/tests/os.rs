@@ -131,6 +131,10 @@ fn probe_reports_a_sane_volume() {
         v.cluster_size.is_power_of_two() && v.cluster_size >= 512,
         "{v:?}"
     );
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(v.free_bytes.unwrap() > 0, "free space is probed: {v:?}");
+        assert!(v.volume_id.is_some());
+    }
     if cfg!(windows) {
         assert_ne!(v.fs, FsKind::Unknown, "{v:?}");
         assert!(v.free_bytes.unwrap() > 0 && v.total_bytes.unwrap() >= v.free_bytes.unwrap());

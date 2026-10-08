@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
