@@ -1,0 +1,393 @@
+//! Non-destructive extraction and verification.
+//!
+//! Both walk the blocks in logical order, decoding a round of blocks in parallel and then
+//! applying them in order. Each entry's BLAKE3 is recomputed from the decoded stream and checked
+//! when its last byte arrives, on top of the per-block hash checks in [`Archive::decode_block`].
+
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
+use trunc_core::{EntryKind, Manifest};
+
+use crate::archive::Archive;
+use crate::error::{Error, IoContext, Result, at};
+use crate::io::{len_usize, write_all_at};
+use crate::walk::system_time;
+
+#[derive(Debug, Clone, Default)]
+pub struct TrustPolicy {
+    /// Refuse unsigned archives.
+    pub require_signed: bool,
+    /// If non-empty, the signer must be one of these keys.
+    pub trusted_keys: Vec<[u8; 32]>,
+}
+
+impl TrustPolicy {
+    pub fn check(&self, archive: &Archive) -> Result<()> {
+        match archive.signer() {
+            None if self.require_signed || !self.trusted_keys.is_empty() => {
+                Err(Error::Refused("archive is not signed".into()))
+            }
+            Some(k) if !self.trusted_keys.is_empty() && !self.trusted_keys.contains(&k) => {
+                Err(Error::Refused(format!(
+                    "archive is signed by untrusted key {}",
+                    hex::encode(k)
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtractOptions {
+    /// Replace existing regular files at destination paths.
+    pub overwrite: bool,
+    /// Create symlink entries (only those resolving inside the destination).
+    pub allow_symlinks: bool,
+    pub trust: TrustPolicy,
+    /// Decode threads; 0 = all cores.
+    pub threads: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractSummary {
+    pub files: usize,
+    pub dirs: usize,
+    pub symlinks_created: usize,
+    pub symlinks_skipped: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifySummary {
+    pub blocks: usize,
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+/// Decode every remaining block in logical order and hand each decoded buffer to `apply`.
+fn for_each_block(
+    archive: &Archive,
+    threads: usize,
+    mut apply: impl FnMut(usize, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| Error::Input(format!("cannot start worker threads: {e}")))?;
+    let per_round = pool.current_num_threads().max(1) * 2;
+    let n = archive.manifest().blocks.len();
+    let mut i = archive.consumed();
+    while i < n {
+        let end = (i + per_round).min(n);
+        let decoded: Vec<Result<Vec<u8>>> = pool.install(|| {
+            (i..end)
+                .into_par_iter()
+                .map(|b| archive.decode_block(b))
+                .collect()
+        });
+        for (k, buf) in decoded.into_iter().enumerate() {
+            apply(i + k, &buf?)?;
+        }
+        i = end;
+    }
+    Ok(())
+}
+
+/// Tracks per-entry hashing as decoded runs arrive in stream order.
+struct EntryHashes<'m> {
+    m: &'m Manifest,
+    remaining: Vec<u64>,
+    hashers: HashMap<usize, trunc_hash::Blake3Hasher>,
+}
+
+impl<'m> EntryHashes<'m> {
+    fn new(m: &'m Manifest) -> Self {
+        Self {
+            m,
+            remaining: m.entries.iter().map(|e| e.size).collect(),
+            hashers: HashMap::new(),
+        }
+    }
+
+    /// Feed a run; returns true when the entry is complete (and verified).
+    fn feed(&mut self, entry: usize, data: &[u8]) -> Result<bool> {
+        self.hashers.entry(entry).or_default().update(data);
+        self.remaining[entry] -= data.len() as u64;
+        if self.remaining[entry] > 0 {
+            return Ok(false);
+        }
+        let h = self.hashers.remove(&entry).expect("hasher inserted above");
+        if *h.finalize().as_bytes() != self.m.entries[entry].blake3 {
+            return Err(Error::Integrity(format!(
+                "content hash mismatch for {:?}",
+                self.m.entries[entry].path
+            )));
+        }
+        Ok(true)
+    }
+}
+
+/// Verify every block and every entry hash without writing anything.
+pub fn verify(archive: &Archive, trust: &TrustPolicy, threads: usize) -> Result<VerifySummary> {
+    trust.check(archive)?;
+    require_complete(archive)?;
+    let m = archive.manifest();
+    let mut hashes = EntryHashes::new(m);
+    let mut summary = VerifySummary::default();
+    for_each_block(archive, threads, |i, buf| {
+        let b = &m.blocks[i];
+        for r in archive.stream().runs(b.stream_off, b.u_len) {
+            let s = len_usize(r.buf_off);
+            hashes.feed(r.entry, &buf[s..s + len_usize(r.len)])?;
+        }
+        summary.blocks += 1;
+        summary.bytes += b.u_len;
+        Ok(())
+    })?;
+    let empty = trunc_hash::blake3(b"");
+    for e in m.entries.iter().filter(|e| e.size == 0) {
+        if e.blake3 != empty {
+            return Err(Error::Integrity(format!(
+                "content hash mismatch for {:?}",
+                e.path
+            )));
+        }
+    }
+    summary.entries = m.entries.len();
+    Ok(summary)
+}
+
+fn require_complete(archive: &Archive) -> Result<()> {
+    if archive.is_complete() {
+        Ok(())
+    } else {
+        Err(Error::Refused(format!(
+            "archive is partially consumed ({} of {} blocks); resume the consume instead",
+            archive.consumed(),
+            archive.manifest().blocks.len()
+        )))
+    }
+}
+
+/// Join a validated manifest path onto `dest`.
+fn dest_path(dest: &Path, rel: &str) -> PathBuf {
+    let mut p = dest.to_path_buf();
+    for c in rel.split('/') {
+        p.push(c);
+    }
+    p
+}
+
+/// Extract everything into `dest` without modifying the archive.
+pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<ExtractSummary> {
+    opts.trust.check(archive)?;
+    require_complete(archive)?;
+    let m = archive.manifest();
+    let mut summary = ExtractSummary::default();
+
+    fs::create_dir_all(dest).ctx(at("creating", dest))?;
+    for d in m.all_dirs() {
+        let p = dest_path(dest, &d);
+        match fs::symlink_metadata(&p) {
+            Ok(md) if md.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(Error::Refused(format!(
+                    "{} exists and is not a directory (or is a link)",
+                    p.display()
+                )));
+            }
+            Err(_) => fs::create_dir(&p).ctx(at("creating", &p))?,
+        }
+        summary.dirs += 1;
+    }
+
+    // Create every file up front so empty files exist and conflicts surface before any data
+    // is written.
+    let mut open: HashMap<usize, File> = HashMap::new();
+    for (i, e) in m.entries.iter().enumerate() {
+        if !matches!(e.kind, EntryKind::File) {
+            continue;
+        }
+        let p = dest_path(dest, &e.path);
+        let f = create_output(&p, opts.overwrite)?;
+        if e.size > 0 {
+            f.set_len(e.size).ctx(at("allocating", &p))?;
+            open.insert(i, f);
+        } else {
+            if e.blake3 != trunc_hash::blake3(b"") {
+                return Err(Error::Integrity(format!(
+                    "content hash mismatch for {:?}",
+                    e.path
+                )));
+            }
+            finish_file(&f, &p, e)?;
+        }
+        summary.files += 1;
+    }
+
+    let mut hashes = EntryHashes::new(m);
+    for_each_block(archive, opts.threads, |i, buf| {
+        let b = &m.blocks[i];
+        for r in archive.stream().runs(b.stream_off, b.u_len) {
+            let s = len_usize(r.buf_off);
+            let data = &buf[s..s + len_usize(r.len)];
+            let e = &m.entries[r.entry];
+            let f = open
+                .get(&r.entry)
+                .expect("non-empty files are opened up front");
+            let p = dest_path(dest, &e.path);
+            write_all_at(f, data, r.entry_off).ctx(at("writing", &p))?;
+            if hashes.feed(r.entry, data)? {
+                let f = open.remove(&r.entry).expect("present");
+                finish_file(&f, &p, e)?;
+            }
+        }
+        summary.bytes += b.u_len;
+        Ok(())
+    })?;
+    debug_assert!(open.is_empty(), "every file received all its bytes");
+
+    for e in &m.entries {
+        if let EntryKind::Symlink { target } = &e.kind {
+            if opts.allow_symlinks && symlink_stays_inside(&e.path, target) {
+                create_symlink(m, dest, &e.path, target)?;
+                summary.symlinks_created += 1;
+            } else {
+                summary.symlinks_skipped += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn create_output(p: &Path, overwrite: bool) -> Result<File> {
+    if let Ok(md) = fs::symlink_metadata(p) {
+        if !overwrite {
+            return Err(Error::Refused(format!("{} already exists", p.display())));
+        }
+        if !md.file_type().is_file() {
+            return Err(Error::Refused(format!(
+                "{} exists and is not a regular file; not overwriting",
+                p.display()
+            )));
+        }
+        let mut perms = md.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(p, perms).ctx(at("making writable", p))?;
+        }
+    }
+    let mut oo = OpenOptions::new();
+    oo.read(true).write(true);
+    if overwrite {
+        oo.create(true).truncate(true);
+    } else {
+        oo.create_new(true);
+    }
+    oo.open(p).ctx(at("creating", p))
+}
+
+fn finish_file(f: &File, p: &Path, e: &trunc_core::Entry) -> Result<()> {
+    f.set_modified(system_time(e.mtime_unix, e.mtime_nanos))
+        .ctx(at("setting mtime of", p))?;
+    apply_mode(p, e.mode)
+}
+
+#[cfg(unix)]
+fn apply_mode(p: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Never restore setuid/setgid/sticky bits from an archive.
+    fs::set_permissions(p, fs::Permissions::from_mode(mode & 0o777)).ctx(at("setting mode of", p))
+}
+
+#[cfg(not(unix))]
+fn apply_mode(p: &Path, mode: u32) -> Result<()> {
+    if mode & 0o222 == 0 {
+        let mut perms = fs::metadata(p)
+            .ctx(at("reading metadata of", p))?
+            .permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(p, perms).ctx(at("setting read-only", p))?;
+    }
+    Ok(())
+}
+
+/// True if a relative link target, resolved lexically from the link's directory, stays inside
+/// the extraction root.
+fn symlink_stays_inside(link_path: &str, target: &str) -> bool {
+    if target.starts_with('/') || target.contains('\\') || target.contains(':') {
+        return false;
+    }
+    let mut depth: i64 = link_path.split('/').count() as i64 - 1;
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn create_symlink(_m: &Manifest, dest: &Path, rel: &str, target: &str) -> Result<()> {
+    let p = dest_path(dest, rel);
+    std::os::unix::fs::symlink(target, &p).ctx(at("creating symlink", &p))
+}
+
+#[cfg(windows)]
+fn create_symlink(m: &Manifest, dest: &Path, rel: &str, target: &str) -> Result<()> {
+    let p = dest_path(dest, rel);
+    // Resolve the target lexically to decide between a file and a directory link.
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let resolved = parts.join("/");
+    let is_dir = m.all_dirs().iter().any(|d| d == &resolved);
+    let native = target.replace('/', "\\");
+    let r = if is_dir {
+        std::os::windows::fs::symlink_dir(&native, &p)
+    } else {
+        std::os::windows::fs::symlink_file(&native, &p)
+    };
+    r.ctx(at(
+        "creating symlink (needs Developer Mode or admin on Windows)",
+        &p,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_containment() {
+        assert!(symlink_stays_inside("a/link", "b"));
+        assert!(symlink_stays_inside("a/link", "../b"));
+        assert!(symlink_stays_inside("a/b/link", "../../c"));
+        assert!(!symlink_stays_inside("link", "../escape"));
+        assert!(!symlink_stays_inside("a/link", "../../escape"));
+        assert!(!symlink_stays_inside("a/link", "/etc/passwd"));
+        assert!(!symlink_stays_inside("a/link", "C:/Windows"));
+        assert!(!symlink_stays_inside("a/link", "..\\..\\x"));
+        assert!(symlink_stays_inside("a/link", "./x/../y"));
+    }
+}

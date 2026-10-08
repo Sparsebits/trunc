@@ -1,0 +1,22 @@
+[package]
+name = "trunc-core"
+description = "trunc .trnc format types and encoders/decoders. Pure: no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+trunc-hash.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

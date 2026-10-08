@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/trunc-hash",
+    "crates/trunc-core",
+    "crates/trunc-codec",
+    "crates/trunc-chunk",
+    "crates/trunc-fs",
+    "crates/trunc-journal",
+    "crates/trunc-legacy",
+    "crates/trunc-engine",
+    "crates/trunc-adapter",
+    "crates/trunc-cli",
+    "crates/trunc-testkit",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# internal
+trunc-hash = { path = "crates/trunc-hash" }
+trunc-core = { path = "crates/trunc-core" }
+trunc-codec = { path = "crates/trunc-codec" }
+trunc-chunk = { path = "crates/trunc-chunk" }
+trunc-fs = { path = "crates/trunc-fs" }
+trunc-journal = { path = "crates/trunc-journal" }
+trunc-legacy = { path = "crates/trunc-legacy" }
+trunc-engine = { path = "crates/trunc-engine" }
+trunc-adapter = { path = "crates/trunc-adapter" }
+trunc-testkit = { path = "crates/trunc-testkit" }
+
+# external
+anyhow = "1"
+blake3 = "1"
+ciborium = "0.2"
+clap = { version = "4", features = ["derive"] }
+crc32c = "0.6"
+ed25519-dalek = "2"
+getrandom = "0.3"
+hex = "0.4"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+proptest = "1"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+unicode-normalization = "0.1"
+zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+cast_possible_truncation = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+debug = 1
+lto = "thin"
+
+[profile.test]
+opt-level = 1

@@ -1,0 +1,27 @@
+name: crash
+
+# Nightly crash-injection sweep and real-filesystem integration tests.
+# The harness lands in phase 3; until then this runs the full test suite with many more
+# property-test cases so the job and its schedule exist from day one.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PROPTEST_CASES: "1000"
+
+jobs:
+  sweep:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release -- --include-ignored

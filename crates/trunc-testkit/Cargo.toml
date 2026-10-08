@@ -1,0 +1,13 @@
+[package]
+name = "trunc-testkit"
+description = "Test fixtures, tree comparison and (later) fault injection for trunc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

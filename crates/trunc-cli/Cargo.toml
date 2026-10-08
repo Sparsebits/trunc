@@ -1,0 +1,28 @@
+[package]
+name = "trunc-cli"
+description = "The trunc command-line tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "trunc"
+path = "src/main.rs"
+
+[dependencies]
+trunc-chunk.workspace = true
+trunc-codec.workspace = true
+trunc-core.workspace = true
+trunc-engine.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+trunc-testkit.workspace = true
+
+[lints]
+workspace = true
