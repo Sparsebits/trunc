@@ -305,7 +305,7 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
         )?;
         if p.extract_fits == Some(false) {
             anyhow::bail!(
-                "not enough free space at {}: extracting needs about {}, {} are free                  (--consume needs about {}; --ignore-space to try anyway)",
+                "not enough free space at {}: extracting needs about {}, {} are free (--consume needs about {}; --ignore-space to try anyway)",
                 a.dest.display(),
                 bytes(p.bound.extract_extra),
                 bytes(p.destination.free_bytes.unwrap_or(0)),

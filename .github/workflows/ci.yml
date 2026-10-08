@@ -50,3 +50,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  # FAT32 and exFAT: no metadata journal, no sparse files. Loop-mounted images exercise the
+  # refusal without --allow-unjournaled and the whole-entry fallback when holes can't be punched.
+  unjournaled:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: mount FAT32 and exFAT images
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq dosfstools exfatprogs
+          for k in vfat exfat; do
+            truncate -s 1G "$RUNNER_TEMP/$k.img"
+            if [ "$k" = vfat ]; then mkfs.vfat -F 32 "$RUNNER_TEMP/$k.img"; else mkfs.exfat "$RUNNER_TEMP/$k.img"; fi
+            sudo mkdir -p "/mnt/$k"
+            sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" "$RUNNER_TEMP/$k.img" "/mnt/$k"
+          done
+      - name: test
+        run: cargo test -p trunc-cli --test cli unjournaled -- --nocapture
+        env:
+          TRUNC_TEST_UNJOURNALED_DIRS: /mnt/vfat:/mnt/exfat
+
+  aarch64-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - run: cargo build --release --target aarch64-unknown-linux-gnu -p trunc-cli
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc

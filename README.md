@@ -261,8 +261,9 @@ large file.
 <details>
 <summary><b>Which platforms does it run on?</b></summary>
 
-Windows with NTFS gets every feature. Linux supports `.trnc` extraction and ZIP extraction one
-entry at a time; releasing space inside large ZIP entries is coming to Linux next. macOS is untested.
+Windows (NTFS) and Linux (ext4, XFS, btrfs, ZFS) get every feature. Both are tested on every
+commit, and Linux builds for x86-64 and ARM64. FAT32 and exFAT drives work with
+`--allow-unjournaled`. macOS is untested.
 
 </details>
 

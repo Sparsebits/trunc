@@ -317,3 +317,48 @@ fn zip_bomb_is_refused_by_the_space_check() {
     );
     assert!(!w.join("out").exists(), "nothing written");
 }
+
+/// FAT32 and exFAT have no metadata journal and no sparse files. `TRUNC_TEST_UNJOURNALED_DIRS`
+/// (`:`-separated, e.g. loop-mounted images in CI) names writable directories on such volumes.
+/// Destructive mode must refuse there by default, leaving the archive whole, and work with
+/// `--allow-unjournaled`, ZIP punch mode falling back to whole entries.
+#[test]
+fn unjournaled_volumes_need_consent() {
+    let Ok(dirs) = std::env::var("TRUNC_TEST_UNJOURNALED_DIRS") else {
+        eprintln!("TRUNC_TEST_UNJOURNALED_DIRS not set; skipping");
+        return;
+    };
+    for dir in dirs.split(':').filter(|d| !d.is_empty()) {
+        let d = tempfile::tempdir_in(dir).unwrap();
+        let w = d.path();
+        fixtures::mixed(&w.join("data"), 7);
+        ok(&trunc(
+            &["create", "data.trnc", "data", "--block-size", "256K"],
+            w,
+        ));
+        let size = std::fs::metadata(w.join("data.trnc")).unwrap().len();
+
+        let s = ok(&trunc(&["plan", "data.trnc", "-C", "out"], w));
+        assert!(s.contains("NOT journaled"), "{dir}: {s}");
+        let refused = trunc(&["x", "data.trnc", "-C", "out", "--consume", "--yes"], w);
+        assert!(!refused.status.success(), "{dir}: consumed without consent");
+        assert_eq!(std::fs::metadata(w.join("data.trnc")).unwrap().len(), size);
+
+        let yes = ["--consume", "--yes", "--allow-unjournaled"];
+        ok(&trunc(
+            &[&["x", "data.trnc", "-C", "out"][..], &yes].concat(),
+            w,
+        ));
+        tree::assert_same(&w.join("data"), &w.join("out/data"));
+        assert!(!w.join("data.trnc").exists());
+
+        let files = write_zip(&w.join("a.zip"), 3);
+        let punch = ["--punch-min", "1", "--checkpoint-every", "64K"];
+        ok(&trunc(
+            &[&["x", "a.zip", "-C", "zout"][..], &yes, &punch].concat(),
+            w,
+        ));
+        assert_files(&w.join("zout"), &files);
+        assert!(!w.join("a.zip").exists() && !w.join("a.zip.trncj").exists());
+    }
+}

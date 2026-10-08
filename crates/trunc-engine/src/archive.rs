@@ -84,7 +84,7 @@ impl Archive {
         let fbo = header.first_block_off();
         let consumed = m.consumed_blocks(fbo, file_len).ok_or_else(|| {
             Error::Integrity(format!(
-                "archive length {file_len} is not at a block boundary (expected {} when complete);                  the file is truncated, extended or corrupt",
+                "archive length {file_len} is not at a block boundary (expected {} when complete); the file is truncated, extended or corrupt",
                 m.archive_len(fbo)
             ))
         })?;

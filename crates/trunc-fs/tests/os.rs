@@ -184,14 +184,14 @@ fn dealloc_zeroes_and_reports() {
 
 /// The probe's `sparse_granularity` must be at least the real unit, so planned frees never
 /// overestimate what is released.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn sparse_granularity_matches_probe() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("gran");
     write_file(&p, &vec![7u8; 1 << 20]);
     let v = fs().probe_volume(&p).unwrap();
-    if v.fs != FsKind::Ntfs {
+    if !v.supports_sparse {
         return;
     }
     let f = fs()
@@ -199,7 +199,7 @@ fn sparse_granularity_matches_probe() {
         .unwrap();
     // An unaligned request: what gets freed is aligned to the real unit.
     let Dealloc::Freed { freed } = f.deallocate(100_000, 700_000).unwrap() else {
-        panic!("NTFS supports sparse files");
+        panic!("the probe said {} can free ranges", v.fs_name);
     };
     let unit = u64::from(v.sparse_granularity);
     eprintln!(
@@ -305,7 +305,7 @@ fn truncating_a_mapped_file_is_retryable() {
 /// Shrinking must return space to the volume immediately, while the handle stays open. (Setting
 /// only the end-of-file marker leaves the allocation in place until the handle closes, which would
 /// make --consume hold the whole archive until the end.)
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn shrinking_frees_space_while_open() {
     let d = tempfile::tempdir().unwrap();
@@ -358,4 +358,153 @@ fn read_back_sees_flushed_bytes_at_unaligned_offsets() {
         f.read_back(&mut past, 299_990).is_err(),
         "reading past the end is an error"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_probe_names_the_mount() {
+    let d = tempfile::tempdir().unwrap();
+    let v = fs().probe_volume(d.path()).unwrap();
+    eprintln!("{v:?}");
+    assert!(v.root.is_some(), "mount point found: {v:?}");
+    assert_ne!(v.fs_name, "unknown", "named by magic or mount table: {v:?}");
+    if v.fs == FsKind::Ext4 {
+        assert!(v.supports_sparse && v.sparse_granularity >= 512, "{v:?}");
+    }
+}
+
+/// `Share::Exclusive` is an advisory lock on Linux: a second trunc is turned away, other programs
+/// are not (that limit is documented).
+#[cfg(target_os = "linux")]
+#[test]
+fn exclusive_open_stops_a_second_exclusive_open() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("x");
+    write_file(&p, b"x");
+    let held = fs()
+        .open(&p, OpenMode::ReadWrite, Share::Exclusive)
+        .unwrap();
+    for mode in [OpenMode::ReadWrite, OpenMode::Read] {
+        assert!(matches!(
+            fs().open(&p, mode, Share::Exclusive),
+            Err(FsError::Busy { .. })
+        ));
+    }
+    drop(fs().open(&p, OpenMode::ReadWrite, Share::Shared).unwrap());
+    held.write_all_at(b"still writable", 0).unwrap();
+    drop(held);
+    // Readers share.
+    let r1 = fs().open(&p, OpenMode::Read, Share::Exclusive).unwrap();
+    let r2 = fs().open(&p, OpenMode::Read, Share::Exclusive).unwrap();
+    drop((r1, r2));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_are_never_followed() {
+    use std::os::unix::fs::symlink;
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    write_file(&outside.join("victim"), b"keep");
+    symlink(outside.join("victim"), root.join("file-link")).unwrap();
+    symlink(&outside, root.join("dir-link")).unwrap();
+
+    // A link as the final component, through plain open and the confined variants.
+    for mode in [
+        OpenMode::Read,
+        OpenMode::ReadWrite,
+        OpenMode::CreateOrTruncate,
+    ] {
+        let e = fs()
+            .open(&root.join("file-link"), mode, Share::Shared)
+            .unwrap_err();
+        assert!(matches!(e, FsError::Link { .. }), "{mode:?}: {e}");
+        let e = fs()
+            .open_beneath(&root, &root.join("file-link"), mode, Share::Shared)
+            .unwrap_err();
+        assert!(matches!(e, FsError::Link { .. }), "{mode:?}: {e}");
+    }
+    // A link in the middle of the path.
+    let through = root.join("dir-link").join("victim");
+    let e = fs()
+        .open_beneath(&root, &through, OpenMode::ReadWrite, Share::Shared)
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    let e = fs()
+        .create_dir_beneath(&root, &root.join("dir-link").join("new"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!outside.join("new").exists());
+    // Leaving the root.
+    assert!(
+        fs().open_beneath(
+            &root,
+            &outside.join("victim"),
+            OpenMode::Read,
+            Share::Shared
+        )
+        .is_err()
+    );
+    assert!(
+        fs().open_beneath(
+            &root,
+            &root.join("..").join("outside").join("victim"),
+            OpenMode::Read,
+            Share::Shared
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"keep");
+
+    // Ordinary nested paths work.
+    fs().create_dir_beneath(&root, &root.join("a")).unwrap();
+    fs().create_dir_beneath(&root, &root.join("a").join("b"))
+        .unwrap();
+    let f = fs()
+        .open_beneath(
+            &root,
+            &root.join("a").join("b").join("c"),
+            OpenMode::CreateNew,
+            Share::Exclusive,
+        )
+        .unwrap();
+    f.write_all_at(b"ok", 0).unwrap();
+    drop(f);
+    let f = fs()
+        .open_beneath(
+            &root,
+            &root.join("a").join("b").join("c"),
+            OpenMode::ReadWrite,
+            Share::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(f.size().unwrap(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn preallocate_reserves_blocks() {
+    use std::os::unix::fs::MetadataExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("pre");
+    let f = fs()
+        .open(&p, OpenMode::CreateNew, Share::Exclusive)
+        .unwrap();
+    let len = 64u64 << 20;
+    f.preallocate(len).unwrap();
+    assert_eq!(f.size().unwrap(), len);
+    let md = std::fs::metadata(&p).unwrap();
+    if fs().probe_volume(&p).unwrap().fs == FsKind::Ext4 {
+        assert!(
+            md.blocks() * 512 >= len,
+            "{} bytes reserved",
+            md.blocks() * 512
+        );
+    }
+    // Never shrinks.
+    f.preallocate(1).unwrap();
+    assert_eq!(f.size().unwrap(), len);
 }

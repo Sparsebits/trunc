@@ -54,7 +54,7 @@ impl std::fmt::Display for PauseReason {
             }
             PauseReason::Mapped => write!(
                 f,
-                "another program (often an antivirus or indexer) has the archive mapped; close                  it, then resume"
+                "another program (often an antivirus or indexer) has the archive mapped; close it, then resume"
             ),
         }
     }

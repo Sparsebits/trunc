@@ -46,6 +46,11 @@ impl FsError {
             Some(39 | 112) => return FsError::NoSpace { path }, // HANDLE_DISK_FULL, DISK_FULL
             #[cfg(unix)]
             Some(28) => return FsError::NoSpace { path }, // ENOSPC
+            // O_NOFOLLOW and RESOLVE_NO_SYMLINKS report a link in the way as ELOOP.
+            #[cfg(unix)]
+            Some(n) if n == rustix::io::Errno::LOOP.raw_os_error() => {
+                return FsError::Link { path };
+            }
             _ => {}
         }
         match e.kind() {

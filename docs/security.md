@@ -20,12 +20,12 @@ How each rule from the design (plan section 7) is enforced, and the test that sh
 
 | Rule | Enforced in | Tested by |
 |---|---|---|
-| Never follow symlinks or junctions when opening outputs | `OsFs::open` (`FILE_FLAG_OPEN_REPARSE_POINT` + attribute check; junction detection on open failure) | `junctions_are_never_followed` |
+| Never follow symlinks or junctions when opening outputs | `OsFs::open` (Windows: `FILE_FLAG_OPEN_REPARSE_POINT` + attribute check, junction detection on open failure; Linux: `O_NOFOLLOW`). Staged outputs and directories go through `open_beneath` / `create_dir_beneath`, which on Linux use `openat2(RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS)` so no component below the staging directory can be a link | `junctions_are_never_followed`; `symlinks_are_never_followed` |
 | Symlink entries are never created by `--consume`; non-destructive extraction creates them only with `--allow-symlinks` and only when they resolve inside the destination | `stage::build_structure`; `extract::symlink_stays_inside` | `symlink_containment` |
-| Writes go only into the staging directory until the rename phase; renames never replace existing paths | `consume`, `consume_zip`, `OsFs::rename` (`MoveFileExW` without replace) | `check_crash_state` in every crash sweep; `rename_never_replaces`; `refuses_existing_targets_and_wrong_destinations` |
+| Writes go only into the staging directory until the rename phase; renames never replace existing paths | `consume`, `consume_zip`, `OsFs::rename` (Windows `MoveFileExW` without replace; Linux `renameat2(RENAME_NOREPLACE)`) | `check_crash_state` in every crash sweep; `rename_never_replaces`; `refuses_existing_targets_and_wrong_destinations` |
 | An output is never the archive or its journal under another name | `stage::open_staged_output` compares file ids | `refuses_staged_files_that_are_the_archive`; `refuses_staged_files_that_are_the_zip` |
 | setuid/setgid/sticky bits are never restored | `extract::apply_mode` (`mode & 0o777`); `OsFs::set_mode` | code review |
-| Outputs cannot be modified by other processes during consumption | exclusive share mode (other handles may read only) | `exclusive_open_blocks_other_handles`; `exclusive_handles_and_create_semantics` |
+| Outputs cannot be modified by other processes during consumption | Windows: exclusive share mode (other handles may read only). Linux: advisory `flock`, which stops a second trunc but not other programs (see gaps) | `exclusive_open_blocks_other_handles`; `exclusive_open_stops_a_second_exclusive_open`; `exclusive_handles_and_create_semantics` |
 
 ## Trust
 
@@ -38,7 +38,7 @@ How each rule from the design (plan section 7) is enforced, and the test that sh
 
 ## Known gaps and accepted risks
 
-- **Local attackers racing the staging directory.** Intermediate directories are checked when created or reused, but a process with write access to the destination could swap a staged directory for a junction between the check and a later open. On Linux, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` closes this; that arrives with the Linux backend (phase 5). Destructive extraction into a directory that untrusted local users can write to is not supported.
-- **Linux advisory locking.** Other processes can modify staged outputs. Changes are caught by hashes on resume, not prevented.
+- **Local attackers racing the staging directory (Windows, and Linux kernels before 5.6).** Intermediate directories are checked when created or reused, but a process with write access to the destination could swap a staged directory for a junction between the check and a later open. On Linux 5.6 and later, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` closes this; where openat2 is unavailable the check-then-open fallback applies. Destructive extraction into a directory that untrusted local users can write to is not supported.
+- **Linux advisory locking.** `flock` stops a second trunc, but other programs can still modify staged outputs. Changes are caught by hashes on resume, not prevented.
 - **Integrity is not authenticity.** An unsigned archive can be replaced wholesale. Use signatures and `--trust-key` when the source matters.
 - **Lying storage.** A drive that acknowledges flushes without persisting data defeats any ordering. `--verify-media` reads data back, bypassing the OS cache, before releasing source bytes; the drive's own cache may still answer.

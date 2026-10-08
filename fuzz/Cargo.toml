@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 trunc-core = { path = "../crates/trunc-core" }
+trunc-hash = { path = "../crates/trunc-hash" }
 trunc-fs = { path = "../crates/trunc-fs" }
 trunc-legacy = { path = "../crates/trunc-legacy" }
 trunc-testkit = { path = "../crates/trunc-testkit" }

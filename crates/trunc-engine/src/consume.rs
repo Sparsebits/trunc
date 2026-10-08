@@ -30,9 +30,9 @@ use crate::extract::TrustPolicy;
 use crate::io::len_usize;
 use crate::preflight::{self, Finding};
 use crate::stage::{
-    Item, ItemKind, all_exist, build_structure, ensure_dir, first_existing, ignore_not_found,
-    is_short_read, join_rel, open_staged_output, parent_of, rename_into_place, top_level_names,
-    truncate_with_retry,
+    Item, ItemKind, StageGuard, all_exist, build_structure, ensure_dir, first_existing,
+    ignore_not_found, is_short_read, join_rel, open_staged_output, parent_of, rename_into_place,
+    top_level_names, truncate_with_retry,
 };
 use crate::walk::system_time;
 
@@ -387,6 +387,10 @@ fn consume_blocks(
     let groups = space::batches(m, archive.consumed(), opts.space.batch_max_u);
     let mut open: HashMap<usize, Box<dyn FileHandle>> = HashMap::new();
     let protected = [archive.handle().file_id()?];
+    let guard = StageGuard {
+        root: stage,
+        protected: &protected,
+    };
     let mut hashers: HashMap<usize, trunc_hash::Blake3Hasher> = HashMap::new();
 
     let pause_on_full = |e: FsError, consumed: usize| -> Error {
@@ -420,7 +424,7 @@ fn consume_blocks(
                 let e = &m.entries[r.entry];
                 if let std::collections::hash_map::Entry::Vacant(slot) = open.entry(r.entry) {
                     let p = join_rel(stage, &e.path);
-                    let (h, created) = open_staged_output(fs, &p, &protected)?;
+                    let (h, created) = open_staged_output(fs, &guard, &p)?;
                     if created {
                         new_parents.insert(parent_of(&p));
                     }
@@ -489,7 +493,7 @@ fn consume_blocks(
                 }
                 if short || *h.finalize().as_bytes() != b.blake3_u {
                     return Err(Error::Integrity(format!(
-                        "media verification failed for block {i}: the data read back from                          disk differs from what was written; the archive was not truncated"
+                        "media verification failed for block {i}: the data read back from disk differs from what was written; the archive was not truncated"
                     )));
                 }
             }

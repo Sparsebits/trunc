@@ -4,19 +4,23 @@
 //! [`FileHandle`], so the same code runs against:
 //!
 //! - [`OsFs`]: the real filesystem. On Windows it adds NTFS sparse-file deallocation, `FILE_ID_INFO`
-//!   identities, volume probing and no-replace renames. Elsewhere it is std-only until the Linux
-//!   backend lands (plan phase 5).
+//!   identities, volume probing and no-replace renames. On Linux: hole punching, `fallocate`
+//!   reservations, `openat2` confinement, `renameat2` no-replace renames, `O_DIRECT` read-back,
+//!   advisory locks and mount lookup. Other platforms get the std-only subset.
 //! - `trunc_testkit::FaultFs`: an in-memory filesystem that injects crashes, torn writes, lost
 //!   unflushed data, space exhaustion and mapped-file truncation failures.
 //!
 //! This is the only crate allowed to contain `unsafe` code, confined to the `win` module.
 
 use std::fmt::Debug;
+use std::io;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 mod error;
+#[cfg(target_os = "linux")]
+mod linux;
 mod os;
 mod sync;
 #[cfg(windows)]
@@ -75,9 +79,11 @@ impl OpenMode {
 pub enum Share {
     /// Other processes may read, write and delete concurrently.
     Shared,
-    /// Other handles may read but not write or delete while this one exists (Windows; advisory
-    /// elsewhere). Readers are allowed so antivirus scanners, indexers and our own uncached
-    /// verification handle can coexist; nothing can change the file under us.
+    /// Other handles may read but not write or delete while this one exists. Readers are allowed
+    /// so antivirus scanners, indexers and our own uncached verification handle can coexist;
+    /// nothing can change the file under us. Enforced on Windows. On Linux it is an advisory
+    /// `flock` (exclusive for writers, shared for readers): it stops a second trunc, not
+    /// arbitrary programs.
     Exclusive,
 }
 
@@ -223,8 +229,28 @@ pub trait FileHandle: Send + Sync + Debug {
 /// creating at a path that is a symlink or junction fails with [`FsError::Link`].
 pub trait FsBackend: Send + Sync + Debug {
     fn open(&self, path: &Path, mode: OpenMode, share: Share) -> Result<Box<dyn FileHandle>>;
+    /// Like [`open`](Self::open), for a `path` inside the directory `root`: no component between
+    /// `root` and the file may be a link, and `..` may not climb out. Linux enforces this
+    /// atomically (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`); the default checks
+    /// each existing component first, which a concurrent local attacker could race.
+    fn open_beneath(
+        &self,
+        root: &Path,
+        path: &Path,
+        mode: OpenMode,
+        share: Share,
+    ) -> Result<Box<dyn FileHandle>> {
+        check_beneath(self, root, path)?;
+        self.open(path, mode, share)
+    }
     /// Create one directory; fails if anything already exists at the path.
     fn create_dir(&self, path: &Path) -> Result<()>;
+    /// [`create_dir`](Self::create_dir) with the confinement of
+    /// [`open_beneath`](Self::open_beneath).
+    fn create_dir_beneath(&self, root: &Path, path: &Path) -> Result<()> {
+        check_beneath(self, root, path)?;
+        self.create_dir(path)
+    }
     /// Make directory entries created, renamed or removed in `dir` durable.
     fn flush_dir(&self, dir: &Path) -> Result<()>;
     /// Rename without replacing: fails with [`FsError::AlreadyExists`] if `to` exists.
@@ -241,4 +267,51 @@ pub trait FsBackend: Send + Sync + Debug {
     /// Apply Unix permission bits (lower 9 only; Windows honours just the write bits, as the
     /// read-only attribute). Never follows links.
     fn set_mode(&self, path: &Path, mode: u32) -> Result<()>;
+}
+
+/// `path` relative to `root`, refusing paths outside it and `..` components.
+pub fn relative_beneath<'a>(root: &Path, path: &'a Path) -> Result<&'a Path> {
+    let outside = || FsError::Io {
+        op: "resolving",
+        path: path.to_path_buf(),
+        source: io::Error::other(format!("not inside {}", root.display())),
+    };
+    let rel = path.strip_prefix(root).map_err(|_| outside())?;
+    if rel.as_os_str().is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return Err(outside());
+    }
+    Ok(rel)
+}
+
+/// Check that every existing directory between `root` and `path` (exclusive) is a real directory.
+/// Missing components are left for the following open or create to report.
+pub fn check_beneath<F: FsBackend + ?Sized>(fs: &F, root: &Path, path: &Path) -> Result<()> {
+    let rel = relative_beneath(root, path)?;
+    let mut at = root.to_path_buf();
+    let mut parts = rel.components().peekable();
+    while let Some(c) = parts.next() {
+        if parts.peek().is_none() {
+            break; // the final component is the open's or create's own business
+        }
+        at.push(c);
+        match fs.metadata(&at)? {
+            Some(Meta {
+                kind: NodeKind::Dir,
+                ..
+            }) => {}
+            Some(Meta {
+                kind: NodeKind::Link,
+                ..
+            }) => return Err(FsError::Link { path: at }),
+            Some(_) => {
+                return Err(FsError::Io {
+                    op: "resolving",
+                    path: at,
+                    source: io::Error::other("not a directory"),
+                });
+            }
+            None => return Ok(()),
+        }
+    }
+    Ok(())
 }

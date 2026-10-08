@@ -30,9 +30,18 @@ struct OsFile {
     path: PathBuf,
     #[cfg(windows)]
     sparse: std::sync::atomic::AtomicBool,
-    /// Lazily opened unbuffered handle for `read_back`.
-    #[cfg(windows)]
-    uncached: std::sync::Mutex<Option<File>>,
+    /// Lazily opened cache-bypassing handle for `read_back`.
+    #[cfg(any(windows, target_os = "linux"))]
+    uncached: std::sync::Mutex<Uncached>,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Debug)]
+enum Uncached {
+    Untried,
+    Open(File),
+    /// The filesystem cannot bypass the cache (Linux tmpfs and some FUSE filesystems).
+    Unavailable,
 }
 
 fn err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> FsError + 'a {
@@ -53,43 +62,100 @@ fn existing_ancestor(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn open_options(mode: OpenMode, share: Share) -> OpenOptions {
+    let mut oo = OpenOptions::new();
+    oo.read(true);
+    match mode {
+        OpenMode::Read => {}
+        OpenMode::ReadWrite => {
+            oo.write(true);
+        }
+        OpenMode::CreateNew => {
+            oo.write(true).create_new(true);
+        }
+        OpenMode::CreateOrTruncate => {
+            oo.write(true).create(true).truncate(true);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        oo.custom_flags(crate::win::FILE_FLAG_OPEN_REPARSE_POINT);
+        if share == Share::Exclusive {
+            oo.share_mode(FILE_SHARE_READ);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = share;
+        // A symlink as the final component fails with ELOOP, which maps to `FsError::Link`.
+        #[allow(clippy::cast_possible_wrap)]
+        oo.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    oo
+}
+
+/// Checks shared by every way of opening: refuse links and non-regular files, and take the
+/// advisory lock that stands in for Windows share modes on Linux.
+fn finish_open(
+    file: File,
+    path: &Path,
+    mode: OpenMode,
+    share: Share,
+) -> Result<Box<dyn FileHandle>> {
+    let md = file.metadata().map_err(err("reading metadata of", path))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if md.file_attributes() & crate::win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FsError::Link {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+    if !md.is_file() {
+        return Err(FsError::Io {
+            op: "opening",
+            path: path.to_path_buf(),
+            source: io::Error::other("not a regular file"),
+        });
+    }
+    #[cfg(target_os = "linux")]
+    if share == Share::Exclusive
+        && !crate::linux::lock(&file, mode.writes()).map_err(err("locking", path))?
+    {
+        return Err(FsError::Busy {
+            path: path.to_path_buf(),
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (mode, share);
+    Ok(Box::new(OsFile {
+        file,
+        path: path.to_path_buf(),
+        #[cfg(windows)]
+        sparse: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(any(windows, target_os = "linux"))]
+        uncached: std::sync::Mutex::new(Uncached::Untried),
+    }))
+}
+
+/// Errors from the confined Linux calls: EXDEV means the path tried to leave the root.
+#[cfg(target_os = "linux")]
+fn beneath_err(op: &'static str, path: &Path, e: io::Error) -> FsError {
+    if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) {
+        FsError::Link {
+            path: path.to_path_buf(),
+        }
+    } else {
+        FsError::from_io(op, path, e)
+    }
+}
+
 impl FsBackend for OsFs {
     fn open(&self, path: &Path, mode: OpenMode, share: Share) -> Result<Box<dyn FileHandle>> {
-        let mut oo = OpenOptions::new();
-        oo.read(true);
-        match mode {
-            OpenMode::Read => {}
-            OpenMode::ReadWrite => {
-                oo.write(true);
-            }
-            OpenMode::CreateNew => {
-                oo.write(true).create_new(true);
-            }
-            OpenMode::CreateOrTruncate => {
-                oo.write(true).create(true).truncate(true);
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            oo.custom_flags(crate::win::FILE_FLAG_OPEN_REPARSE_POINT);
-            if share == Share::Exclusive {
-                oo.share_mode(FILE_SHARE_READ);
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = share;
-            // Without openat2 (phase 5) this check is racy; it still stops the common case.
-            if let Ok(md) = fs::symlink_metadata(path) {
-                if md.file_type().is_symlink() {
-                    return Err(FsError::Link {
-                        path: path.to_path_buf(),
-                    });
-                }
-            }
-        }
-        let file = match oo.open(path) {
+        let file = match open_options(mode, share).open(path) {
             Ok(f) => f,
             // Opening a directory junction as a file fails with a generic access error; report
             // what is actually there.
@@ -106,35 +172,50 @@ impl FsBackend for OsFs {
                 return Err(FsError::from_io("opening", path, e));
             }
         };
-        let md = file.metadata().map_err(err("reading metadata of", path))?;
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if md.file_attributes() & crate::win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(FsError::Link {
-                    path: path.to_path_buf(),
-                });
+        finish_open(file, path, mode, share)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_beneath(
+        &self,
+        root: &Path,
+        path: &Path,
+        mode: OpenMode,
+        share: Share,
+    ) -> Result<Box<dyn FileHandle>> {
+        use rustix::fs::OFlags;
+        let rel = crate::relative_beneath(root, path)?;
+        let flags = match mode {
+            OpenMode::Read => OFlags::RDONLY,
+            OpenMode::ReadWrite => OFlags::RDWR,
+            OpenMode::CreateNew => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
+            OpenMode::CreateOrTruncate => OFlags::RDWR | OFlags::CREATE | OFlags::TRUNC,
+        };
+        match crate::linux::open_beneath(root, rel, flags) {
+            Ok(Some(file)) => finish_open(file, path, mode, share),
+            Ok(None) => {
+                crate::check_beneath(self, root, path)?;
+                self.open(path, mode, share)
             }
+            Err(e) => Err(beneath_err("opening", path, e)),
         }
-        if !md.is_file() {
-            return Err(FsError::Io {
-                op: "opening",
-                path: path.to_path_buf(),
-                source: io::Error::other("not a regular file"),
-            });
-        }
-        Ok(Box::new(OsFile {
-            file,
-            path: path.to_path_buf(),
-            #[cfg(windows)]
-            sparse: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(windows)]
-            uncached: std::sync::Mutex::new(None),
-        }))
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
         fs::create_dir(path).map_err(err("creating directory", path))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_dir_beneath(&self, root: &Path, path: &Path) -> Result<()> {
+        let rel = crate::relative_beneath(root, path)?;
+        match crate::linux::mkdir_beneath(root, rel) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                crate::check_beneath(self, root, path)?;
+                self.create_dir(path)
+            }
+            Err(e) => Err(beneath_err("creating directory", path, e)),
+        }
     }
 
     fn flush_dir(&self, dir: &Path) -> Result<()> {
@@ -164,7 +245,11 @@ impl FsBackend for OsFs {
         }
         #[cfg(not(windows))]
         {
-            // renameat2(RENAME_NOREPLACE) arrives with the Linux backend (phase 5).
+            #[cfg(target_os = "linux")]
+            if crate::linux::rename_noreplace(from, to).map_err(err("renaming", from))? {
+                return Ok(());
+            }
+            // Without renameat2 support, checking and renaming are two steps.
             if fs::symlink_metadata(to).is_ok() {
                 return Err(FsError::AlreadyExists {
                     path: to.to_path_buf(),
@@ -302,32 +387,60 @@ fn probe_unix(at: &Path, sync: crate::SyncHint) -> Result<VolumeInfo> {
         vfs.f_bsize
     };
     #[cfg(target_os = "linux")]
+    let mount = crate::linux::mount_of(at);
+    #[cfg(target_os = "linux")]
     let (fs, name) = {
         let st = rustix::fs::statfs(at).map_err(|e| err("querying volume of", at)(e.into()))?;
         // The magic is a 32-bit value stored in a signed or wider field depending on the ABI.
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let magic = st.f_type as u32;
-        linux_fs_kind(magic)
+        match (linux_fs_kind(magic), &mount) {
+            // Not a magic we know (9p, fuseblk, nfs...): name it after the mount table.
+            ((FsKind::Unknown, "unknown"), Some(m)) => {
+                (FsKind::from_name(&m.fstype), m.fstype.clone())
+            }
+            ((kind, name), _) => (kind, name.to_owned()),
+        }
     };
     #[cfg(not(target_os = "linux"))]
-    let (fs, name) = (FsKind::Unknown, "unknown");
+    let (fs, name) = (FsKind::Unknown, String::from("unknown"));
     let snapshots = match fs {
         FsKind::Btrfs | FsKind::Zfs => SnapshotHint::Unknown(format!(
             "{name} snapshots can keep truncated data allocated; not checked"
         )),
+        #[cfg(target_os = "linux")]
+        _ if mount.as_ref().is_some_and(|m| {
+            m.source.starts_with("/dev/mapper/") || m.source.starts_with("/dev/dm-")
+        }) =>
+        {
+            SnapshotHint::Unknown(
+                "device-mapper volume (LVM?): thin snapshots would keep truncated data \
+                 allocated; not checked"
+                    .into(),
+            )
+        }
         _ => SnapshotHint::None,
     };
+    // Filesystems known to punch holes with fallocate, freeing whole blocks.
+    let supports_sparse = cfg!(target_os = "linux")
+        && matches!(fs, FsKind::Ext4 | FsKind::Xfs | FsKind::Btrfs | FsKind::Zfs);
     Ok(VolumeInfo {
         fs,
-        fs_name: name.into(),
+        fs_name: name,
+        #[cfg(target_os = "linux")]
+        root: mount.map(|m| m.point),
+        #[cfg(not(target_os = "linux"))]
         root: None,
         volume_id: unix_dev(at),
         cluster_size: u32::try_from(unit).unwrap_or(4096).max(512),
         free_bytes: Some(vfs.f_bavail.saturating_mul(unit)),
         total_bytes: Some(vfs.f_blocks.saturating_mul(unit)),
-        // Range deallocation on Linux (fallocate PUNCH_HOLE) arrives with the full backend.
-        supports_sparse: false,
-        sparse_granularity: 0,
+        supports_sparse,
+        sparse_granularity: if supports_sparse {
+            u32::try_from(vfs.f_bsize).unwrap_or(4096).max(512)
+        } else {
+            0
+        },
         max_file_size: if fs == FsKind::Fat32 {
             (4u64 << 30) - 1
         } else {
@@ -427,58 +540,35 @@ impl FileHandle for OsFile {
         Ok(())
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn read_back(&self, buf: &mut [u8], off: u64) -> Result<()> {
-        use std::os::windows::fs::OpenOptionsExt;
-        const ALIGN: u64 = 4096; // covers 512-byte and 4 KiB sectors
-        const ALIGN_BYTES: usize = 4096;
-        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
         let mut guard = self
             .uncached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_none() {
-            let f = OpenOptions::new()
-                .read(true)
-                .share_mode(7) // read | write | delete: coexist with our own writer handle
-                .custom_flags(FILE_FLAG_NO_BUFFERING | crate::win::FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&self.path)
-                .map_err(self.e("opening for verification"))?;
-            *guard = Some(f);
+        if matches!(*guard, Uncached::Untried) {
+            *guard = match open_uncached(&self.path) {
+                Ok(f) => Uncached::Open(f),
+                Err(e) if direct_unsupported(&e) => Uncached::Unavailable,
+                Err(e) => return Err(self.e("opening for verification")(e)),
+            };
         }
-        let f = guard.as_ref().expect("set above");
-        // Unbuffered reads need sector-aligned offsets, lengths and memory.
-        let start = off / ALIGN * ALIGN;
-        let end = (off + buf.len() as u64).div_ceil(ALIGN) * ALIGN;
-        let span = usize::try_from(end - start)
-            .map_err(|_| self.e("verifying")(io::ErrorKind::InvalidInput.into()))?;
-        let mut raw = vec![0u8; span + ALIGN_BYTES];
-        let a = raw.as_ptr().align_offset(ALIGN_BYTES);
-        let aligned = &mut raw[a..a + span];
-        let mut got = 0usize;
-        while got < span {
-            match read_at(f, &mut aligned[got..], start + got as u64) {
-                // Unbuffered reads are only ever short at end of file; continuing from an
-                // unaligned offset would fail with ERROR_INVALID_PARAMETER.
-                Ok(n) if n < span - got => {
-                    got += n;
-                    break;
-                }
-                Ok(n) => got += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(FsError::from_io("verifying", &self.path, e)),
-            }
+        let direct = match &*guard {
+            Uncached::Open(f) => Some(read_aligned(f, buf, off)),
+            _ => None,
+        };
+        match direct {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(e)) if direct_unsupported(&e) => *guard = Uncached::Unavailable,
+            Some(Err(e)) => return Err(FsError::from_io("verifying", &self.path, e)),
+            None => {}
         }
-        let rel = usize::try_from(off - start).expect("< ALIGN");
-        if got < rel + buf.len() {
-            return Err(FsError::from_io(
-                "verifying",
-                &self.path,
-                io::ErrorKind::UnexpectedEof.into(),
-            ));
-        }
-        buf.copy_from_slice(&aligned[rel..rel + buf.len()]);
-        Ok(())
+        drop(guard);
+        // No cache bypass on this filesystem: drop the cached pages (clean, since the data was
+        // flushed), so the read below has to go to the device.
+        #[cfg(target_os = "linux")]
+        crate::linux::drop_cache(&self.file, off, buf.len() as u64).map_err(self.e("verifying"))?;
+        self.read_exact_at(buf, off)
     }
 
     fn write_all_at(&self, mut buf: &[u8], mut off: u64) -> Result<()> {
@@ -522,12 +612,17 @@ impl FileHandle for OsFile {
     }
 
     fn preallocate(&self, len: u64) -> Result<()> {
-        // NTFS allocates clusters for the new length of a non-sparse file, so running out of
-        // space shows up here. (fallocate on Linux arrives in phase 5.)
-        if len > self.size()? {
-            self.set_len(len)?;
+        let size = self.size()?;
+        if len <= size {
+            return Ok(());
         }
-        Ok(())
+        #[cfg(target_os = "linux")]
+        if crate::linux::reserve(&self.file, size, len).map_err(self.e("reserving space for"))? {
+            return Ok(());
+        }
+        // NTFS allocates clusters for the new length of a non-sparse file, so running out of
+        // space shows up here. Elsewhere this at least fixes the size.
+        self.set_len(len)
     }
 
     fn flush_data(&self) -> Result<()> {
@@ -560,7 +655,19 @@ impl FileHandle for OsFile {
                 freed: largest_hole(&allocated, start, end.min(len)),
             })
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            if !crate::linux::punch_hole(&self.file, start, end).map_err(self.e("deallocating"))? {
+                return Ok(Dealloc::Unsupported);
+            }
+            let len = self.size()?;
+            let allocated = crate::linux::allocated_ranges(&self.file, len)
+                .map_err(self.e("querying allocation of"))?;
+            Ok(Dealloc::Freed {
+                freed: largest_hole(&allocated, start, end.min(len)),
+            })
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Ok(Dealloc::Unsupported)
         }
@@ -572,7 +679,12 @@ impl FileHandle for OsFile {
         {
             crate::win::allocated_ranges(&self.file, len).map_err(self.e("querying allocation of"))
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            crate::linux::allocated_ranges(&self.file, len)
+                .map_err(self.e("querying allocation of"))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Ok(if len == 0 {
                 vec![]
@@ -615,7 +727,7 @@ impl FileHandle for OsFile {
 }
 
 /// The largest unallocated sub-range of `[start, end)` given the allocated ranges.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 fn largest_hole(allocated: &[Range<u64>], start: u64, end: u64) -> Range<u64> {
     let mut best = start..start;
     let mut cursor = start;
@@ -629,6 +741,68 @@ fn largest_hole(allocated: &[Range<u64>], start: u64, end: u64) -> Range<u64> {
         best = cursor..end;
     }
     best
+}
+
+/// Open a second handle on `path` that reads from the device, not the OS cache.
+#[cfg(windows)]
+fn open_uncached(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    OpenOptions::new()
+        .read(true)
+        .share_mode(7) // read | write | delete: coexist with our own writer handle
+        .custom_flags(FILE_FLAG_NO_BUFFERING | crate::win::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_uncached(path: &Path) -> io::Result<File> {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::OpenOptionsExt;
+    #[allow(clippy::cast_possible_wrap)]
+    let flags = (OFlags::DIRECT | OFlags::NOFOLLOW).bits() as i32;
+    OpenOptions::new().read(true).custom_flags(flags).open(path)
+}
+
+/// EINVAL from an `O_DIRECT` open or read: the filesystem cannot bypass the cache.
+#[cfg(any(windows, target_os = "linux"))]
+fn direct_unsupported(e: &io::Error) -> bool {
+    cfg!(target_os = "linux") && e.raw_os_error() == Some(22)
+}
+
+/// Read `buf.len()` bytes at `off` through a handle that needs sector-aligned offsets, lengths
+/// and memory (Windows `FILE_FLAG_NO_BUFFERING`, Linux `O_DIRECT`).
+#[cfg(any(windows, target_os = "linux"))]
+fn read_aligned(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    const ALIGN: u64 = 4096; // covers 512-byte and 4 KiB sectors
+    const ALIGN_BYTES: usize = 4096;
+    let start = off / ALIGN * ALIGN;
+    let end = (off + buf.len() as u64).div_ceil(ALIGN) * ALIGN;
+    let span =
+        usize::try_from(end - start).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut raw = vec![0u8; span + ALIGN_BYTES];
+    let a = raw.as_ptr().align_offset(ALIGN_BYTES);
+    let aligned = &mut raw[a..a + span];
+    let mut got = 0usize;
+    while got < span {
+        match read_at(f, &mut aligned[got..], start + got as u64) {
+            // Unbuffered reads are only ever short at end of file; continuing from an
+            // unaligned offset would fail with an invalid-parameter error.
+            Ok(n) if n < span - got => {
+                got += n;
+                break;
+            }
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let rel = usize::try_from(off - start).expect("< ALIGN");
+    if got < rel + buf.len() {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    buf.copy_from_slice(&aligned[rel..rel + buf.len()]);
+    Ok(())
 }
 
 #[cfg(unix)]

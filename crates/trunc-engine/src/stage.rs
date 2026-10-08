@@ -45,20 +45,29 @@ pub(crate) fn join_rel(base: &Path, rel: &str) -> PathBuf {
     p
 }
 
-/// Open (or create) a staging output, refusing anything that is really one of `protected`
-/// (the archive or its journal, e.g. via a hard link planted in the staging directory).
-/// Returns the handle and whether the file was created.
+/// Where staged outputs may be written, and what they must never turn out to be.
+#[derive(Debug)]
+pub(crate) struct StageGuard<'a> {
+    /// The staging directory. Outputs are opened beneath it without following links.
+    pub root: &'a Path,
+    /// The archive and its journal: an output that is one of these (e.g. a hard link planted in
+    /// the staging directory) is refused.
+    pub protected: &'a [trunc_fs::FileId],
+}
+
+/// Open (or create) a staging output. Returns the handle and whether the file was created.
 pub(crate) fn open_staged_output(
     fs: &dyn FsBackend,
+    guard: &StageGuard<'_>,
     p: &Path,
-    protected: &[trunc_fs::FileId],
 ) -> Result<(Box<dyn FileHandle>, bool)> {
+    let open = |mode| fs.open_beneath(guard.root, p, mode, Share::Exclusive);
     let (h, created) = match fs.metadata(p)?.map(|m| m.kind) {
-        None => (fs.open(p, OpenMode::CreateNew, Share::Exclusive)?, true),
-        Some(NodeKind::File) => (fs.open(p, OpenMode::ReadWrite, Share::Exclusive)?, false),
+        None => (open(OpenMode::CreateNew)?, true),
+        Some(NodeKind::File) => (open(OpenMode::ReadWrite)?, false),
         Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
     };
-    if protected.contains(&h.file_id()?) {
+    if guard.protected.contains(&h.file_id()?) {
         return Err(Error::Refused(format!(
             "{} is the archive (or its journal) under another name; refusing to write to it",
             p.display()
@@ -188,7 +197,7 @@ pub(crate) fn build_structure(
         let p = join_rel(stage, &d);
         match fs.metadata(&p)?.map(|m| m.kind) {
             None => {
-                fs.create_dir(&p)?;
+                fs.create_dir_beneath(stage, &p)?;
                 to_flush.insert(parent_of(&p));
             }
             Some(NodeKind::Dir) => {}
@@ -213,7 +222,7 @@ pub(crate) fn build_structure(
         let p = join_rel(stage, &e.path);
         match fs.metadata(&p)?.map(|m| m.kind) {
             None => {
-                let h = fs.open(&p, OpenMode::CreateNew, Share::Exclusive)?;
+                let h = fs.open_beneath(stage, &p, OpenMode::CreateNew, Share::Exclusive)?;
                 h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
                 h.flush_data()?;
                 to_flush.insert(parent_of(&p));

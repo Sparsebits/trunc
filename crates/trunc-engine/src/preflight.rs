@@ -109,7 +109,7 @@ impl fmt::Display for Finding {
             ),
             Finding::JournalingUnknown => write!(
                 f,
-                "the archive's filesystem could not be identified, so crash safety of --consume                  depends on it journaling metadata (most modern filesystems do)"
+                "the archive's filesystem could not be identified, so crash safety of --consume depends on it journaling metadata (most modern filesystems do)"
             ),
             Finding::SnapshotsPresent(why) => write!(
                 f,
@@ -127,7 +127,7 @@ impl fmt::Display for Finding {
             }
             Finding::Unsigned => write!(
                 f,
-                "the archive is unsigned: its integrity is checked, but not who made it                  (--require-signed to insist)"
+                "the archive is unsigned: its integrity is checked, but not who made it (--require-signed to insist)"
             ),
             Finding::PartiallyConsumed { consumed, total } => {
                 write!(

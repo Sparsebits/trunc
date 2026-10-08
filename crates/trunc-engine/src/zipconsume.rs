@@ -26,8 +26,8 @@ use crate::consume::{ConsumeOptions, ConsumeSummary, Progress, stage_dir};
 use crate::error::{Error, PauseReason, Result};
 use crate::preflight::{self, Finding, Severity};
 use crate::stage::{
-    Item, ItemKind, all_exist, build_structure, ensure_dir, first_existing, ignore_not_found,
-    join_rel, open_staged_output, parent_of, rename_into_place, top_level_names,
+    Item, ItemKind, StageGuard, all_exist, build_structure, ensure_dir, first_existing,
+    ignore_not_found, join_rel, open_staged_output, parent_of, rename_into_place, top_level_names,
     truncate_with_retry,
 };
 use crate::walk::system_time;
@@ -367,7 +367,7 @@ fn verified_crc(out: &dyn FileHandle, from: u64, to: u64, crc: u32) -> Result<Op
 
 fn media_mismatch(name: &str) -> Error {
     Error::Integrity(format!(
-        "media verification failed for {name}: the data read back from disk differs from what          was written; its source was not released"
+        "media verification failed for {name}: the data read back from disk differs from what was written; its source was not released"
     ))
 }
 
@@ -379,9 +379,9 @@ fn extract_whole(
     p: &Path,
     need_free: u64,
     verify: bool,
-    protected: &[trunc_fs::FileId],
+    guard: &StageGuard<'_>,
 ) -> Result<()> {
-    let (out, created) = open_staged_output(fs, p, protected)?;
+    let (out, created) = open_staged_output(fs, guard, p)?;
     out.preallocate(e.size).map_err(|x| nospace(x, need_free))?;
     let mut off = 0u64;
     decode_entry(
@@ -419,7 +419,7 @@ fn extract_punching(
     every: u64,
     need_free: u64,
     verify: bool,
-    protected: &[trunc_fs::FileId],
+    guard: &StageGuard<'_>,
 ) -> Result<()> {
     let start = match resume {
         Some(ck) => ck,
@@ -439,7 +439,7 @@ fn extract_punching(
             ck
         }
     };
-    let (out, created) = open_staged_output(fs, p, protected)?;
+    let (out, created) = open_staged_output(fs, guard, p)?;
     if created {
         fs.flush_dir(&parent_of(p))?;
     }
@@ -743,6 +743,10 @@ pub fn consume_zip(
     }
 
     let protected = [handle.file_id()?, journal.file_id().map_err(journal_err)?];
+    let guard = StageGuard {
+        root: &stage,
+        protected: &protected,
+    };
     let order = schedule(layout);
     let after = ends_after(layout, &order);
     progress(Progress::Started {
@@ -787,7 +791,7 @@ pub fn consume_zip(
                     opts.zip.checkpoint_every.max(1),
                     need_free,
                     opts.verify_media,
-                    &protected,
+                    &guard,
                 )?;
             } else {
                 extract_whole(
@@ -797,7 +801,7 @@ pub fn consume_zip(
                     &p,
                     need_free,
                     opts.verify_media,
-                    &protected,
+                    &guard,
                 )?;
             }
             summary.bytes_written += e.size;
