@@ -1,8 +1,8 @@
 name: fuzz
 
+# Fuzzing runs locally (scripts/fuzz.ps1), where the corpus persists and all cores are available.
+# This workflow is kept for occasional manual runs on Linux with AddressSanitizer.
 on:
-  schedule:
-    - cron: "41 3 * * *"
   workflow_dispatch:
 
 jobs:

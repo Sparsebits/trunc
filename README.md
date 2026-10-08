@@ -1,6 +1,6 @@
 # trunc
 
-*By [Headroom Labs](https://github.com/headroom-labs).*
+*By [Sparsebits](https://github.com/sparsebits).*
 
 Self-consuming archives. A `.trnc` archive stores its blocks in reverse order, so an extractor can decode the block at the end of the file, make its output durable, and truncate the archive past it. Extraction then needs roughly *output size − archive size* of free space instead of the full output size.
 
