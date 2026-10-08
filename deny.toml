@@ -1,0 +1,37 @@
+# cargo-deny configuration: licences, security advisories, banned and duplicate crates.
+# Run in CI by .github/workflows/ci.yml (job "deny").
+
+[graph]
+all-features = false
+
+[advisories]
+# Any advisory (vulnerability, unmaintained, yanked) fails the build until reviewed.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences compatible with distributing trunc under MIT OR Apache-2.0.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates refer to each other by path.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

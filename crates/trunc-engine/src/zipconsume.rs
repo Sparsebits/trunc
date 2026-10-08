@@ -27,7 +27,8 @@ use crate::error::{Error, PauseReason, Result};
 use crate::preflight::{self, Finding, Severity};
 use crate::stage::{
     Item, ItemKind, all_exist, build_structure, ensure_dir, first_existing, ignore_not_found,
-    join_rel, parent_of, rename_into_place, top_level_names, truncate_with_retry,
+    join_rel, open_staged_output, parent_of, rename_into_place, top_level_names,
+    truncate_with_retry,
 };
 use crate::walk::system_time;
 
@@ -286,15 +287,6 @@ fn nospace(e: FsError, need_free: u64) -> Error {
     }
 }
 
-/// Open (or create) a staging output. Returns the handle and whether it was created.
-fn open_output(fs: &dyn FsBackend, p: &Path) -> Result<(Box<dyn FileHandle>, bool)> {
-    match fs.metadata(p)?.map(|m| m.kind) {
-        None => Ok((fs.open(p, OpenMode::CreateNew, Share::Exclusive)?, true)),
-        Some(NodeKind::File) => Ok((fs.open(p, OpenMode::ReadWrite, Share::Exclusive)?, false)),
-        Some(_) => Err(Error::Refused(format!("{} is not a file", p.display()))),
-    }
-}
-
 /// Decode an entry, passing output to `sink`; check size and CRC.
 fn decode_entry(
     archive: &dyn FileHandle,
@@ -345,6 +337,40 @@ fn decode_entry(
     Ok(())
 }
 
+/// CRC of `out[from..to)` as read back from the device, continuing from `crc`.
+fn read_back_crc(
+    out: &dyn FileHandle,
+    from: u64,
+    to: u64,
+    crc: u32,
+) -> std::result::Result<u32, FsError> {
+    let mut h = crc32fast::Hasher::new_with_initial(crc);
+    let mut buf = vec![0u8; 4 << 20];
+    let mut off = from;
+    while off < to {
+        let n = usize::try_from((to - off).min(buf.len() as u64)).expect("<= 4 MiB");
+        out.read_back(&mut buf[..n], off)?;
+        h.update(&buf[..n]);
+        off += n as u64;
+    }
+    Ok(h.finalize())
+}
+
+/// `read_back_crc`, with a short read reported as `None` (media mismatch).
+fn verified_crc(out: &dyn FileHandle, from: u64, to: u64, crc: u32) -> Result<Option<u32>> {
+    match read_back_crc(out, from, to, crc) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if crate::stage::is_short_read(&e) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn media_mismatch(name: &str) -> Error {
+    Error::Integrity(format!(
+        "media verification failed for {name}: the data read back from disk differs from what          was written; its source was not released"
+    ))
+}
+
 /// Extract one entry into the staging area (whole entry before any of it is released).
 fn extract_whole(
     fs: &dyn FsBackend,
@@ -352,8 +378,10 @@ fn extract_whole(
     e: &Entry,
     p: &Path,
     need_free: u64,
+    verify: bool,
+    protected: &[trunc_fs::FileId],
 ) -> Result<()> {
-    let (out, created) = open_output(fs, p)?;
+    let (out, created) = open_staged_output(fs, p, protected)?;
     out.preallocate(e.size).map_err(|x| nospace(x, need_free))?;
     let mut off = 0u64;
     decode_entry(
@@ -372,6 +400,9 @@ fn extract_whole(
     if created {
         fs.flush_dir(&parent_of(p))?;
     }
+    if verify && verified_crc(out.as_ref(), 0, e.size, 0)? != Some(e.crc32) {
+        return Err(media_mismatch(&e.name));
+    }
     Ok(())
 }
 
@@ -387,6 +418,8 @@ fn extract_punching(
     resume: Option<Checkpoint>,
     every: u64,
     need_free: u64,
+    verify: bool,
+    protected: &[trunc_fs::FileId],
 ) -> Result<()> {
     let start = match resume {
         Some(ck) => ck,
@@ -406,7 +439,7 @@ fn extract_punching(
             ck
         }
     };
-    let (out, created) = open_output(fs, p)?;
+    let (out, created) = open_staged_output(fs, p, protected)?;
     if created {
         fs.flush_dir(&parent_of(p))?;
     }
@@ -422,8 +455,26 @@ fn extract_punching(
     };
     let mut off = start.out_total;
     let mut journal_error: Option<trunc_journal::JournalError> = None;
+    // With --verify-media, output up to each checkpoint is read back and its running CRC
+    // compared before the matching input is deallocated.
+    let (mut verified_to, mut running_crc) = (start.out_total, start.crc);
+    let mut media_bad = false;
     let mut on_ckpt = |ck: &Checkpoint| -> std::result::Result<(), InflateError> {
         out.flush_data()?;
+        if verify {
+            match read_back_crc(out.as_ref(), verified_to, ck.out_total, running_crc) {
+                Ok(c) if c == ck.crc => {
+                    running_crc = c;
+                    verified_to = ck.out_total;
+                }
+                Ok(_) => media_bad = true,
+                Err(e) if crate::stage::is_short_read(&e) => media_bad = true,
+                Err(e) => return Err(e.into()),
+            }
+            if media_bad {
+                return Err(InflateError::Callback("media verification failed".into()));
+            }
+        }
         if let Err(je) = journal.write(
             &EntryCkpt {
                 entry: index,
@@ -458,6 +509,9 @@ fn extract_punching(
     if let Some(je) = journal_error {
         return Err(journal_err(je));
     }
+    if media_bad {
+        return Err(media_mismatch(&e.name));
+    }
     let (total, crc, used) = finished.map_err(|x| inflate_err(&e.name, x, need_free))?;
     if total != e.size || crc != e.crc32 || used > e.compressed_size {
         return Err(Error::Integrity(format!(
@@ -468,6 +522,9 @@ fn extract_punching(
     out.set_len(e.size)?;
     out.set_modified(system_time(e.mtime_unix, 0))?;
     out.flush_data()?;
+    if verify && verified_crc(out.as_ref(), verified_to, e.size, running_crc)? != Some(e.crc32) {
+        return Err(media_mismatch(&e.name));
+    }
     Ok(())
 }
 
@@ -685,6 +742,7 @@ pub fn consume_zip(
         }
     }
 
+    let protected = [handle.file_id()?, journal.file_id().map_err(journal_err)?];
     let order = schedule(layout);
     let after = ends_after(layout, &order);
     progress(Progress::Started {
@@ -728,9 +786,19 @@ pub fn consume_zip(
                     resume,
                     opts.zip.checkpoint_every.max(1),
                     need_free,
+                    opts.verify_media,
+                    &protected,
                 )?;
             } else {
-                extract_whole(fs, handle.as_ref(), e, &p, need_free)?;
+                extract_whole(
+                    fs,
+                    handle.as_ref(),
+                    e,
+                    &p,
+                    need_free,
+                    opts.verify_media,
+                    &protected,
+                )?;
             }
             summary.bytes_written += e.size;
         }

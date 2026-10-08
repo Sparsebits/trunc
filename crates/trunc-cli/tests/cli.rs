@@ -290,3 +290,30 @@ fn killed_zip_consume_resumes() {
         );
     }
 }
+
+/// A tiny ZIP whose directory claims 1 TiB of output is refused before anything is written.
+#[test]
+fn zip_bomb_is_refused_by_the_space_check() {
+    use trunc_testkit::zipbuild::{Spec, ZipBuilder};
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let mut b = ZipBuilder::new();
+    b.add(Spec::file("bomb.bin", &vec![0u8; 100_000]).zip64());
+    let mut bytes = b.build();
+    // Patch the central directory's Zip64 uncompressed size (first field of the extra block).
+    let cd = bytes
+        .windows(4)
+        .position(|x| x == [0x50, 0x4b, 0x01, 0x02])
+        .unwrap();
+    let extra = cd + 46 + "bomb.bin".len() + 4;
+    bytes[extra..extra + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    std::fs::write(w.join("bomb.zip"), &bytes).unwrap();
+    let out = trunc(&["x", "bomb.zip", "-C", "out"], w);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not enough free space"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!w.join("out").exists(), "nothing written");
+}

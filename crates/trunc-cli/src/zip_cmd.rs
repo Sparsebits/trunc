@@ -14,9 +14,40 @@ use trunc_legacy::zip::{Kind, Method};
 
 use crate::fmt::bytes;
 
-pub fn extract(archive: &Path, dest: &Path, overwrite: bool) -> Result<ExitCode> {
+pub fn extract(
+    archive: &Path,
+    dest: &Path,
+    overwrite: bool,
+    ignore_space: bool,
+) -> Result<ExitCode> {
+    let fs = OsFs::new();
+    if !ignore_space {
+        // Declared sizes are checked against free space before anything is written.
+        let layout = zipconsume::open_layout(&fs, archive)?;
+        let vc = preflight::check_volumes(&fs, archive, dest, None)?;
+        let params = SpaceParams {
+            cluster_size: u64::from(vc.destination.cluster_size.max(1)),
+            ..SpaceParams::default()
+        };
+        let sp = zipconsume::zip_space(
+            &layout,
+            layout.file_len,
+            &ConsumeOptions::default(),
+            false,
+            1,
+            &params,
+        );
+        if let Some(free) = vc.destination.free_bytes.filter(|f| *f < sp.extract_extra) {
+            anyhow::bail!(
+                "not enough free space at {}: extracting needs about {}, {} are free (--ignore-space to try anyway)",
+                dest.display(),
+                bytes(sp.extract_extra),
+                bytes(free)
+            );
+        }
+    }
     let t = Instant::now();
-    let s = zipconsume::extract_zip(&OsFs::new(), archive, dest, overwrite)?;
+    let s = zipconsume::extract_zip(&fs, archive, dest, overwrite)?;
     println!(
         "extracted {} files, {} directories, {} into {}",
         s.files,
@@ -185,7 +216,12 @@ pub fn plan(archive: &Path, dest: &Path, punch: bool) -> Result<ExitCode> {
             layout.overlaps.len()
         );
     }
-    Ok(ExitCode::SUCCESS)
+    let fit = |need: u64| vc.destination.free_bytes.map(|f| f >= need);
+    Ok(match (fit(sp.extract_extra), fit(consume_needs)) {
+        (Some(false), Some(true)) => ExitCode::from(2),
+        (Some(false), Some(false)) => ExitCode::from(3),
+        _ => ExitCode::SUCCESS,
+    })
 }
 
 pub fn is_zip(path: &Path) -> bool {

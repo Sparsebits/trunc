@@ -113,9 +113,12 @@ struct State {
     capacity: Option<u64>,
     used: u64,
     peak: u64,
-    handles: HashMap<u64, (usize, bool)>,
+    /// Per file: (open handles, writable handles, exclusive handles).
+    handles: HashMap<u64, (usize, usize, usize)>,
     granularity: u64,
     dealloc_supported: bool,
+    /// A drive that acknowledges flushes without persisting anything.
+    flush_lies: bool,
 }
 
 /// In-memory, fault-injecting [`FsBackend`]. Cloning shares the same filesystem.
@@ -402,6 +405,7 @@ impl FaultFs {
                 handles: HashMap::new(),
                 granularity: 4096,
                 dealloc_supported: true,
+                flush_lies: false,
             })),
         }
     }
@@ -438,6 +442,12 @@ impl FaultFs {
     /// Unit in which deallocation frees space (default 4096).
     pub fn set_granularity(&self, g: u64) {
         self.st().granularity = g.max(1);
+    }
+
+    /// Simulate a drive that acknowledges `flush_data` without persisting the data (what
+    /// `--verify-media` exists to catch).
+    pub fn set_flush_lies(&self, yes: bool) {
+        self.st().flush_lies = yes;
     }
 
     /// Make `deallocate` report `Unsupported` (as on FAT/exFAT).
@@ -572,10 +582,10 @@ impl FsBackend for FaultFs {
         }
         let exclusive = share == Share::Exclusive;
         // Sharing is checked before anything is modified (CreateOrTruncate must not truncate a
-        // file someone else holds exclusively).
+        // file someone else holds exclusively). Exclusive handles admit readers only.
         if let Some(Node::File(id)) = s.node(&k) {
-            if let Some(&(count, excl)) = s.handles.get(&id) {
-                if excl || (exclusive && count > 0) {
+            if let Some(&(_, writers, exclusives)) = s.handles.get(&id) {
+                if (exclusives > 0 && mode.writes()) || (exclusive && writers > 0) {
                     return Err(FsError::Busy {
                         path: path.to_path_buf(),
                     });
@@ -610,9 +620,10 @@ impl FsBackend for FaultFs {
                 id
             }
         };
-        let entry = s.handles.entry(id).or_insert((0, false));
+        let entry = s.handles.entry(id).or_insert((0, 0, 0));
         entry.0 += 1;
-        entry.1 |= exclusive;
+        entry.1 += usize::from(mode.writes());
+        entry.2 += usize::from(exclusive);
         let epoch = s.epoch;
         Ok(Box::new(MemHandle {
             fs: self.clone(),
@@ -826,8 +837,11 @@ impl Drop for MemHandle {
         }
         if let Some(e) = s.handles.get_mut(&self.id) {
             e.0 = e.0.saturating_sub(1);
+            if self.writable {
+                e.1 = e.1.saturating_sub(1);
+            }
             if self.exclusive {
-                e.1 = false;
+                e.2 = e.2.saturating_sub(1);
             }
             if e.0 == 0 {
                 s.handles.remove(&self.id);
@@ -848,6 +862,22 @@ impl FileHandle for MemHandle {
         if end > data.len() {
             return Err(FsError::from_io(
                 "reading",
+                &self.path,
+                std::io::ErrorKind::UnexpectedEof.into(),
+            ));
+        }
+        buf.copy_from_slice(&data[off as usize..end]);
+        Ok(())
+    }
+
+    /// What is durable on the "device": the bytes a crash right now would leave.
+    fn read_back(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        let s = self.st()?;
+        let data = &s.files[&self.id].durable.data;
+        let end = off as usize + buf.len();
+        if end > data.len() {
+            return Err(FsError::from_io(
+                "verifying",
                 &self.path,
                 std::io::ErrorKind::UnexpectedEof.into(),
             ));
@@ -901,6 +931,9 @@ impl FileHandle for MemHandle {
     fn flush_data(&self) -> Result<()> {
         let mut s = self.st()?;
         s.begin(Kind::Other, &self.path)?;
+        if s.flush_lies {
+            return Ok(());
+        }
         let f = s.files.get_mut(&self.id).expect("checked in st()");
         f.durable = f.cur.clone();
         f.pending.clear();

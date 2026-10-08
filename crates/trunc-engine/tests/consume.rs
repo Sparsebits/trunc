@@ -426,3 +426,68 @@ fn crash_sweep_torn_writes() {
         assert_complete(&fs, &fx);
     }
 }
+
+#[test]
+fn verify_media_catches_a_lying_drive_before_destroying_anything() {
+    let fx = build(1024, |r| sample_tree(r, 21));
+    let mut o = opts(4096);
+    o.verify_media = true;
+
+    let fs = fresh_fs(CrashModel::LoseUnflushed, &fx);
+    run(&fs, &o).unwrap();
+    assert_complete(&fs, &fx); // no false alarms on an honest drive
+
+    let fs = fresh_fs(CrashModel::LoseUnflushed, &fx);
+    fs.set_flush_lies(true);
+    let e = run(&fs, &o).unwrap_err();
+    assert!(e.to_string().contains("media verification failed"), "{e}");
+    assert_eq!(
+        fs.get_file(Path::new(ARC)).unwrap(),
+        fx.bytes,
+        "nothing was truncated"
+    );
+}
+
+#[test]
+fn verify_media_on_the_real_filesystem() {
+    let fx = build(64 << 10, |r| fixtures::mixed(r, 22));
+    let d = tempfile::tempdir().unwrap();
+    let arc = d.path().join("a.trnc");
+    fs::write(&arc, &fx.bytes).unwrap();
+    let mut o = opts(256 << 10);
+    o.verify_media = true;
+    consume::consume(&OsFs::new(), &arc, &d.path().join("out"), &o, &mut |_| {}).unwrap();
+    tree::assert_same(&fx.src, &d.path().join("out/src"));
+}
+
+/// A staged output that is really the archive (a planted hard link) must never be written.
+#[test]
+fn refuses_staged_files_that_are_the_archive() {
+    let fx = build(1024, |r| sample_tree(r, 23));
+    let d = tempfile::tempdir().unwrap();
+    let arc = d.path().join("a.trnc");
+    fs::write(&arc, &fx.bytes).unwrap();
+    let dest = d.path().join("out");
+    let a = Archive::open(&arc).unwrap();
+    let id = a.manifest().archive_id;
+    let victim = a
+        .manifest()
+        .entries
+        .iter()
+        .find(|e| e.size > 0)
+        .unwrap()
+        .path
+        .clone();
+    drop(a);
+    let staged =
+        consume::stage_dir(&dest, &id).join(victim.replace('/', std::path::MAIN_SEPARATOR_STR));
+    fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    fs::hard_link(&arc, &staged).unwrap();
+    let e = consume::consume(&OsFs::new(), &arc, &dest, &opts(4096), &mut |_| {}).unwrap_err();
+    // Windows sharing rules stop it first (we hold the archive open against writers); where
+    // locks are advisory, the file-identity check does.
+    let refused =
+        e.to_string().contains("is the archive") || matches!(e, Error::Fs(FsError::Busy { .. }));
+    assert!(refused, "{e}");
+    assert_eq!(fs::read(&arc).unwrap(), fx.bytes, "archive untouched");
+}

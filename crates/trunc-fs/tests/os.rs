@@ -219,13 +219,16 @@ fn exclusive_open_blocks_other_handles() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("x");
     write_file(&p, b"x");
-    let _held = fs()
+    let held = fs()
         .open(&p, OpenMode::ReadWrite, Share::Exclusive)
         .unwrap();
+    // Readers may coexist (scanners, our own verification); writers may not.
+    drop(fs().open(&p, OpenMode::Read, Share::Shared).unwrap());
     assert!(matches!(
-        fs().open(&p, OpenMode::Read, Share::Shared),
+        fs().open(&p, OpenMode::ReadWrite, Share::Shared),
         Err(FsError::Busy { .. })
     ));
+    held.write_all_at(b"still writable", 0).unwrap();
 }
 
 #[cfg(windows)]
@@ -323,5 +326,32 @@ fn shrinking_frees_space_while_open() {
         freed >= 400 << 20,
         "only {} MiB returned after shrinking 512 MiB",
         freed >> 20
+    );
+}
+
+#[test]
+fn read_back_sees_flushed_bytes_at_unaligned_offsets() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("rb");
+    let f = fs()
+        .open(&p, OpenMode::CreateNew, Share::Exclusive)
+        .unwrap();
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+    f.write_all_at(&data, 0).unwrap();
+    f.flush_data().unwrap();
+    for (off, len) in [
+        (0usize, 10usize),
+        (4095, 2),
+        (12_345, 100_000),
+        (299_990, 10),
+    ] {
+        let mut buf = vec![0u8; len];
+        f.read_back(&mut buf, off as u64).unwrap();
+        assert_eq!(buf, &data[off..off + len], "offset {off}");
+    }
+    let mut past = [0u8; 20];
+    assert!(
+        f.read_back(&mut past, 299_990).is_err(),
+        "reading past the end is an error"
     );
 }

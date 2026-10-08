@@ -227,8 +227,10 @@ fn exclusive_handles_and_create_semantics() {
     let h = fs
         .open(p("/f"), OpenMode::ReadWrite, Share::Exclusive)
         .unwrap();
+    // Exclusive admits readers but no writers.
+    drop(fs.open(p("/f"), OpenMode::Read, Share::Shared).unwrap());
     assert!(matches!(
-        fs.open(p("/f"), OpenMode::Read, Share::Shared),
+        fs.open(p("/f"), OpenMode::ReadWrite, Share::Shared),
         Err(FsError::Busy { .. })
     ));
     assert!(matches!(
@@ -242,11 +244,18 @@ fn exclusive_handles_and_create_semantics() {
     );
     drop(h);
     let _s1 = fs.open(p("/f"), OpenMode::Read, Share::Shared).unwrap();
-    let _s2 = fs.open(p("/f"), OpenMode::Read, Share::Shared).unwrap();
-    assert!(matches!(
-        fs.open(p("/f"), OpenMode::Read, Share::Exclusive),
-        Err(FsError::Busy { .. })
-    ));
+    let w = fs
+        .open(p("/f"), OpenMode::ReadWrite, Share::Shared)
+        .unwrap();
+    assert!(
+        matches!(
+            fs.open(p("/f"), OpenMode::Read, Share::Exclusive),
+            Err(FsError::Busy { .. })
+        ),
+        "a writer is open"
+    );
+    drop(w);
+    drop(fs.open(p("/f"), OpenMode::Read, Share::Exclusive).unwrap());
     assert!(matches!(
         fs.open(p("/f"), OpenMode::CreateNew, Share::Shared),
         Err(FsError::AlreadyExists { .. })
@@ -312,4 +321,20 @@ fn unflushed_removal_is_undone_with_its_data() {
     fs.flush_dir(p("/d")).unwrap();
     fs.recover();
     assert!(fs.get_file(p("/d/f")).is_none());
+}
+
+#[test]
+fn read_back_returns_only_durable_bytes() {
+    let fs = FaultFs::new(CrashModel::LoseUnflushed);
+    fs.put_file(p("/f"), b"aaaa");
+    let h = fs
+        .open(p("/f"), OpenMode::ReadWrite, Share::Exclusive)
+        .unwrap();
+    h.write_all_at(b"bb", 0).unwrap();
+    let mut buf = [0u8; 4];
+    h.read_back(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"aaaa", "not flushed yet");
+    h.flush_data().unwrap();
+    h.read_back(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"bbaa");
 }

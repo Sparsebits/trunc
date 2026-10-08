@@ -44,6 +44,8 @@ pub enum Finding {
         max: u64,
     },
     FreeSpaceUnknown,
+    /// The archive carries no signature, so its origin cannot be checked.
+    Unsigned,
     /// Some blocks were already consumed; this is a resume.
     PartiallyConsumed {
         consumed: usize,
@@ -62,7 +64,9 @@ impl Finding {
             | Finding::DestinationSynced(_)
             | Finding::SnapshotsPresent(_)
             | Finding::FreeSpaceUnknown => Severity::Warning,
-            Finding::SnapshotsUnknown(_) | Finding::PartiallyConsumed { .. } => Severity::Note,
+            Finding::SnapshotsUnknown(_)
+            | Finding::PartiallyConsumed { .. }
+            | Finding::Unsigned => Severity::Note,
         }
     }
 }
@@ -121,6 +125,10 @@ impl fmt::Display for Finding {
             Finding::FreeSpaceUnknown => {
                 write!(f, "free space at the destination could not be determined")
             }
+            Finding::Unsigned => write!(
+                f,
+                "the archive is unsigned: its integrity is checked, but not who made it                  (--require-signed to insist)"
+            ),
             Finding::PartiallyConsumed { consumed, total } => {
                 write!(
                     f,
@@ -251,6 +259,9 @@ pub fn assess(
     } else {
         bound.extract_extra
     };
+    if archive.signer().is_none() {
+        findings.push(Finding::Unsigned);
+    }
     if archive.consumed() > 0 {
         findings.push(Finding::PartiallyConsumed {
             consumed: archive.consumed(),

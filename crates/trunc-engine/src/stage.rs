@@ -45,6 +45,33 @@ pub(crate) fn join_rel(base: &Path, rel: &str) -> PathBuf {
     p
 }
 
+/// Open (or create) a staging output, refusing anything that is really one of `protected`
+/// (the archive or its journal, e.g. via a hard link planted in the staging directory).
+/// Returns the handle and whether the file was created.
+pub(crate) fn open_staged_output(
+    fs: &dyn FsBackend,
+    p: &Path,
+    protected: &[trunc_fs::FileId],
+) -> Result<(Box<dyn FileHandle>, bool)> {
+    let (h, created) = match fs.metadata(p)?.map(|m| m.kind) {
+        None => (fs.open(p, OpenMode::CreateNew, Share::Exclusive)?, true),
+        Some(NodeKind::File) => (fs.open(p, OpenMode::ReadWrite, Share::Exclusive)?, false),
+        Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
+    };
+    if protected.contains(&h.file_id()?) {
+        return Err(Error::Refused(format!(
+            "{} is the archive (or its journal) under another name; refusing to write to it",
+            p.display()
+        )));
+    }
+    Ok((h, created))
+}
+
+/// A read-back that came up short: the device holds less than was written.
+pub(crate) fn is_short_read(e: &FsError) -> bool {
+    matches!(e, FsError::Io { source, .. } if source.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 pub(crate) fn ignore_not_found(r: std::result::Result<(), FsError>) -> Result<()> {
     match r {
         Ok(()) | Err(FsError::NotFound { .. }) => Ok(()),

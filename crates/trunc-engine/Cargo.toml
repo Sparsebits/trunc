@@ -25,6 +25,7 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
+trunc-hash.workspace = true
 trunc-legacy.workspace = true
 trunc-testkit.workspace = true
 proptest.workspace = true

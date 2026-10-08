@@ -31,7 +31,8 @@ use crate::io::len_usize;
 use crate::preflight::{self, Finding};
 use crate::stage::{
     Item, ItemKind, all_exist, build_structure, ensure_dir, first_existing, ignore_not_found,
-    join_rel, parent_of, rename_into_place, top_level_names, truncate_with_retry,
+    is_short_read, join_rel, open_staged_output, parent_of, rename_into_place, top_level_names,
+    truncate_with_retry,
 };
 use crate::walk::system_time;
 
@@ -71,6 +72,9 @@ pub struct ConsumeOptions {
     pub retry: RetryPolicy,
     /// ZIP-specific settings (ignored for `.trnc`).
     pub zip: crate::zipconsume::ZipOptions,
+    /// Before releasing source bytes, read the outputs back bypassing the OS cache and check
+    /// them (costs one extra read of everything written).
+    pub verify_media: bool,
 }
 
 impl Default for ConsumeOptions {
@@ -85,6 +89,7 @@ impl Default for ConsumeOptions {
             keep_receipt: true,
             retry: RetryPolicy::default(),
             zip: crate::zipconsume::ZipOptions::default(),
+            verify_media: false,
         }
     }
 }
@@ -381,6 +386,7 @@ fn consume_blocks(
     let n = m.blocks.len();
     let groups = space::batches(m, archive.consumed(), opts.space.batch_max_u);
     let mut open: HashMap<usize, Box<dyn FileHandle>> = HashMap::new();
+    let protected = [archive.handle().file_id()?];
     let mut hashers: HashMap<usize, trunc_hash::Blake3Hasher> = HashMap::new();
 
     let pause_on_full = |e: FsError, consumed: usize| -> Error {
@@ -414,18 +420,10 @@ fn consume_blocks(
                 let e = &m.entries[r.entry];
                 if let std::collections::hash_map::Entry::Vacant(slot) = open.entry(r.entry) {
                     let p = join_rel(stage, &e.path);
-                    let h = match fs.metadata(&p)?.map(|m| m.kind) {
-                        None => {
-                            new_parents.insert(parent_of(&p));
-                            fs.open(&p, OpenMode::CreateNew, Share::Exclusive)?
-                        }
-                        Some(NodeKind::File) => {
-                            fs.open(&p, OpenMode::ReadWrite, Share::Exclusive)?
-                        }
-                        Some(_) => {
-                            return Err(Error::Refused(format!("{} is not a file", p.display())));
-                        }
-                    };
+                    let (h, created) = open_staged_output(fs, &p, &protected)?;
+                    if created {
+                        new_parents.insert(parent_of(&p));
+                    }
                     slot.insert(h);
                 }
                 let h = &open[&r.entry];
@@ -471,6 +469,30 @@ fn consume_blocks(
         }
         for d in &new_parents {
             fs.flush_dir(d)?;
+        }
+        if opts.verify_media {
+            // Read the batch back from the device and check it before releasing its source.
+            for i in g.clone() {
+                let b = &m.blocks[i];
+                let mut h = trunc_hash::Blake3Hasher::new();
+                let mut short = false;
+                for r in archive.stream().runs(b.stream_off, b.u_len) {
+                    let mut buf = vec![0u8; len_usize(r.len)];
+                    match open[&r.entry].read_back(&mut buf, r.entry_off) {
+                        Ok(()) => h.update(&buf),
+                        Err(e) if is_short_read(&e) => {
+                            short = true;
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                }
+                if short || *h.finalize().as_bytes() != b.blake3_u {
+                    return Err(Error::Integrity(format!(
+                        "media verification failed for block {i}: the data read back from                          disk differs from what was written; the archive was not truncated"
+                    )));
+                }
+            }
         }
         for entry in &completed {
             open.remove(entry);

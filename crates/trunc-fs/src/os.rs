@@ -21,12 +21,18 @@ impl OsFs {
     }
 }
 
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 1;
+
 #[derive(Debug)]
 struct OsFile {
     file: File,
     path: PathBuf,
     #[cfg(windows)]
     sparse: std::sync::atomic::AtomicBool,
+    /// Lazily opened unbuffered handle for `read_back`.
+    #[cfg(windows)]
+    uncached: std::sync::Mutex<Option<File>>,
 }
 
 fn err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> FsError + 'a {
@@ -68,7 +74,7 @@ impl FsBackend for OsFs {
             use std::os::windows::fs::OpenOptionsExt;
             oo.custom_flags(crate::win::FILE_FLAG_OPEN_REPARSE_POINT);
             if share == Share::Exclusive {
-                oo.share_mode(0);
+                oo.share_mode(FILE_SHARE_READ);
             }
         }
         #[cfg(not(windows))]
@@ -122,6 +128,8 @@ impl FsBackend for OsFs {
             path: path.to_path_buf(),
             #[cfg(windows)]
             sparse: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(windows)]
+            uncached: std::sync::Mutex::new(None),
         }))
     }
 
@@ -357,6 +365,60 @@ impl FileHandle for OsFile {
                 Err(e) => return Err(FsError::from_io("reading", &self.path, e)),
             }
         }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn read_back(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ALIGN: u64 = 4096; // covers 512-byte and 4 KiB sectors
+        const ALIGN_BYTES: usize = 4096;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        let mut guard = self
+            .uncached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            let f = OpenOptions::new()
+                .read(true)
+                .share_mode(7) // read | write | delete: coexist with our own writer handle
+                .custom_flags(FILE_FLAG_NO_BUFFERING | crate::win::FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)
+                .map_err(self.e("opening for verification"))?;
+            *guard = Some(f);
+        }
+        let f = guard.as_ref().expect("set above");
+        // Unbuffered reads need sector-aligned offsets, lengths and memory.
+        let start = off / ALIGN * ALIGN;
+        let end = (off + buf.len() as u64).div_ceil(ALIGN) * ALIGN;
+        let span = usize::try_from(end - start)
+            .map_err(|_| self.e("verifying")(io::ErrorKind::InvalidInput.into()))?;
+        let mut raw = vec![0u8; span + ALIGN_BYTES];
+        let a = raw.as_ptr().align_offset(ALIGN_BYTES);
+        let aligned = &mut raw[a..a + span];
+        let mut got = 0usize;
+        while got < span {
+            match read_at(f, &mut aligned[got..], start + got as u64) {
+                // Unbuffered reads are only ever short at end of file; continuing from an
+                // unaligned offset would fail with ERROR_INVALID_PARAMETER.
+                Ok(n) if n < span - got => {
+                    got += n;
+                    break;
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(FsError::from_io("verifying", &self.path, e)),
+            }
+        }
+        let rel = usize::try_from(off - start).expect("< ALIGN");
+        if got < rel + buf.len() {
+            return Err(FsError::from_io(
+                "verifying",
+                &self.path,
+                io::ErrorKind::UnexpectedEof.into(),
+            ));
+        }
+        buf.copy_from_slice(&aligned[rel..rel + buf.len()]);
         Ok(())
     }
 

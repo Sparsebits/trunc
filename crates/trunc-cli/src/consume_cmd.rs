@@ -38,6 +38,10 @@ pub struct ConsumeFlags {
     /// Start even if the free-space check says it will not fit.
     #[arg(long)]
     pub ignore_space: bool,
+    /// Before releasing any source bytes, read the extracted data back from disk (bypassing the
+    /// OS cache) and check it. Costs one extra read of everything extracted.
+    #[arg(long)]
+    pub verify_media: bool,
     /// .trnc: decoded bytes per batch (smaller means less extra space, more flushes).
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     pub batch: u64,
@@ -69,6 +73,7 @@ impl ConsumeFlags {
             skip_space_check: self.ignore_space,
             keep_receipt: !self.no_receipt,
             retry: RetryPolicy::default(),
+            verify_media: self.verify_media,
             zip: ZipOptions {
                 allow_overlap: self.allow_overlap,
                 punch: if self.no_punch {

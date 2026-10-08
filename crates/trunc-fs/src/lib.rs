@@ -75,7 +75,9 @@ impl OpenMode {
 pub enum Share {
     /// Other processes may read, write and delete concurrently.
     Shared,
-    /// No other handle may be opened while this one exists (Windows); advisory elsewhere.
+    /// Other handles may read but not write or delete while this one exists (Windows; advisory
+    /// elsewhere). Readers are allowed so antivirus scanners, indexers and our own uncached
+    /// verification handle can coexist; nothing can change the file under us.
     Exclusive,
 }
 
@@ -193,6 +195,12 @@ pub trait FileHandle: Send + Sync + Debug {
     /// Path the file was opened at (diagnostics only; the file may have been renamed since).
     fn path(&self) -> &Path;
     fn read_exact_at(&self, buf: &mut [u8], off: u64) -> Result<()>;
+    /// Read what is on the storage device, bypassing the OS cache where the platform allows
+    /// (Windows: `FILE_FLAG_NO_BUFFERING`). Used to verify written data before releasing the
+    /// source. The drive's own cache may still answer. The default reads normally.
+    fn read_back(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        self.read_exact_at(buf, off)
+    }
     fn write_all_at(&self, buf: &[u8], off: u64) -> Result<()>;
     fn size(&self) -> Result<u64>;
     /// Truncate or extend. Shrinking a file that another process has memory-mapped fails with

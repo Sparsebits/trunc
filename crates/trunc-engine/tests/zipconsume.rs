@@ -450,3 +450,76 @@ fn consumes_archives_made_by_windows() {
     trunc_testkit::tree::assert_same(&src, &dest.join("src"));
     assert!(!arc.exists());
 }
+
+#[test]
+fn verify_media_catches_a_lying_drive_in_both_zip_modes() {
+    let mut rng = Rng::new(31);
+    let sp = vec![
+        Spec::file("big.txt", &fixtures::text_bytes(&mut rng, 400_000)),
+        Spec::file("s.txt", b"small"),
+    ];
+    let bytes = build(&sp, b"");
+    for mut o in [opts(), punch_opts(32 << 10)] {
+        o.verify_media = true;
+        let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+        run(&fs, &o).unwrap();
+        assert_complete(&fs, &expected(&sp));
+
+        let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+        fs.set_flush_lies(true);
+        let e = run(&fs, &o).unwrap_err();
+        assert!(e.to_string().contains("media verification failed"), "{e}");
+        // The entry whose output failed verification still has all its source bytes.
+        let h = fs
+            .open(Path::new(ARC), OpenMode::Read, Share::Shared)
+            .unwrap();
+        let mut zeros = 0usize;
+        let len = h.size().unwrap() as usize;
+        let mut buf = vec![0u8; len];
+        h.read_exact_at(&mut buf, 0).unwrap();
+        zeros += buf.iter().filter(|&&b| b == 0).count();
+        assert!(
+            zeros < len / 4,
+            "source was not punched away: {zeros} zero bytes of {len}"
+        );
+    }
+}
+
+#[test]
+fn refuses_staged_files_that_are_the_zip() {
+    let sp = specs(32);
+    let bytes = build(&sp, b"");
+    let d = tempfile::tempdir().unwrap();
+    let arc = d.path().join("a.zip");
+    std::fs::write(&arc, &bytes).unwrap();
+    let dest = d.path().join("out");
+    let layout = {
+        let h = OsFs::new()
+            .open(&arc, OpenMode::Read, Share::Shared)
+            .unwrap();
+        zip::parse(h.as_ref()).unwrap()
+    };
+    let id: [u8; 16] = trunc_hash::blake3(&layout.to_bytes())[..16]
+        .try_into()
+        .unwrap();
+    let staged = trunc_engine::consume::stage_dir(&dest, &id)
+        .join("proj")
+        .join("readme.md");
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::hard_link(&arc, &staged).unwrap();
+    let e = zipconsume::consume_zip(&OsFs::new(), &arc, &dest, &opts(), &mut |_| {}).unwrap_err();
+    let refused =
+        e.to_string().contains("is the archive") || matches!(e, Error::Fs(FsError::Busy { .. }));
+    assert!(refused, "{e}");
+    // Entries after it (consumed first, from the end) were extracted safely; the victim's own
+    // bytes are still in the archive.
+    let victim = layout
+        .entries
+        .iter()
+        .find(|e| e.name == "proj/readme.md")
+        .unwrap();
+    let h = OsFs::new()
+        .open(&arc, OpenMode::Read, Share::Shared)
+        .unwrap();
+    assert!(h.size().unwrap() >= victim.region_end);
+}

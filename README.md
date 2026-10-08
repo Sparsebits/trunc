@@ -4,6 +4,8 @@ Self-consuming archives. A `.trnc` archive stores its blocks in reverse order, s
 
 > **Status: early development (plan phases 0–4 done).** Create, inspect, verify, plan, extract and destructive extraction (`--consume`) with crash recovery work for `.trnc` and for existing ZIP archives, including punch mode, which frees space inside huge ZIP entries as they decompress. Windows/NTFS is the primary platform; Linux runs everything except volume probing and sparse-file features (phase 5).
 
+Start with the [user guide](docs/guide.md). It includes what `--consume` promises and what it doesn't. The [security checklist](docs/security.md) maps every safety rule to the code and test that enforce it.
+
 ## Build
 
 Needs Rust 1.85+ (the repo pins `stable` via `rust-toolchain.toml`). On Windows, also the MSVC build tools.
@@ -24,6 +26,7 @@ trunc plan data.trnc -C ./out                  # filesystem, free space, extract
 trunc x data.trnc -C ./out                     # non-destructive extract
 trunc x data.trnc -C ./out --consume           # destructive: frees the archive as it extracts
 trunc resume data.trnc                         # continue after a crash, kill or pause
+trunc x data.trnc -C ./out --consume --verify-media   # also read outputs back from disk first
 trunc x big.zip -C ./out --consume             # existing ZIPs too (Stored/Deflate, Zip64)
 
 trunc key gen me.key                           # signing

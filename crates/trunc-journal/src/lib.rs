@@ -219,6 +219,11 @@ impl Journal {
         Ok(())
     }
 
+    /// Identity of the journal file (so callers can refuse to write to it by another name).
+    pub fn file_id(&self) -> Result<trunc_fs::FileId> {
+        Ok(self.handle.file_id()?)
+    }
+
     /// Delete a journal (after the job is complete).
     pub fn remove(self, fs: &dyn FsBackend, path: &Path) -> Result<()> {
         drop(self.handle);

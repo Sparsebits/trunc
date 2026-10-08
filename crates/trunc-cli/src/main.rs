@@ -286,9 +286,33 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
         if a.allow_symlinks {
             anyhow::bail!("--allow-symlinks is not supported for ZIP archives");
         }
-        return zip_cmd::extract(&a.archive, &a.dest, a.overwrite);
+        return zip_cmd::extract(
+            &a.archive,
+            &a.dest,
+            a.overwrite,
+            a.consume_flags.ignore_space,
+        );
     }
     let archive = Archive::open(&a.archive)?;
+    // Refuse up front when the declared output cannot fit (guards against archives that expand
+    // to far more than the disk holds).
+    if !a.consume_flags.ignore_space {
+        let p = trunc_engine::preflight::assess(
+            &trunc_fs::OsFs::new(),
+            &archive,
+            &a.dest,
+            SpaceParams::default(),
+        )?;
+        if p.extract_fits == Some(false) {
+            anyhow::bail!(
+                "not enough free space at {}: extracting needs about {}, {} are free                  (--consume needs about {}; --ignore-space to try anyway)",
+                a.dest.display(),
+                bytes(p.bound.extract_extra),
+                bytes(p.destination.free_bytes.unwrap_or(0)),
+                bytes(p.consume_needs)
+            );
+        }
+    }
     let opts = ExtractOptions {
         overwrite: a.overwrite,
         allow_symlinks: a.allow_symlinks,
