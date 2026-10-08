@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  Source for the README proof chart. Rendered to docs/assets/chart-{dark,light}.png by render.ps1.
+  Numbers: measured 2026-10-08 on NTFS (Ryzen 7 5800H, Samsung NVMe), 10 GiB dataset,
+  5.81 GiB lz4 archive. See README "Benchmarks" for the exact commands.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=block" rel="stylesheet">
+<style>
+  :root { --bg: #080808; --ink: #f3f1ee; --muted: #8a8784; --faint: #3a3a3a; --track: #141414;
+          --accent: #ff5b35; --other: #5c5a57; }
+  :root.light { --bg: #faf9f7; --ink: #121212; --muted: #6f6c68; --faint: #d8d4ce; --track: #efece7;
+                --accent: #ff5b35; --other: #b3afa9; }
+  html, body { margin: 0; }
+  body { width: 1200px; height: 300px; background: var(--bg); font-family: 'Space Grotesk', sans-serif;
+         -webkit-font-smoothing: antialiased; position: relative; overflow: hidden; }
+  .title { position: absolute; left: 56px; top: 34px; font: 500 15px/1 'IBM Plex Mono', monospace;
+           letter-spacing: 1.4px; color: var(--muted); text-transform: uppercase; }
+  .row { position: absolute; left: 56px; right: 56px; height: 64px; display: flex; align-items: center; }
+  .row.a { top: 84px; } .row.b { top: 172px; }
+  .name { width: 300px; font: 500 20px/1.25 'IBM Plex Mono', monospace; color: var(--ink); }
+  .name small { display: block; font-size: 14px; color: var(--muted); margin-top: 4px; }
+  .track { flex: 1; height: 44px; background: var(--track); position: relative; }
+  .bar { position: absolute; left: 0; top: 0; bottom: 0; }
+  .val { position: absolute; top: 50%; transform: translateY(-50%); font-weight: 600; font-size: 26px;
+         letter-spacing: -0.5px; color: var(--ink); white-space: nowrap; }
+  .a .bar { width: 43.2%; background: var(--accent); }
+  .a .val { left: calc(43.2% + 16px); }
+  .b .bar { width: 100%; background: var(--other); }
+  .b .val { right: 16px; color: var(--bg); }
+  :root.light .b .val { color: var(--ink); }
+  .val em { font-style: normal; font: 500 15px/1 'IBM Plex Mono', monospace; color: var(--muted); margin-left: 10px; }
+</style>
+</head>
+<body>
+  <div class="title">Free disk space needed to extract 10 GiB from a 5.81 GiB archive</div>
+  <div class="row a">
+    <div class="name">trunc x --consume<small>archive shrinks as it extracts</small></div>
+    <div class="track"><div class="bar"></div><div class="val">4.32 GiB<em>peak, measured</em></div></div>
+  </div>
+  <div class="row b">
+    <div class="name">any extractor<small>archive kept until the end</small></div>
+    <div class="track"><div class="bar"></div><div class="val">10.00 GiB</div></div>
+  </div>
+  <script>
+    if (new URLSearchParams(location.search).get('theme') === 'light') document.documentElement.classList.add('light');
+  </script>
+</body>
+</html>
