@@ -2,7 +2,7 @@
 
 Self-consuming archives. A `.trnc` archive stores its blocks in reverse order, so an extractor can decode the block at the end of the file, make its output durable, and truncate the archive past it. Extraction then needs roughly *output size − archive size* of free space instead of the full output size.
 
-> **Status: early development (plan phases 0–1 done).** Creating, inspecting, verifying and non-destructively extracting `.trnc` archives works. Destructive extraction (`--consume`) arrives in phase 3 and currently refuses to run.
+> **Status: early development (plan phases 0–2 done).** Creating, inspecting, verifying and non-destructively extracting `.trnc` archives works, and `trunc plan` probes the real destination volume. Destructive extraction (`--consume`) arrives in phase 3 and currently refuses to run.
 
 ## Build
 
@@ -20,7 +20,7 @@ trunc create data.trnc ./data                  # zstd:9, 8 MiB blocks
 trunc create data.trnc ./data --codec lz4 --block-size 4M --dict train
 trunc inspect data.trnc --entries --blocks
 trunc verify data.trnc
-trunc plan data.trnc                           # free space needed: extract vs consume
+trunc plan data.trnc -C ./out                  # filesystem, free space, extract vs consume, warnings
 trunc x data.trnc -C ./out                     # non-destructive extract
 
 trunc key gen me.key                           # signing
@@ -38,8 +38,9 @@ trunc verify data.trnc --trust-key <hex public key>
 | `crates/trunc-chunk` | Block boundary selection |
 | `crates/trunc-engine` | Producer, archive reader, extractor, verifier, keys |
 | `crates/trunc-cli` | The `trunc` binary |
-| `crates/trunc-testkit` | Deterministic fixtures, tree comparison (fault injection later) |
-| `crates/trunc-fs`, `-journal`, `-legacy`, `-adapter` | Placeholders for phases 2, 4 and 7 |
+| `crates/trunc-fs` | Filesystem backend trait; OS backend (NTFS sparse files, file ids, volume probing, no-replace rename); cloud-sync detection |
+| `crates/trunc-testkit` | Deterministic fixtures, tree comparison, `FaultFs` in-memory crash-injection filesystem |
+| `crates/trunc-journal`, `-legacy`, `-adapter` | Placeholders for phases 4 and 7 |
 | `docs/spec` | Normative format spec, crash-safety invariants, journal draft |
 | `docs/adr` | Design decisions |
 | `fuzz/` | cargo-fuzz targets (needs nightly) |

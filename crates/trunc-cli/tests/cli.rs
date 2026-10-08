@@ -45,8 +45,9 @@ fn create_inspect_verify_plan_extract() {
     let s = ok(&trunc(&["verify", "data.trnc"], w));
     assert!(s.starts_with("ok:"), "{s}");
 
-    let s = ok(&trunc(&["plan", "data.trnc"], w));
+    let s = ok(&trunc(&["plan", "data.trnc", "-C", "out"], w));
     assert!(s.contains("consume (--consume)"), "{s}");
+    assert!(s.contains("archive       same volume"), "{s}");
 
     ok(&trunc(&["x", "data.trnc", "-C", "out"], w));
     tree::assert_same(&w.join("data"), &w.join("out/data"));

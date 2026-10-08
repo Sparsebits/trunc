@@ -11,6 +11,7 @@ publish.workspace = true
 trunc-chunk.workspace = true
 trunc-codec.workspace = true
 trunc-core.workspace = true
+trunc-fs.workspace = true
 trunc-hash.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true

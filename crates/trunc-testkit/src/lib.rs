@@ -4,11 +4,16 @@
 //!   files and directories, incompressible and all-zero data).
 //! - [`tree`] snapshots and compares directory trees byte for byte.
 //!
-//! Phase 2 adds `FaultFs` (crash, torn-write, volatile-cache, ENOSPC and mapped-file injection)
-//! and phase 3 the crash harness that sweeps every operation index.
+//! - [`faultfs`] is an in-memory filesystem with crash, torn-write, lost-unflushed-data, ENOSPC
+//!   and mapped-file fault injection, plus occupancy tracking.
+//!
+//! Phase 3 adds the crash harness that sweeps every operation index of a consume.
 
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
+pub use faultfs::{CrashModel, Fault, FaultFs};
+
+pub mod faultfs;
 pub mod fixtures;
 pub mod tree;
 

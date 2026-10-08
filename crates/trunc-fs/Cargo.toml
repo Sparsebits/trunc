@@ -8,7 +8,30 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
 
-[lints]
-workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+
+# Same as the workspace lints, except `unsafe_code` is `deny` instead of `forbid` so the Windows
+# module alone can opt in with `#[allow(unsafe_code)]` (ADR-0004: OS code lives only here).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cast_possible_truncation = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"

@@ -1,6 +1,6 @@
 [package]
 name = "trunc-testkit"
-description = "Test fixtures, tree comparison and (later) fault injection for trunc."
+description = "Test fixtures, tree comparison and the fault-injecting FaultFs for trunc."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+trunc-fs.workspace = true
 
 [lints]
 workspace = true

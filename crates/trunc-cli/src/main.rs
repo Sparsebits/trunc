@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use trunc_codec::CodecChoice;
-use trunc_core::space::{self, SpaceParams};
+use trunc_core::space::SpaceParams;
 use trunc_core::{CodecId, EntryKind};
 use trunc_engine::extract::{ExtractOptions, TrustPolicy};
 use trunc_engine::producer::{CreateOptions, DictMode};
@@ -140,9 +140,9 @@ struct VerifyArgs {
 #[derive(Debug, Args)]
 struct PlanArgs {
     archive: PathBuf,
-    /// Destination filesystem cluster size.
-    #[arg(long, default_value = "4K", value_parser = parse_size)]
-    cluster: u64,
+    /// Destination directory (need not exist yet).
+    #[arg(short = 'C', long = "dest", default_value = ".")]
+    dest: PathBuf,
     /// Decoded bytes per consume batch (one flush + truncate per batch).
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     batch: u64,
@@ -379,45 +379,100 @@ fn verify(a: VerifyArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Exit codes for `plan`: both fit, only `--consume` fits, neither fits.
+const PLAN_ONLY_CONSUME: u8 = 2;
+const PLAN_NEITHER: u8 = 3;
+
+fn volume_line(v: &trunc_fs::VolumeInfo) -> String {
+    let free = v.free_bytes.map_or("free space unknown".into(), |f| {
+        format!("{} free", bytes(f))
+    });
+    let journal = if v.journaled() {
+        "journaled"
+    } else {
+        "NOT journaled"
+    };
+    let root = v
+        .root
+        .as_ref()
+        .map_or(String::new(), |r| format!("{} ", r.display()));
+    format!(
+        "{root}{} ({journal}, cluster {}), {free}",
+        v.fs_name,
+        bytes(u64::from(v.cluster_size))
+    )
+}
+
+fn fits(f: Option<bool>) -> &'static str {
+    match f {
+        Some(true) => "fits",
+        Some(false) => "DOES NOT FIT",
+        None => "unknown",
+    }
+}
+
 fn plan(a: PlanArgs) -> Result<ExitCode> {
+    use trunc_engine::preflight::{self, Severity};
     let archive = Archive::open(&a.archive)?;
     let params = SpaceParams {
-        cluster_size: a.cluster,
         batch_max_u: a.batch,
         ..SpaceParams::default()
     };
-    let b = space::bound(
-        archive.manifest(),
-        archive.header().first_block_off(),
-        archive.consumed(),
-        &params,
-    );
-    println!("archive now            {}", bytes(b.archive_len));
-    println!("content to write       {}", bytes(b.remaining_u));
+    let p = preflight::assess(&trunc_fs::OsFs::new(), &archive, &a.dest, params)?;
+    let b = &p.bound;
+    println!("destination   {}", volume_line(&p.destination));
+    if p.same_volume {
+        println!("archive       same volume");
+    } else {
+        println!("archive       {}", volume_line(&p.archive_volume));
+    }
+    println!("archive now   {}", bytes(b.archive_len));
+    println!("content       {} to write", bytes(b.remaining_u));
     println!(
-        "allowances             {} rounding/metadata + {} margin",
+        "allowances    {} rounding/metadata + {} margin",
         bytes(b.slack),
         bytes(b.margin)
     );
-    println!("free space needed:");
-    println!("  extract (keeps archive)   {}", bytes(b.extract_extra));
+    println!();
+    println!("free space needed at the destination:");
     println!(
-        "  consume (--consume)       {}  (peak occupancy {}, {} batches)",
-        bytes(b.consume_extra),
-        bytes(b.consume_peak),
-        b.batches
+        "  extract (keeps archive)   {:>12}   {}",
+        bytes(b.extract_extra),
+        fits(p.extract_fits)
     );
-    if b.extract_extra > 0 {
+    println!(
+        "  consume (--consume)       {:>12}   {}   (peak occupancy {}, {} batch{})",
+        bytes(p.consume_needs),
+        fits(p.consume_fits),
+        bytes(b.consume_peak),
+        b.batches,
+        if b.batches == 1 { "" } else { "es" }
+    );
+    if p.same_volume && b.extract_extra > 0 {
         println!(
-            "consume saves {} ({:.1}%) of free space",
-            bytes(b.extract_extra.saturating_sub(b.consume_extra)),
-            100.0 - pct(b.consume_extra, b.extract_extra)
+            "  consume saves {} ({:.1}%)",
+            bytes(b.extract_extra.saturating_sub(p.consume_needs)),
+            100.0 - pct(p.consume_needs, b.extract_extra)
         );
     }
-    println!(
-        "note: this is a conservative upper bound; volume probing (free space, filesystem, snapshots) arrives in phase 2"
-    );
-    Ok(ExitCode::SUCCESS)
+    if !p.findings.is_empty() {
+        println!();
+        for f in &p.findings {
+            let tag = match f.severity() {
+                Severity::Blocker => "blocks --consume",
+                Severity::Warning => "warning",
+                Severity::Note => "note",
+            };
+            println!("[{tag}] {f}");
+        }
+    }
+    println!();
+    println!("figures are conservative upper bounds, not exact predictions");
+    Ok(match (p.extract_fits, p.consume_fits) {
+        (Some(false), Some(true)) => ExitCode::from(PLAN_ONLY_CONSUME),
+        (Some(false), Some(false)) => ExitCode::from(PLAN_NEITHER),
+        _ => ExitCode::SUCCESS,
+    })
 }
 
 fn key(k: KeyCmd) -> Result<ExitCode> {

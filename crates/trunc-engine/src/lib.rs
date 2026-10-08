@@ -4,15 +4,16 @@
 //! - [`archive`] opens and reads them, including partially consumed ones.
 //! - [`extract`] performs non-destructive extraction and verification.
 //! - [`keys`] manages Ed25519 signing keys.
+//! - [`preflight`] checks space and safety for a destination before extracting or consuming.
 //!
-//! The destructive consumer, space planner against live volumes, staging and recovery arrive in
-//! phase 3 on top of `trunc-fs`.
+//! The destructive consumer, staging and recovery arrive in phase 3 on top of `trunc-fs`.
 
 pub mod archive;
 pub mod error;
 pub mod extract;
 mod io;
 pub mod keys;
+pub mod preflight;
 pub mod producer;
 mod walk;
 
