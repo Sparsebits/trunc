@@ -120,14 +120,23 @@ fn mtime_of(md: &fs::Metadata) -> (i64, u32) {
     }
 }
 
-/// Convert a stored mtime back to `SystemTime`.
+/// Earliest and latest times every supported platform can store: 1601-01-01 (the Windows
+/// epoch) and 9999-12-31.
+const MIN_SECS: i64 = -11_644_473_600;
+const MAX_SECS: i64 = 253_402_300_799;
+
+/// Convert a stored mtime back to `SystemTime`, clamped to what every platform can store (an
+/// archive may carry any value; it must never make extraction fail or panic).
 pub(crate) fn system_time(secs: i64, nanos: u32) -> SystemTime {
+    let secs = secs.clamp(MIN_SECS, MAX_SECS);
+    let nanos = std::time::Duration::from_nanos(u64::from(nanos.min(999_999_999)));
     let base = if secs >= 0 {
-        UNIX_EPOCH + std::time::Duration::from_secs(secs.unsigned_abs())
+        UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs.unsigned_abs()))
     } else {
-        UNIX_EPOCH - std::time::Duration::from_secs(secs.unsigned_abs())
+        UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(secs.unsigned_abs()))
     };
-    base + std::time::Duration::from_nanos(u64::from(nanos))
+    base.and_then(|t| t.checked_add(nanos))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 #[cfg(unix)]
@@ -143,5 +152,31 @@ fn mode_of(md: &fs::Metadata) -> u32 {
         base & !0o222
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extreme_mtimes_never_panic() {
+        for secs in [
+            i64::MIN,
+            MIN_SECS - 1,
+            -1,
+            0,
+            1_700_000_000,
+            MAX_SECS + 1,
+            i64::MAX,
+        ] {
+            for nanos in [0, 999_999_999, u32::MAX] {
+                let _ = system_time(secs, nanos);
+            }
+        }
+        assert_eq!(
+            system_time(1_700_000_000, 5),
+            UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 5)
+        );
     }
 }

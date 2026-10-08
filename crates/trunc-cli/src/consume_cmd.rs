@@ -1,4 +1,4 @@
-//! `trunc x --consume` and `trunc resume`, for `.trnc` and ZIP archives.
+//! `trunc x --consume` and `trunc resume`, for `.trnc`, ZIP and `.tar.gz` archives.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use trunc_core::space::SpaceParams;
 use trunc_engine::consume::{self, ConsumeOptions, Progress, RetryPolicy};
 use trunc_engine::extract::TrustPolicy;
 use trunc_engine::preflight::{Finding, Severity};
+use trunc_engine::tgzconsume;
 use trunc_engine::zipconsume::{self, PunchPolicy, ZipOptions};
 use trunc_engine::{Error, PauseReason};
 use trunc_fs::OsFs;
@@ -54,7 +55,7 @@ pub struct ConsumeFlags {
     /// ZIP: compressed size from which entries are punched while decompressing.
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     pub punch_min: u64,
-    /// ZIP: output bytes between punch-mode checkpoints.
+    /// ZIP and tar.gz: output bytes between checkpoints that free compressed data.
     #[arg(long, default_value = "64M", value_parser = parse_size)]
     pub checkpoint_every: u64,
 }
@@ -88,21 +89,22 @@ impl ConsumeFlags {
     }
 }
 
-fn confirm(archive: &Path, dest: &Path, zip: bool) -> Result<bool> {
+fn confirm(archive: &Path, dest: &Path, legacy: Option<&str>) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!(
             "--consume destroys the archive; pass --yes to confirm when not running interactively"
         );
     }
-    let zip_note = if zip {
-        "Other ZIP tools cannot open the file once the first step has run.\n"
-    } else {
-        ""
+    let legacy_note = match legacy {
+        Some(kind) => {
+            format!("Other {kind} tools cannot open the file once the first step has run.\n")
+        }
+        None => String::new(),
     };
     eprint!(
         "--consume destroys {} while extracting into {}.\n\
          If interrupted, nothing is lost: run the same command again to continue.\n\
-         {zip_note}Continue? [y/N] ",
+         {legacy_note}Continue? [y/N] ",
         archive.display(),
         dest.display(),
     );
@@ -120,13 +122,20 @@ pub fn run(
     threads: usize,
 ) -> Result<ExitCode> {
     let fs = OsFs::new();
-    let zip = zipconsume::is_zip(&fs, archive);
-    if !flags.yes && !confirm(archive, dest, zip)? {
+    let legacy = crate::legacy_kind(archive);
+    if let Some(kind) = legacy {
+        crate::refuse_trust_flags(&trust, kind)?;
+    }
+    if !flags.yes && !confirm(archive, dest, legacy)? {
         eprintln!("cancelled; nothing was changed");
         return Ok(ExitCode::FAILURE);
     }
     let opts = flags.options(trust, threads);
-    let unit = if zip { "entries" } else { "blocks" };
+    let unit = match legacy {
+        Some("ZIP") => "entries",
+        Some(_) => "checkpoints",
+        None => "blocks",
+    };
     let tty = std::io::stderr().is_terminal();
     let t = Instant::now();
     let mut progress = |p: Progress| match p {
@@ -159,10 +168,10 @@ pub fn run(
             eprintln!("all {unit} consumed; moving files into place");
         }
     };
-    let result = if zip {
-        zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress)
-    } else {
-        consume::consume(&fs, archive, dest, &opts, &mut progress)
+    let result = match legacy {
+        Some("ZIP") => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
+        Some(_) => tgzconsume::consume_tgz(&fs, archive, dest, &opts, &mut progress),
+        None => consume::consume(&fs, archive, dest, &opts, &mut progress),
     };
     match result {
         Ok(s) => {
@@ -192,11 +201,17 @@ pub fn run(
                     s.symlinks_skipped
                 );
             }
+            if s.specials_skipped > 0 {
+                println!(
+                    "devices   {} device or FIFO entries skipped",
+                    s.specials_skipped
+                );
+            }
             match &s.receipt {
                 Some(r) => println!("archive   consumed; receipt kept at {}", r.display()),
                 None => println!("archive   consumed and removed"),
             }
-            let steps = if zip { "steps" } else { "batches" };
+            let steps = if legacy.is_some() { "steps" } else { "batches" };
             println!(
                 "time      {:.2}s ({} {steps})",
                 t.elapsed().as_secs_f64(),
@@ -231,18 +246,24 @@ pub fn run(
 }
 
 /// Destination for `trunc resume`: the explicit one, else the one recorded when consumption
-/// started (ZIP journal or `.trnc` resume note).
+/// started (ZIP or tar.gz journal, or `.trnc` resume note). Refuses archives that were never
+/// started, so `resume` cannot begin a fresh destructive run by accident.
 pub fn resume_dest(archive: &Path, dest: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(d) = dest {
-        return Ok(d);
-    }
     let fs = OsFs::new();
-    if let Some(d) = zipconsume::journal_dest(&fs, archive) {
-        return Ok(d);
+    let recorded = zipconsume::journal_dest(&fs, archive)
+        .or_else(|| tgzconsume::journal_dest(&fs, archive))
+        .or_else(|| consume::read_resume_note(&fs, archive).map(|n| n.dest));
+    let started =
+        recorded.is_some() || trunc_engine::Archive::open(archive).is_ok_and(|a| a.consumed() > 0);
+    if !started {
+        bail!(
+            "nothing to resume: {} has not been partly consumed (start with `trunc x --consume`)",
+            archive.display()
+        );
     }
-    match consume::read_resume_note(&fs, archive) {
-        Some(n) => Ok(n.dest),
-        None => bail!(
+    match (dest, recorded) {
+        (Some(d), _) | (None, Some(d)) => Ok(d),
+        (None, None) => bail!(
             "no resume note or journal found next to {}; pass the destination with -C",
             archive.display()
         ),

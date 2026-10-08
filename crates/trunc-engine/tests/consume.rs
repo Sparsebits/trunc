@@ -491,3 +491,39 @@ fn refuses_staged_files_that_are_the_archive() {
     assert!(refused, "{e}");
     assert_eq!(fs::read(&arc).unwrap(), fx.bytes, "archive untouched");
 }
+
+/// A pause leaves entries the interrupted run created but never flushed. The resumed run must
+/// make them durable before it releases anything: crash it at every step and recover.
+#[test]
+fn pause_then_resume_survives_a_crash_at_every_step() {
+    let fx = build(1024, |r| sample_tree(r, 13));
+    let mut o = opts(2048);
+    o.skip_space_check = true;
+    for extra in [500u64, 1500, 3000, 6000] {
+        let paused = |fs: &FaultFs| {
+            fs.set_capacity(Some(fx.bytes.len() as u64 + extra));
+            let r = run(fs, &o);
+            fs.set_capacity(None);
+            r.is_err()
+        };
+        let probe = fresh_fs(CrashModel::LoseUnflushed, &fx);
+        if !paused(&probe) {
+            continue;
+        }
+        let base = probe.op_count();
+        run(&probe, &o).unwrap();
+        let resumed_ops = probe.op_count() - base;
+        for k in 1..=resumed_ops {
+            let fs = fresh_fs(CrashModel::LoseUnflushed, &fx);
+            assert!(paused(&fs));
+            fs.inject(Fault::CrashAt(fs.op_count() + k));
+            if run(&fs, &o).is_ok() {
+                continue;
+            }
+            fs.recover();
+            fs.clear_faults();
+            run(&fs, &o).unwrap_or_else(|e| panic!("extra {extra}, op {k}: {e}"));
+            assert_complete(&fs, &fx);
+        }
+    }
+}

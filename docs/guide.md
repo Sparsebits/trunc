@@ -1,6 +1,6 @@
 # trunc user guide
 
-`trunc` extracts archives while consuming them: as each piece is safely extracted, the archive shrinks by that piece. You need about *output size − archive size* of free space instead of the full output size. It works with its own `.trnc` format and with existing ZIP files.
+`trunc` extracts archives while consuming them: as each piece is safely extracted, the archive shrinks by that piece. You need about *output size − archive size* of free space instead of the full output size. It works with its own `.trnc` format and with existing ZIP and `.tar.gz` files.
 
 ## Quick start
 
@@ -27,14 +27,14 @@ Smaller blocks (`--block-size 4M`) mean less extra space during `--consume`; lar
 ## What `--consume` promises
 
 - **Nothing is lost if it is interrupted.** Every byte is always either still in the archive or safely written at the destination. Run the same command again, or `trunc resume <archive>`, to continue. This is tested by crashing it at every single filesystem operation, under models where unflushed writes are lost or survive in any order.
-- **Nothing is destroyed until it has been verified and made durable.** Each piece's hash (or ZIP CRC) is checked before anything is written. The output is flushed to disk, and only then is the source released.
+- **Nothing is destroyed until it has been verified and made durable.** Each piece's hash (or ZIP CRC) is checked before its source is released; `.tar.gz` archives are checked in full before anything is written. The output is flushed to disk, and only then is the source released.
 - **Files appear all at once at the end.** Output goes into a hidden `.trunc-stage-…` folder inside the destination and is moved into place when everything is done. Existing files at the destination are never overwritten. `--consume` refuses to start if a top-level name already exists.
 - **It stops safely when it can't continue.** If the disk fills up, or another program keeps the archive open, it pauses (exit code 75). Free some space or close the program, then resume.
-- **It tells you before risky situations.** It refuses to run on an archive inside a cloud-synced folder (the sync client could upload every truncation and replace your cloud copy) or on FAT32/exFAT, which have no journal. Override with `--allow-sync` or `--allow-unjournaled` if you are sure.
+- **It tells you before risky situations.** It refuses to run on an archive inside a cloud-synced folder (the sync client could upload every truncation and replace your cloud copy), on FAT32/exFAT, which have no journal, or on a filesystem it cannot identify (network shares, FUSE, WSL's view of Windows drives). Override with `--allow-sync` or `--allow-unjournaled` if you are sure.
 
 ## What it does not promise
 
-- **The archive is gone afterwards.** For `.trnc`, a small `<archive>.receipt` (header and signed manifest) is kept unless you pass `--no-receipt`. For ZIP, nothing remains, and other ZIP tools cannot open the file once the first step has run.
+- **The archive is gone afterwards.** For `.trnc`, a small `<archive>.receipt` (header and signed manifest) is kept unless you pass `--no-receipt`. For ZIP and `.tar.gz`, nothing remains, and other tools cannot open the file once the first step has run.
 - **Space figures are upper bounds, not exact predictions.** Other programs writing to the same disk, filesystem compression and quotas are outside its view.
 - **Snapshots defeat it.** With System Restore / Volume Shadow Copies, Time Machine local snapshots, or btrfs/ZFS snapshots, truncated data stays allocated and no space is freed. `trunc plan` says when it could not check.
 - **Drives that ignore flush commands** (some cheap USB sticks and SD cards) can lose data on power loss no matter what software does. `--verify-media` reads extracted data back from disk, bypassing the OS cache, before releasing the source. It catches many such problems, at the cost of one extra read.
@@ -45,6 +45,16 @@ Smaller blocks (`--block-size 4M`) mean less extra space during `--consume`; lar
 `trunc x file.zip -C out --consume` handles Stored and Deflate entries, Zip64, self-extracting archives and names in UTF-8 or the old DOS code page. Encrypted archives, other compression methods and multi-part archives are refused.
 
 For ZIPs containing a few very large files, **punch mode** frees space *inside* each large entry as it decompresses, on NTFS and other filesystems that support sparse files. It applies to entries whose compressed size is at least `--punch-min` (default 256 MiB). Each such entry is fully verified once before any of it is freed. `--no-punch` turns it off.
+
+## .tar.gz files
+
+`trunc x file.tar.gz -C out --consume` handles gzip-compressed tar archives from GNU tar, bsdtar, Python and most other writers: ustar, GNU long names, PAX headers, files over 8 GiB, and several gzip members back to back. Symlinks and device entries are skipped. Hard links, sparse files and multi-volume archives are refused for now.
+
+gzip can only be decompressed from the start, so trunc frees space from the front of the archive. It first decompresses the whole archive once to check every CRC and tar header, without writing anything. Then it extracts, and every 64 MiB of output (`--checkpoint-every`) it confirms the output matches that first pass, saves its position in a small journal, and frees the compressed bytes already used. The file keeps its size, but those bytes stop taking up disk space. That needs a filesystem that can free space inside a file (NTFS, ext4, XFS, btrfs, ZFS). Elsewhere `--consume` still works, but needs as much space as a normal extraction.
+
+The scan means a `.tar.gz` is decompressed twice. `trunc plan`, `inspect` and `verify` scan it too, since gzip records no sizes.
+
+Signatures apply only to `.trnc` archives: `--require-signed` and `--trust-key` are refused for ZIP and `.tar.gz` files rather than ignored.
 
 ## Exit codes
 

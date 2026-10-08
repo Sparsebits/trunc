@@ -523,3 +523,80 @@ fn refuses_staged_files_that_are_the_zip() {
         .unwrap();
     assert!(h.size().unwrap() >= victim.region_end);
 }
+
+/// A pause, a resume, and a crash at every step of the resumed run (entry and punch mode).
+#[test]
+fn pause_then_resume_survives_a_crash_at_every_step() {
+    let mut rng = Rng::new(13);
+    let sp = vec![
+        Spec::file("a/big.txt", &fixtures::text_bytes(&mut rng, 200_000)),
+        Spec::file("a/b/c.txt", &fixtures::text_bytes(&mut rng, 30_000)),
+        Spec::file("top.txt", b"top"),
+    ];
+    let bytes = build(&sp, b"");
+    let want = expected(&sp);
+    for base_opts in [opts(), punch_opts(32 << 10)] {
+        let mut o = base_opts;
+        o.skip_space_check = true;
+        for extra in [20_000u64, 60_000, 150_000] {
+            let paused = |fs: &FaultFs| {
+                fs.set_capacity(Some(bytes.len() as u64 + extra));
+                let r = run(fs, &o);
+                fs.set_capacity(None);
+                r.is_err()
+            };
+            let probe = fresh(CrashModel::LoseUnflushed, &bytes);
+            if !paused(&probe) {
+                continue;
+            }
+            let base = probe.op_count();
+            run(&probe, &o).unwrap();
+            let resumed_ops = probe.op_count() - base;
+            for k in 1..=resumed_ops {
+                let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+                assert!(paused(&fs));
+                fs.inject(Fault::CrashAt(fs.op_count() + k));
+                if run(&fs, &o).is_ok() {
+                    continue;
+                }
+                fs.recover();
+                fs.clear_faults();
+                match run(&fs, &o) {
+                    Ok(_) => {}
+                    Err(Error::Fs(FsError::NotFound { .. }))
+                        if fs.get_file(Path::new(ARC)).is_none() => {}
+                    Err(e) => panic!("extra {extra}, op {k}: {e}"),
+                }
+                assert_complete(&fs, &want);
+            }
+        }
+    }
+}
+
+/// A top-level symlink entry is never created; a crash after the rename phase must still let
+/// the cleanup finish.
+#[test]
+fn top_level_symlink_does_not_wedge_recovery() {
+    let sp = vec![
+        Spec::file("dir/a.txt", b"a"),
+        Spec::file("link", b"dir/a.txt").mode(0o120_777),
+    ];
+    let bytes = build(&sp, b"");
+    let want = expected(&sp[..1]);
+    let total = op_total(&bytes, &opts());
+    for k in 1..=total {
+        let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+        fs.inject(Fault::CrashAt(k));
+        if run(&fs, &opts()).is_ok() {
+            continue;
+        }
+        fs.recover();
+        fs.clear_faults();
+        match run(&fs, &opts()) {
+            Ok(_) => {}
+            Err(Error::Fs(FsError::NotFound { .. })) if fs.get_file(Path::new(ARC)).is_none() => {}
+            Err(e) => panic!("op {k}: {e}"),
+        }
+        assert_complete(&fs, &want);
+    }
+}

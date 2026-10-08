@@ -7,9 +7,12 @@ How each rule from the design (plan section 7) is enforced, and the test that sh
 | Rule | Enforced in | Tested by |
 |---|---|---|
 | Entry paths are relative, NFC, `/`-separated; no `..`, `.`, empty components, drive letters, `\`, `:`, control characters, Windows-reserved names or trailing dots/spaces | `trunc-core::path::validate`, applied to every manifest entry and every ZIP name | `trunc-core` path tests; `hostile_manifest_is_rejected_at_open`; `rejects_hostile_names`; `hostile_archives_are_refused_untouched` |
-| No duplicate names (case-insensitive) and nothing nested under a file | `Manifest::validate`; `zip::parse` | `rejects_case_collisions_and_nesting_under_files`; `rejects_hostile_names` |
+| No duplicate names (case-insensitive) and nothing nested under a file | `Manifest::validate`; `zip::parse`; `tar::Reader` | `rejects_case_collisions_and_nesting_under_files`; `rejects_hostile_names`; `hostile_and_unsupported_archives_are_refused_untouched` |
+| Names that the filesystem folds together anyway (8.3 short names like `LONGFI~1.TXT`, Unicode case variants) are never merged into one output | `stage::check_exact_name`: an output that already exists must be listed under its exact name | code review; covered by the crash sweeps for the legitimate resume case |
 | Block table tiles the stream exactly; sizes bounded; footers match the manifest | `Manifest::validate`, `Footer::decode`, `Archive::read_footer` | manifest and footer unit tests; `decode_never_panics` property tests; fuzz targets `header`, `footer`, `manifest` |
 | Every byte is hash-checked before use (payload before decompressing, decoded block, whole entry) | `Archive::decode_block`, extract/consume hashers | `tampered_payload_is_detected`; `tampered_block_stops_before_destroying_it` |
+| tar.gz: the whole archive (gzip CRCs, tar headers, names) is checked before anything is written, and the content between checkpoints must hash as it did then before its compressed bytes are freed | `tgzconsume::scan`, `consume_tgz` | `corruption_is_found_before_anything_is_destroyed`; crash sweeps in `tgzconsume.rs` |
+| ZIP punch mode: each checkpoint's running CRC must match the verification pass before its bytes are freed | `zipconsume::verify_checkpoints`, `extract_punching` | `crash_sweep_punch_mode` |
 | Manifest corruption is detected even when unsigned | BLAKE3 of the manifest region in the header | `tampered_footer_and_manifest_are_detected` (flips every 5th byte of header and manifest) |
 | ZIP: central directory entries match their local headers; data stays before the directory; descriptor CRCs agree | `zip::parse` | `rejects_unsupported_and_inconsistent_archives`; fuzz target `zip`; `tampered_archives_never_panic` |
 | ZIP: overlapping entries (zip-bomb technique) refused unless `--allow-overlap` | `consume_zip`, `extract_zip` | `overlapping_entries_need_opt_in_and_then_extract_correctly` |
@@ -21,7 +24,7 @@ How each rule from the design (plan section 7) is enforced, and the test that sh
 | Rule | Enforced in | Tested by |
 |---|---|---|
 | Never follow symlinks or junctions when opening outputs | `OsFs::open` (Windows: `FILE_FLAG_OPEN_REPARSE_POINT` + attribute check, junction detection on open failure; Linux: `O_NOFOLLOW`). Staged outputs and directories go through `open_beneath` / `create_dir_beneath`, which on Linux use `openat2(RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS)` so no component below the staging directory can be a link | `junctions_are_never_followed`; `symlinks_are_never_followed` |
-| Symlink entries are never created by `--consume`; non-destructive extraction creates them only with `--allow-symlinks` and only when they resolve inside the destination | `stage::build_structure`; `extract::symlink_stays_inside` | `symlink_containment` |
+| Symlink entries are never created by `--consume`; non-destructive extraction creates them only with `--allow-symlinks` and only when they resolve inside the destination, without passing through another symlink entry | `stage::build_structure`; `extract::symlink_stays_inside` | `symlink_containment` |
 | Writes go only into the staging directory until the rename phase; renames never replace existing paths | `consume`, `consume_zip`, `OsFs::rename` (Windows `MoveFileExW` without replace; Linux `renameat2(RENAME_NOREPLACE)`) | `check_crash_state` in every crash sweep; `rename_never_replaces`; `refuses_existing_targets_and_wrong_destinations` |
 | An output is never the archive or its journal under another name | `stage::open_staged_output` compares file ids | `refuses_staged_files_that_are_the_archive`; `refuses_staged_files_that_are_the_zip` |
 | setuid/setgid/sticky bits are never restored | `extract::apply_mode` (`mode & 0o777`); `OsFs::set_mode` | code review |
@@ -34,11 +37,12 @@ How each rule from the design (plan section 7) is enforced, and the test that sh
 | Signatures (Ed25519 over the manifest hash) are verified whenever present | `SignedManifest::open` | `signature_round_trip_and_tamper` |
 | `--require-signed` refuses unsigned archives; `--trust-key` pins signers | `TrustPolicy::check` | `signatures_and_trust_policy`; `signing_flow` |
 | Unsigned archives are reported | preflight `Finding::Unsigned` (`trunc plan`, `--consume`) | code review |
-| Destructive mode refuses archives in cloud-synced folders and on unjournaled filesystems unless overridden | preflight blockers | `blockers_for_unjournaled_and_synced_archives` |
+| `--require-signed` and `--trust-key` are refused (not ignored) for ZIP and tar.gz, which cannot be signed, so a ZIP renamed to `.trnc` cannot slip past them | CLI `refuse_trust_flags` | `signature_flags_are_refused_for_unsigned_formats` |
+| Destructive mode refuses archives in cloud-synced folders, on unjournaled filesystems and on filesystems it cannot identify, unless overridden | preflight blockers | `blockers_for_unjournaled_and_synced_archives`; `unjournaled_volumes_need_consent` |
 
 ## Known gaps and accepted risks
 
 - **Local attackers racing the staging directory (Windows, and Linux kernels before 5.6).** Intermediate directories are checked when created or reused, but a process with write access to the destination could swap a staged directory for a junction between the check and a later open. On Linux 5.6 and later, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` closes this; where openat2 is unavailable the check-then-open fallback applies. Destructive extraction into a directory that untrusted local users can write to is not supported.
-- **Linux advisory locking.** `flock` stops a second trunc, but other programs can still modify staged outputs. Changes are caught by hashes on resume, not prevented.
+- **Linux advisory locking.** `flock` stops a second trunc, but other programs can still modify staged outputs, and such changes are not detected: a resumed run does not re-read output that was already made durable.
 - **Integrity is not authenticity.** An unsigned archive can be replaced wholesale. Use signatures and `--trust-key` when the source matters.
 - **Lying storage.** A drive that acknowledges flushes without persisting data defeats any ordering. `--verify-media` reads data back, bypassing the OS cache, before releasing source bytes; the drive's own cache may still answer.

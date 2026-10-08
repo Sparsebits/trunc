@@ -280,7 +280,7 @@ fn inflate_err(name: &str, e: InflateError, need_free: u64) -> Error {
     }
 }
 
-fn nospace(e: FsError, need_free: u64) -> Error {
+pub(crate) fn nospace(e: FsError, need_free: u64) -> Error {
     match e {
         FsError::NoSpace { .. } => Error::Paused(PauseReason::NoSpace { needed: need_free }),
         other => other.into(),
@@ -421,11 +421,14 @@ fn extract_punching(
     verify: bool,
     guard: &StageGuard<'_>,
 ) -> Result<()> {
+    // On a fresh start, the checkpoints of a verification pass: each checkpoint of the real
+    // decode must match before its input is freed (catches the input changing in between).
+    let mut expected: Option<Vec<(u64, u32)>> = None;
     let start = match resume {
         Some(ck) => ck,
         None => {
             // Nothing has been punched yet: verify the whole entry before destroying any of it.
-            decode_entry(archive, e, &mut |_| Ok(()), need_free)?;
+            expected = Some(verify_checkpoints(archive, e, every, need_free)?);
             let ck = Checkpoint::start();
             journal
                 .write(
@@ -459,7 +462,16 @@ fn extract_punching(
     // compared before the matching input is deallocated.
     let (mut verified_to, mut running_crc) = (start.out_total, start.crc);
     let mut media_bad = false;
+    let mut seen = 0usize;
     let mut on_ckpt = |ck: &Checkpoint| -> std::result::Result<(), InflateError> {
+        if let Some(list) = &expected {
+            if list.get(seen) != Some(&(ck.out_total, ck.crc)) {
+                return Err(InflateError::Corrupt(
+                    "entry changed since it was verified; nothing past the last checkpoint was released",
+                ));
+            }
+            seen += 1;
+        }
         out.flush_data()?;
         if verify {
             match read_back_crc(out.as_ref(), verified_to, ck.out_total, running_crc) {
@@ -528,6 +540,51 @@ fn extract_punching(
     Ok(())
 }
 
+/// Decode an entry without writing, checking its size and CRC, and return the (output size,
+/// running CRC) at every checkpoint the real decode will meet.
+fn verify_checkpoints(
+    archive: &dyn FileHandle,
+    e: &Entry,
+    every: u64,
+    need_free: u64,
+) -> Result<Vec<(u64, u32)>> {
+    let mut list = Vec::new();
+    let (total, crc, used) = match e.method {
+        Method::Deflate => Inflater::new(&Checkpoint::start(), e.size)
+            .run(
+                archive,
+                e.data_offset,
+                e.compressed_size,
+                &mut |_| Ok(()),
+                every,
+                &mut |ck| {
+                    list.push((ck.out_total, ck.crc));
+                    Ok(())
+                },
+            )
+            .map(|f| (f.out_total, f.crc, f.in_bits.div_ceil(8))),
+        Method::Stored => copy_stored(
+            archive,
+            e,
+            &Checkpoint::start(),
+            &mut |_| Ok(()),
+            every,
+            &mut |ck| {
+                list.push((ck.out_total, ck.crc));
+                Ok(())
+            },
+        ),
+    }
+    .map_err(|x| inflate_err(&e.name, x, need_free))?;
+    if total != e.size || crc != e.crc32 || used > e.compressed_size {
+        return Err(Error::Integrity(format!(
+            "{}: CRC or size mismatch",
+            e.name
+        )));
+    }
+    Ok(list)
+}
+
 /// Stored entries in punch mode: plain copy with the same checkpoint protocol.
 fn copy_stored(
     archive: &dyn FileHandle,
@@ -566,7 +623,7 @@ fn copy_stored(
     Ok((done, crc.finalize(), done))
 }
 
-fn journal_err(e: trunc_journal::JournalError) -> Error {
+pub(crate) fn journal_err(e: trunc_journal::JournalError) -> Error {
     match e {
         trunc_journal::JournalError::Fs(f) => f.into(),
         other => Error::Integrity(format!("journal: {other}")),
@@ -597,7 +654,7 @@ pub fn consume_zip(
             let (j, pre, _) = existing.expect("checked");
             let p = Preamble::decode(&pre)
                 .ok_or_else(|| Error::Integrity("journal preamble unreadable".into()))?;
-            if p.dest != dest {
+            if !same_dest(&p.dest, &dest) {
                 return Err(wrong_dest(&p.dest));
             }
             if fs.metadata(&stage_dir(&dest, &p.archive_id))?.is_some() {
@@ -621,7 +678,7 @@ pub fn consume_zip(
         Some((j, pre_bytes, latest)) => {
             let pre = Preamble::decode(&pre_bytes)
                 .ok_or_else(|| Error::Integrity("journal preamble unreadable".into()))?;
-            if pre.dest != dest {
+            if !same_dest(&pre.dest, &dest) {
                 return Err(wrong_dest(&pre.dest));
             }
             if handle.file_id()? != pre.file_id || handle.size()? > pre.original_len {
@@ -652,6 +709,12 @@ pub fn consume_zip(
                 layout,
             };
             let tops = top_level_names(&items_of(&pre.layout));
+            if let Some(name) = crate::stage::sidecar_conflict(archive_path, &dest, &tops) {
+                return Err(Error::Refused(format!(
+                    "the archive contains {name}, which is the name of trunc's own journal next \
+                     to the archive; extract into another directory"
+                )));
+            }
             if let Some(conflict) = first_existing(fs, &dest, &tops)? {
                 return Err(Error::Refused(format!(
                     "{} already exists; move it away or choose another destination",
@@ -681,7 +744,7 @@ pub fn consume_zip(
         .filter(|f| f.severity() == Severity::Blocker)
     {
         match f {
-            Finding::NotJournaled(_) if opts.allow_unjournaled => {}
+            Finding::NotJournaled(_) | Finding::JournalingUnknown if opts.allow_unjournaled => {}
             Finding::ArchiveSynced(_) if opts.allow_sync => {}
             _ => return Err(Error::Refused(f.to_string())),
         }
@@ -707,7 +770,7 @@ pub fn consume_zip(
     };
 
     match fs.metadata(&stage)?.map(|m| m.kind) {
-        Some(NodeKind::Dir) => {}
+        Some(NodeKind::Dir) => crate::stage::flush_staging_tree(fs, &stage, &dest)?,
         Some(_) => {
             return Err(Error::Refused(format!(
                 "{} exists and is not a directory",
@@ -727,7 +790,7 @@ pub fn consume_zip(
             fs.create_dir(&stage)?;
             fs.flush_dir(&dest)?;
         }
-        None if all_exist(fs, &dest, &tops)? => {
+        None if len == 0 && all_exist(fs, &dest, &tops)? => {
             // Everything was renamed into place; only cleanup remains.
             progress(Progress::Renaming);
             finish(fs, handle, archive_path, journal, &jpath)?;
@@ -832,7 +895,19 @@ pub fn consume_zip(
     Ok(summary)
 }
 
-fn wrong_dest(recorded: &Path) -> Error {
+/// Whether `dest` is the destination recorded (as text) when consumption started. Paths that
+/// are not valid UTF-8 are compared in the same lossy form they were stored in; Windows paths
+/// compare case-insensitively.
+pub(crate) fn same_dest(recorded: &Path, dest: &Path) -> bool {
+    let (a, b) = (recorded.to_string_lossy(), dest.to_string_lossy());
+    if cfg!(windows) {
+        a.to_lowercase() == b.to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+pub(crate) fn wrong_dest(recorded: &Path) -> Error {
     Error::Refused(format!(
         "this archive is being extracted into {}; resume with that destination",
         recorded.display()
@@ -840,7 +915,7 @@ fn wrong_dest(recorded: &Path) -> Error {
 }
 
 /// Remove the (now empty) archive, then the journal.
-fn finish(
+pub(crate) fn finish(
     fs: &dyn FsBackend,
     handle: Box<dyn FileHandle>,
     archive_path: &Path,
@@ -855,8 +930,8 @@ fn finish(
 
 /// True if `path` looks like a ZIP (or a ZIP being consumed: its journal exists).
 pub fn is_zip(fs: &dyn FsBackend, path: &Path) -> bool {
-    if fs.metadata(&journal_path(path)).ok().flatten().is_some() {
-        return true;
+    if let Ok((_, pre, _)) = Journal::open(fs, &journal_path(path)) {
+        return pre.starts_with(PREAMBLE_MAGIC);
     }
     let Ok(h) = fs.open(path, OpenMode::Read, Share::Shared) else {
         return false;

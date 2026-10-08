@@ -7,6 +7,7 @@
 //! - [`preflight`] checks space and safety for a destination before extracting or consuming.
 //! - [`consume`] extracts destructively, truncating the archive as outputs become durable.
 //! - [`zipconsume`] does the same for existing ZIP archives (with optional punch mode).
+//! - [`tgzconsume`] does the same for `.tar.gz`, freeing compressed bytes as they are decoded.
 
 pub mod archive;
 pub mod consume;
@@ -17,6 +18,7 @@ pub mod keys;
 pub mod preflight;
 pub mod producer;
 mod stage;
+pub mod tgzconsume;
 mod walk;
 pub mod zipconsume;
 

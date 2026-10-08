@@ -18,6 +18,11 @@ $dir = if ($env:TRUNC_INSTALL_DIR) { $env:TRUNC_INSTALL_DIR } else { Join-Path $
 if (@('AMD64', 'ARM64') -notcontains $env:PROCESSOR_ARCHITECTURE) {
     throw "trunc-install: unsupported CPU $env:PROCESSOR_ARCHITECTURE"
 }
+# There is no native ARM64 build yet. Windows 11 on ARM runs x64 programs; Windows 10 on ARM
+# does not.
+if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -and [Environment]::OSVersion.Version.Build -lt 22000) {
+    throw "trunc-install: Windows 10 on ARM cannot run the x64 build; build from source with cargo"
+}
 $name = 'trunc-x86_64-pc-windows-msvc'
 $asset = "$name.zip"
 $url = if ($version -eq 'latest') { "$base/latest/download/$asset" } else { "$base/download/$version/$asset" }
@@ -44,12 +49,12 @@ finally {
 $exe = Join-Path $dir 'trunc.exe'
 Write-Host "trunc-install: installed $(& $exe --version) to $exe"
 
-# Add the directory to the user PATH, keeping the registry value's type so entries like
-# %USERPROFILE%\bin keep expanding.
+# Add the directory to the user PATH. The value is read unexpanded and written back as
+# REG_EXPAND_SZ, so entries like %USERPROFILE%\bin keep expanding.
 $key = Get-Item 'HKCU:\Environment'
 $path = [string]$key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
 if (($path -split ';') -contains $dir) { return }
-if ($env:TRUNC_NO_MODIFY_PATH) {
+if ($env:TRUNC_NO_MODIFY_PATH -and $env:TRUNC_NO_MODIFY_PATH -ne '0') {
     Write-Host "trunc-install: $dir is not on your PATH; add it to use trunc from any terminal"
     return
 }

@@ -8,12 +8,15 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=TRUNC_BUILD_COMMIT");
     // Rebuild when HEAD moves: a checkout changes HEAD, a commit changes the ref it points to.
+    // Only existing paths are watched; a missing one would rerun this script on every build.
     for p in [
         "../../.git/HEAD",
         "../../.git/refs/heads",
         "../../.git/packed-refs",
     ] {
-        println!("cargo:rerun-if-changed={p}");
+        if std::path::Path::new(p).exists() {
+            println!("cargo:rerun-if-changed={p}");
+        }
     }
     let commit = std::env::var("TRUNC_BUILD_COMMIT")
         .ok()

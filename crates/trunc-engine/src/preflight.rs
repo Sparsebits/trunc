@@ -56,11 +56,11 @@ pub enum Finding {
 impl Finding {
     pub fn severity(&self) -> Severity {
         match self {
-            Finding::ArchiveSynced(_) | Finding::NotJournaled(_) | Finding::FileTooLarge { .. } => {
-                Severity::Blocker
-            }
-            Finding::DifferentVolumes
+            Finding::ArchiveSynced(_)
+            | Finding::NotJournaled(_)
             | Finding::JournalingUnknown
+            | Finding::FileTooLarge { .. } => Severity::Blocker,
+            Finding::DifferentVolumes
             | Finding::DestinationSynced(_)
             | Finding::SnapshotsPresent(_)
             | Finding::FreeSpaceUnknown => Severity::Warning,

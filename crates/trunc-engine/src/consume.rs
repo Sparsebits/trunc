@@ -119,6 +119,8 @@ pub struct ConsumeSummary {
     pub bytes_written: u64,
     pub batches: usize,
     pub symlinks_skipped: usize,
+    /// Device and FIFO entries (tar), which are never created.
+    pub specials_skipped: usize,
     pub receipt: Option<PathBuf>,
     /// Non-blocking preflight findings (warnings and notes).
     pub findings: Vec<Finding>,
@@ -215,7 +217,9 @@ pub fn consume(
             Ok(a) => a,
             // Crashed after the archive became a receipt but before the note was removed.
             Err(Error::Fs(FsError::NotFound { .. }))
-                if note.as_ref().is_some_and(|n| n.dest == dest) =>
+                if note
+                    .as_ref()
+                    .is_some_and(|n| crate::zipconsume::same_dest(&n.dest, &dest)) =>
             {
                 ignore_not_found(fs.remove_file(&resume_note_path(archive_path)))?;
                 fs.flush_dir(&parent_of(archive_path))?;
@@ -250,7 +254,7 @@ pub fn consume(
     let pre = preflight::assess(fs, &archive, &dest, opts.space)?;
     for f in pre.blockers() {
         match f {
-            Finding::NotJournaled(_) if opts.allow_unjournaled => {}
+            Finding::NotJournaled(_) | Finding::JournalingUnknown if opts.allow_unjournaled => {}
             Finding::ArchiveSynced(_) if opts.allow_sync => {}
             _ => return Err(Error::Refused(f.to_string())),
         }
@@ -263,15 +267,18 @@ pub fn consume(
         .collect();
 
     let stage_kind = fs.metadata(&stage)?.map(|m| m.kind);
-    let note_matches = note
-        .as_ref()
-        .is_some_and(|n| n.archive_id == m.archive_id && n.dest == dest);
+    let note_matches = note.as_ref().is_some_and(|n| {
+        n.archive_id == m.archive_id && crate::zipconsume::same_dest(&n.dest, &dest)
+    });
     let mut summary = ConsumeSummary {
         findings,
         ..ConsumeSummary::default()
     };
     match stage_kind {
-        Some(NodeKind::Dir) => summary.resumed = true,
+        Some(NodeKind::Dir) => {
+            summary.resumed = true;
+            crate::stage::flush_staging_tree(fs, &stage, &dest)?;
+        }
         Some(_) => {
             return Err(Error::Refused(format!(
                 "{} exists and is not a directory",
@@ -292,6 +299,12 @@ pub fn consume(
                     dest.display(),
                     pre.consume_needs,
                     pre.destination.free_bytes.unwrap_or(0)
+                )));
+            }
+            if let Some(name) = crate::stage::sidecar_conflict(archive_path, &dest, &tops) {
+                return Err(Error::Refused(format!(
+                    "the archive contains {name}, which is the name of one of trunc's own files \
+                     next to the archive; extract into another directory"
                 )));
             }
             if let Some(conflict) = first_existing(fs, &dest, &tops)? {

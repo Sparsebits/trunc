@@ -49,3 +49,10 @@ path = "fuzz_targets/inflate.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tar"
+path = "fuzz_targets/tar.rs"
+test = false
+doc = false
+bench = false

@@ -251,9 +251,16 @@ pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<
     })?;
     debug_assert!(open.is_empty(), "every file received all its bytes");
 
+    let links: std::collections::HashSet<String> = m
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Symlink { .. }))
+        .map(|e| trunc_core::path::collision_key(&e.path))
+        .collect();
+    let is_link = |p: &str| links.contains(&trunc_core::path::collision_key(p));
     for e in &m.entries {
         if let EntryKind::Symlink { target } = &e.kind {
-            if opts.allow_symlinks && symlink_stays_inside(&e.path, target) {
+            if opts.allow_symlinks && symlink_stays_inside(&e.path, target, &is_link) {
                 create_symlink(m, dest, &e.path, target)?;
                 summary.symlinks_created += 1;
             } else {
@@ -318,22 +325,28 @@ fn apply_mode(p: &Path, mode: u32) -> Result<()> {
 }
 
 /// True if a relative link target, resolved lexically from the link's directory, stays inside
-/// the extraction root.
-fn symlink_stays_inside(link_path: &str, target: &str) -> bool {
+/// the extraction root. Resolution is lexical, so it must not pass *through* another symlink
+/// entry (`s -> .` plus `x -> s/../escape` would otherwise leave the destination).
+fn symlink_stays_inside(link_path: &str, target: &str, is_link: &dyn Fn(&str) -> bool) -> bool {
     if target.starts_with('/') || target.contains('\\') || target.contains(':') {
         return false;
     }
-    let mut depth: i64 = link_path.split('/').count() as i64 - 1;
-    for c in target.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
+    let mut at: Vec<&str> = link_path.split('/').collect();
+    at.pop();
+    let comps: Vec<&str> = target
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    for (i, c) in comps.iter().enumerate() {
+        if *c == ".." {
+            if at.pop().is_none() {
+                return false;
             }
-            _ => depth += 1,
+        } else {
+            at.push(c);
+            if i + 1 < comps.len() && is_link(&at.join("/")) {
+                return false;
+            }
         }
     }
     true
@@ -380,14 +393,20 @@ mod tests {
 
     #[test]
     fn symlink_containment() {
-        assert!(symlink_stays_inside("a/link", "b"));
-        assert!(symlink_stays_inside("a/link", "../b"));
-        assert!(symlink_stays_inside("a/b/link", "../../c"));
-        assert!(!symlink_stays_inside("link", "../escape"));
-        assert!(!symlink_stays_inside("a/link", "../../escape"));
-        assert!(!symlink_stays_inside("a/link", "/etc/passwd"));
-        assert!(!symlink_stays_inside("a/link", "C:/Windows"));
-        assert!(!symlink_stays_inside("a/link", "..\\..\\x"));
-        assert!(symlink_stays_inside("a/link", "./x/../y"));
+        let inside = |l: &str, t: &str| symlink_stays_inside(l, t, &|_| false);
+        assert!(inside("a/link", "b"));
+        assert!(inside("a/link", "../b"));
+        assert!(inside("a/b/link", "../../c"));
+        assert!(!inside("link", "../escape"));
+        assert!(!inside("a/link", "../../escape"));
+        assert!(!inside("a/link", "/etc/passwd"));
+        assert!(!inside("a/link", "C:/Windows"));
+        assert!(!inside("a/link", "..\\..\\x"));
+        assert!(inside("a/link", "./x/../y"));
+        // Passing through another symlink entry is refused; ending at one is fine.
+        let s_is_link = |p: &str| p == "s";
+        assert!(!symlink_stays_inside("x", "s/../escape", &s_is_link));
+        assert!(!symlink_stays_inside("x", "s/inner", &s_is_link));
+        assert!(symlink_stays_inside("x", "s", &s_is_link));
     }
 }

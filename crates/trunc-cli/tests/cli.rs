@@ -169,7 +169,18 @@ fn killed_consume_resumes() {
         let _ = child.kill();
         let _ = child.wait();
 
-        ok(&trunc(&["resume", "a.trnc", "-C", "out", "--yes"], w));
+        if w.join("a.trnc.trncr").exists() {
+            ok(&trunc(&["resume", "a.trnc", "-C", "out", "--yes"], w));
+        } else {
+            // Killed before anything was recorded: `resume` refuses (nothing to resume), so
+            // start again.
+            let r = trunc(&["resume", "a.trnc", "-C", "out", "--yes"], w);
+            assert!(!r.status.success(), "resume must not start a fresh consume");
+            ok(&trunc(
+                &["x", "a.trnc", "-C", "out", "--consume", "--yes"],
+                w,
+            ));
+        }
         tree::assert_same(&w.join("data"), &w.join("out/data"));
         assert!(
             !w.join("a.trnc").exists(),
@@ -360,5 +371,128 @@ fn unjournaled_volumes_need_consent() {
         ));
         assert_files(&w.join("zout"), &files);
         assert!(!w.join("a.zip").exists() && !w.join("a.zip.trncj").exists());
+    }
+}
+
+fn write_tgz(path: &Path, seed: u64) -> Vec<(String, Vec<u8>)> {
+    use trunc_testkit::tarbuild::{self, Spec};
+    let mut rng = trunc_testkit::Rng::new(seed);
+    let files = vec![
+        (
+            "pkg/readme.txt".to_string(),
+            fixtures::text_bytes(&mut rng, 20_000),
+        ),
+        (
+            "pkg/data/big.txt".to_string(),
+            fixtures::text_bytes(&mut rng, 3 << 20),
+        ),
+        (
+            "pkg/data/noise.bin".to_string(),
+            fixtures::noise_bytes(&mut rng, 500_000),
+        ),
+        ("top.txt".to_string(), b"top level".to_vec()),
+    ];
+    let specs: Vec<Spec> = files.iter().map(|(n, d)| Spec::file(n, d)).collect();
+    std::fs::write(path, tarbuild::gzip(&tarbuild::tar(&specs), 6)).unwrap();
+    files
+}
+
+#[test]
+fn tgz_inspect_verify_plan_extract_consume() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let files = write_tgz(&w.join("a.tar.gz"), 1);
+
+    let s = ok(&trunc(&["inspect", "a.tar.gz", "--entries"], w));
+    assert!(
+        s.contains("(tar.gz)") && s.contains("pkg/data/big.txt"),
+        "{s}"
+    );
+    assert!(ok(&trunc(&["verify", "a.tar.gz"], w)).starts_with("ok:"));
+    let s = ok(&trunc(&["plan", "a.tar.gz", "-C", "out"], w));
+    assert!(s.contains("consume (--consume)"), "{s}");
+
+    ok(&trunc(&["x", "a.tar.gz", "-C", "copy"], w));
+    assert_files(&w.join("copy"), &files);
+    assert!(w.join("a.tar.gz").exists());
+
+    let s = ok(&trunc(
+        &["x", "a.tar.gz", "-C", "out", "--consume", "--yes"],
+        w,
+    ));
+    assert!(s.contains("consumed and removed"), "{s}");
+    assert_files(&w.join("out"), &files);
+    assert!(!w.join("a.tar.gz").exists() && !w.join("a.tar.gz.trncj").exists());
+}
+
+/// Kill a tar.gz consume at arbitrary points; `trunc resume` must finish with identical files.
+#[test]
+fn killed_tgz_consume_resumes() {
+    for (round, delay_ms) in [10u64, 60, 150, 400].into_iter().enumerate() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        let files = write_tgz(&w.join("a.tar.gz"), 20 + round as u64);
+        let flags = ["--yes", "--checkpoint-every", "64K"];
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trunc"))
+            .args([&["x", "a.tar.gz", "-C", "out", "--consume"][..], &flags].concat())
+            .current_dir(w)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+        if w.join("a.tar.gz.trncj").exists() {
+            ok(&trunc(&[&["resume", "a.tar.gz"][..], &flags].concat(), w));
+        } else if w.join("a.tar.gz").exists() {
+            ok(&trunc(
+                &[&["x", "a.tar.gz", "-C", "out", "--consume"][..], &flags].concat(),
+                w,
+            ));
+        }
+        assert_files(&w.join("out"), &files);
+        assert!(
+            !w.join("a.tar.gz").exists(),
+            "round {round}: archive left behind"
+        );
+        assert!(
+            !w.join("a.tar.gz.trncj").exists(),
+            "round {round}: journal left behind"
+        );
+    }
+}
+
+/// ZIP and tar.gz cannot be signed: asking for a signature must fail, not be ignored (a file
+/// named `.trnc` could really be a ZIP).
+#[test]
+fn signature_flags_are_refused_for_unsigned_formats() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    write_zip(&w.join("release.trnc"), 1);
+    write_tgz(&w.join("other.trnc"), 2);
+    for arc in ["release.trnc", "other.trnc"] {
+        for args in [
+            &["verify", arc, "--require-signed"][..],
+            &["x", arc, "-C", "o1", "--require-signed"],
+            &[
+                "x",
+                arc,
+                "-C",
+                "o2",
+                "--consume",
+                "--yes",
+                "--trust-key",
+                &"ab".repeat(32),
+            ],
+        ] {
+            let out = trunc(args, w);
+            assert!(!out.status.success(), "{args:?} succeeded");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("cannot be signed"),
+                "{args:?}"
+            );
+        }
+        assert!(w.join(arc).exists(), "{arc} was not touched");
     }
 }

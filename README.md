@@ -20,7 +20,8 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
-  <a href="#zip-files">ZIP files</a> ·
+  <a href="#zip-files">ZIP</a> ·
+  <a href="#targz-files">.tar.gz</a> ·
   <a href="docs/guide.md">User guide</a>
 </p>
 
@@ -32,8 +33,8 @@ An ordinary extractor keeps the whole archive on disk until it finishes, so turn
 archive into 10 GB of files needs 10 GB free. trunc deletes each part of the archive as soon as
 the files from that part are safely on disk, so the same job needs a little over 4 GB.
 
-It reads its own `.trnc` format and the ZIP files you already have. If the power goes out
-halfway, nothing is lost: run `trunc resume` and it carries on from where it stopped.
+It reads its own `.trnc` format and the ZIP and `.tar.gz` files you already have. If the power
+goes out halfway, nothing is lost: run `trunc resume` and it carries on from where it stopped.
 
 ## Highlights
 
@@ -42,8 +43,9 @@ halfway, nothing is lost: run `trunc resume` and it carries on from where it sto
   written and flushed to disk.
 - **Plans first.** `trunc plan` tells you how much space each mode needs, and warns about cloud-sync
   folders, snapshots and filesystems where destructive extraction is unsafe.
-- **Works on ZIP.** Stored and Deflate entries, including Zip64. Very large entries give back
-  space while they decompress, not just when they finish.
+- **Works on ZIP and .tar.gz.** ZIP with Stored and Deflate entries, including Zip64, and
+  `.tar.gz` from GNU tar, bsdtar and friends. Both give back space while they decompress, not
+  just when each file finishes.
 - **Checks everything.** Every block is hashed, and archives can be signed. Nothing is deleted until
   the output that replaces it has been verified.
 - **Fast.** Blocks decompress in parallel at over 1 GiB/s.
@@ -109,8 +111,8 @@ archive   consumed; receipt kept at data.trnc.receipt
 time      1.52s (3 batches)
 ```
 
-The same command works on a ZIP file. Without `--consume`, `trunc x` is an ordinary extractor
-and leaves the archive alone.
+The same command works on ZIP and `.tar.gz` files. Without `--consume`, `trunc x` is an
+ordinary extractor and leaves the archive alone.
 
 <details>
 <summary><b>More commands</b></summary>
@@ -216,6 +218,20 @@ those bytes stop taking up disk space.
 From the first deletion on, other tools can no longer open the ZIP. trunc tells you this before
 it starts.
 
+## .tar.gz files
+
+A gzip stream can only be decompressed from the start, so trunc frees a `.tar.gz` from the front:
+
+1. It decompresses the whole archive once, writing nothing. This checks every gzip checksum and
+   tar header, validates every file name, and records a hash of each 64 MiB stretch of output.
+2. It decompresses again, this time writing files. Every 64 MiB it flushes the files, checks that
+   the stretch it just wrote hashes the same as in step 1, saves its position in a journal, and
+   releases the compressed bytes it has used.
+
+Hard links, sparse files and multi-volume archives are refused for now. Symlinks and device
+entries are skipped. Like punch mode for ZIP, freeing space needs a filesystem that can release
+part of a file: NTFS, ext4, XFS, btrfs or ZFS.
+
 ## When not to use it
 
 - **You want to keep the archive.** Leave off `--consume`.
@@ -298,8 +314,8 @@ cargo test --workspace
 ```
 
 The parsers are fuzzed with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). On Linux with
-a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `inflate`,
-`manifest`, `header` and `footer`).
+a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `tar`,
+`inflate`, `manifest`, `header` and `footer`).
 
 <details>
 <summary><b>Repository layout</b></summary>
@@ -312,7 +328,7 @@ a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `
 | `crates/trunc-chunk` | Splitting content into blocks |
 | `crates/trunc-fs` | Filesystem access: sparse files, file ids, volume checks, cloud-sync detection |
 | `crates/trunc-journal` | The crash-safe journal used for ZIP extraction |
-| `crates/trunc-legacy` | ZIP reader and the resumable Deflate decoder |
+| `crates/trunc-legacy` | ZIP and tar readers, gzip framing, and the resumable Deflate decoder |
 | `crates/trunc-engine` | Creating, extracting, verifying and consuming archives |
 | `crates/trunc-cli` | The `trunc` command |
 | `crates/trunc-testkit` | A simulated filesystem that can crash on demand, plus test fixtures |

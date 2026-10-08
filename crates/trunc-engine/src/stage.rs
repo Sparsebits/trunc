@@ -64,7 +64,10 @@ pub(crate) fn open_staged_output(
     let open = |mode| fs.open_beneath(guard.root, p, mode, Share::Exclusive);
     let (h, created) = match fs.metadata(p)?.map(|m| m.kind) {
         None => (open(OpenMode::CreateNew)?, true),
-        Some(NodeKind::File) => (open(OpenMode::ReadWrite)?, false),
+        Some(NodeKind::File) => {
+            check_exact_name(fs, p)?;
+            (open(OpenMode::ReadWrite)?, false)
+        }
         Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
     };
     if guard.protected.contains(&h.file_id()?) {
@@ -126,12 +129,70 @@ pub(crate) fn truncate_with_retry(h: &dyn FileHandle, len: u64, retry: RetryPoli
     unreachable!("loop returns on its last attempt")
 }
 
+/// Top-level names the extraction creates. A top-level symlink entry is never created, so it is
+/// left out (otherwise "everything was moved into place" could never become true).
 pub(crate) fn top_level_names(items: &[Item]) -> Vec<String> {
     let set: BTreeSet<String> = items
         .iter()
+        .filter(|e| !(e.kind == ItemKind::Symlink && !e.path.contains('/')))
         .map(|e| e.path.split('/').next().unwrap_or(&e.path).to_owned())
         .collect();
     set.into_iter().collect()
+}
+
+/// Refuse a path that exists but under another name: an 8.3 short name (`LONGFI~1.TXT`), a
+/// case variant, or a Unicode case-folding variant of an entry already extracted. Writing
+/// through it would silently merge two entries into one file.
+pub(crate) fn check_exact_name(fs: &dyn FsBackend, p: &Path) -> Result<()> {
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+        return Ok(());
+    };
+    let name = name.to_string_lossy();
+    if fs.read_dir(parent)?.iter().any(|n| *n == name) {
+        return Ok(());
+    }
+    Err(Error::Refused(format!(
+        "{} resolves to a different existing entry (names that differ only in case, or an 8.3 \
+         short name); refusing to merge them",
+        p.display()
+    )))
+}
+
+/// Flush every directory under `stage`, then `stage` and `dest`. Run when resuming: an
+/// interrupted run may have created entries it never flushed, and a resumed run only flushes
+/// the entries it creates itself. File contents need no sweep: everything past the last point
+/// where source bytes were released is rewritten and flushed again.
+pub(crate) fn flush_staging_tree(fs: &dyn FsBackend, stage: &Path, dest: &Path) -> Result<()> {
+    fn walk(fs: &dyn FsBackend, dir: &Path) -> Result<()> {
+        for name in fs.read_dir(dir)? {
+            let p = dir.join(&name);
+            if fs.metadata(&p)?.map(|m| m.kind) == Some(NodeKind::Dir) {
+                walk(fs, &p)?;
+            }
+        }
+        fs.flush_dir(dir)?;
+        Ok(())
+    }
+    walk(fs, stage)?;
+    fs.flush_dir(dest)?;
+    Ok(())
+}
+
+/// A top-level entry named like one of the archive's sidecar files (resume note, journal,
+/// receipt) when extracting next to the archive. The sidecar is created after the conflict
+/// check and removed at the end, so such an entry would be refused or deleted.
+pub(crate) fn sidecar_conflict(archive: &Path, dest: &Path, tops: &[String]) -> Option<String> {
+    let same_dir = archive
+        .parent()
+        .is_some_and(|p| p == dest || std::path::absolute(p).ok().as_deref() == Some(dest));
+    if !same_dir {
+        return None;
+    }
+    let base = archive.file_name()?.to_string_lossy().to_lowercase();
+    let sidecars = [".trncr", ".trncj", ".trncj.tmp", ".receipt"].map(|s| format!("{base}{s}"));
+    tops.iter()
+        .find(|t| sidecars.contains(&t.to_lowercase()))
+        .cloned()
 }
 
 /// Every directory the items need, including implicit parents, parents first.
@@ -200,7 +261,7 @@ pub(crate) fn build_structure(
                 fs.create_dir_beneath(stage, &p)?;
                 to_flush.insert(parent_of(&p));
             }
-            Some(NodeKind::Dir) => {}
+            Some(NodeKind::Dir) => check_exact_name(fs, &p)?,
             Some(_) => {
                 return Err(Error::Refused(format!(
                     "{} is not a directory",
@@ -227,7 +288,7 @@ pub(crate) fn build_structure(
                 h.flush_data()?;
                 to_flush.insert(parent_of(&p));
             }
-            Some(NodeKind::File) => {}
+            Some(NodeKind::File) => check_exact_name(fs, &p)?,
             Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
         }
     }
@@ -250,12 +311,13 @@ pub(crate) fn rename_into_place(
             ignore_not_found(fs.set_mode(&join_rel(stage, &e.path), mode))?;
         }
     }
-    for name in top_level_names(items) {
-        let from = stage.join(&name);
+    let tops = top_level_names(items);
+    for name in &tops {
+        let from = stage.join(name);
         if fs.metadata(&from)?.is_none() {
             continue; // already moved by an earlier run
         }
-        match fs.rename(&from, &dest.join(&name)) {
+        match fs.rename(&from, &dest.join(name)) {
             Ok(()) => {}
             Err(FsError::AlreadyExists { path }) => {
                 return Err(Error::Refused(format!(
@@ -265,6 +327,16 @@ pub(crate) fn rename_into_place(
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    if let Some(missing) = tops
+        .iter()
+        .find(|n| fs.metadata(&dest.join(n)).ok().flatten().is_none())
+    {
+        return Err(Error::Integrity(format!(
+            "{} is missing from {} after moving files into place",
+            missing,
+            dest.display()
+        )));
     }
     fs.flush_dir(stage)?;
     fs.flush_dir(dest)?;

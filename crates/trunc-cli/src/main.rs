@@ -15,6 +15,7 @@ use trunc_engine::{Archive, keys};
 
 mod consume_cmd;
 mod fmt;
+mod tgz_cmd;
 mod zip_cmd;
 use fmt::{bytes, parse_size};
 
@@ -282,10 +283,22 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
             a.threads,
         );
     }
-    if zip_cmd::is_zip(&a.archive) {
+    let legacy = legacy_kind(&a.archive);
+    if let Some(kind) = legacy {
+        refuse_trust_flags(&a.trust.policy()?, kind)?;
         if a.allow_symlinks {
-            anyhow::bail!("--allow-symlinks is not supported for ZIP archives");
+            anyhow::bail!("--allow-symlinks is not supported for {kind} archives");
         }
+    }
+    if legacy == Some("tar.gz") {
+        return tgz_cmd::extract(
+            &a.archive,
+            &a.dest,
+            a.overwrite,
+            a.consume_flags.ignore_space,
+        );
+    }
+    if legacy == Some("ZIP") {
         return zip_cmd::extract(
             &a.archive,
             &a.dest,
@@ -342,6 +355,28 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `Some("tar.gz")` or `Some("ZIP")` for formats other than `.trnc`, detected by content.
+pub(crate) fn legacy_kind(archive: &std::path::Path) -> Option<&'static str> {
+    if tgz_cmd::is_tgz(archive) {
+        Some("tar.gz")
+    } else if zip_cmd::is_zip(archive) {
+        Some("ZIP")
+    } else {
+        None
+    }
+}
+
+/// ZIP and tar.gz carry no signatures. Asking for one must not be silently ignored: a file
+/// named `.trnc` might really be a ZIP.
+pub(crate) fn refuse_trust_flags(trust: &TrustPolicy, kind: &str) -> Result<()> {
+    if trust.require_signed || !trust.trusted_keys.is_empty() {
+        anyhow::bail!(
+            "this is a {kind} archive, which cannot be signed; --require-signed and --trust-key              apply only to .trnc archives"
+        );
+    }
+    Ok(())
+}
+
 fn signer_line(archive: &Archive) -> String {
     match archive.signer() {
         Some(k) => format!("signed by {}", keys::public_hex(&k)),
@@ -350,6 +385,9 @@ fn signer_line(archive: &Archive) -> String {
 }
 
 fn inspect(a: InspectArgs) -> Result<ExitCode> {
+    if tgz_cmd::is_tgz(&a.archive) {
+        return tgz_cmd::inspect(&a.archive, a.entries);
+    }
     if zip_cmd::is_zip(&a.archive) {
         return zip_cmd::inspect(&a.archive, a.entries);
     }
@@ -439,8 +477,13 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
 }
 
 fn verify(a: VerifyArgs) -> Result<ExitCode> {
-    if zip_cmd::is_zip(&a.archive) {
-        return zip_cmd::verify(&a.archive);
+    if let Some(kind) = legacy_kind(&a.archive) {
+        refuse_trust_flags(&a.trust.policy()?, kind)?;
+        return if kind == "tar.gz" {
+            tgz_cmd::verify(&a.archive)
+        } else {
+            zip_cmd::verify(&a.archive)
+        };
     }
     let archive = Archive::open(&a.archive)?;
     let t = Instant::now();
@@ -489,6 +532,9 @@ fn fits(f: Option<bool>) -> &'static str {
 }
 
 fn plan(a: PlanArgs) -> Result<ExitCode> {
+    if tgz_cmd::is_tgz(&a.archive) {
+        return tgz_cmd::plan(&a.archive, &a.dest);
+    }
     if zip_cmd::is_zip(&a.archive) {
         return zip_cmd::plan(&a.archive, &a.dest, true);
     }
