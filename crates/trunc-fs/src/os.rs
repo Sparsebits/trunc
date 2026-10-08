@@ -453,7 +453,7 @@ impl FileHandle for OsFile {
         }
         #[cfg(not(windows))]
         {
-            Ok(if len == 0 { vec![] } else { vec![0..len] })
+            Ok(if len == 0 { vec![] } else { vec![Range { start: 0, end: len }] })
         }
     }
 
