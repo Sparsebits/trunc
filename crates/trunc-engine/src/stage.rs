@@ -71,13 +71,17 @@ pub(crate) fn open_staged_output(
     p: &Path,
 ) -> Result<(Box<dyn FileHandle>, bool)> {
     let open = |mode| fs.open_beneath(guard.root, p, mode, Share::Exclusive);
-    let (h, created) = match fs.metadata(p)?.map(|m| m.kind) {
-        None => (open(OpenMode::CreateNew)?, true),
-        Some(NodeKind::File) => {
-            check_exact_name(fs, p)?;
-            (open(OpenMode::ReadWrite)?, false)
-        }
-        Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
+    // Usually the file is new: try that first, and look closer only if something is there.
+    let (h, created) = match open(OpenMode::CreateNew) {
+        Ok(h) => (h, true),
+        Err(FsError::AlreadyExists { .. }) => match fs.metadata(p)?.map(|m| m.kind) {
+            Some(NodeKind::File) => {
+                check_exact_name(fs, p)?;
+                (open(OpenMode::ReadWrite)?, false)
+            }
+            _ => return Err(Error::Refused(format!("{} is not a file", p.display()))),
+        },
+        Err(e) => return Err(e.into()),
     };
     if (guard.protected)(&h.file_id()?) {
         return Err(Error::Refused(format!(
@@ -172,18 +176,20 @@ pub(crate) fn check_exact_name(fs: &dyn FsBackend, p: &Path) -> Result<()> {
 /// the entries it creates itself. File contents need no sweep: everything past the last point
 /// where source bytes were released is rewritten and flushed again.
 pub(crate) fn flush_staging_tree(fs: &dyn FsBackend, stage: &Path, dest: &Path) -> Result<()> {
-    fn walk(fs: &dyn FsBackend, dir: &Path) -> Result<()> {
+    fn walk(fs: &dyn FsBackend, dir: &Path, all: &mut Vec<PathBuf>) -> Result<()> {
         for name in fs.read_dir(dir)? {
             let p = dir.join(&name);
             if fs.metadata(&p)?.map(|m| m.kind) == Some(NodeKind::Dir) {
-                walk(fs, &p)?;
+                walk(fs, &p, all)?;
             }
         }
-        fs.flush_dir(dir)?;
+        all.push(dir.to_path_buf());
         Ok(())
     }
-    walk(fs, stage)?;
-    fs.flush_dir(dest)?;
+    let mut dirs = Vec::new();
+    walk(fs, stage, &mut dirs)?;
+    dirs.push(dest.to_path_buf());
+    fs.flush_all(&[], &dirs)?;
     Ok(())
 }
 
@@ -260,50 +266,67 @@ pub(crate) fn build_structure(
     summary: &mut ConsumeSummary,
 ) -> Result<()> {
     let mut to_flush: BTreeSet<PathBuf> = BTreeSet::new();
+    // Whether a top-level name was already moved into place, asked once per name.
+    let mut moved: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut already_moved = |rel: &str| -> Result<bool> {
+        let top = rel.split('/').next().unwrap_or(rel);
+        if let Some(&m) = moved.get(top) {
+            return Ok(m);
+        }
+        let m = already_moved(fs, dest, stage, top)?;
+        moved.insert(top.to_owned(), m);
+        Ok(m)
+    };
     for d in all_dirs(items) {
-        if already_moved(fs, dest, stage, &d)? {
+        if already_moved(&d)? {
             continue;
         }
         let p = join_rel(stage, &d);
-        match fs.metadata(&p)?.map(|m| m.kind) {
-            None => {
-                fs.create_dir_beneath(stage, &p)?;
+        // Usually new: create first, and look closer only if something is there.
+        match fs.create_dir_beneath(stage, &p) {
+            Ok(()) => {
                 to_flush.insert(parent_of(&p));
             }
-            Some(NodeKind::Dir) => check_exact_name(fs, &p)?,
-            Some(_) => {
-                return Err(Error::Refused(format!(
-                    "{} is not a directory",
-                    p.display()
-                )));
-            }
+            Err(FsError::AlreadyExists { .. }) => match fs.metadata(&p)?.map(|m| m.kind) {
+                Some(NodeKind::Dir) => check_exact_name(fs, &p)?,
+                _ => {
+                    return Err(Error::Refused(format!(
+                        "{} is not a directory",
+                        p.display()
+                    )));
+                }
+            },
+            Err(e) => return Err(e.into()),
         }
         summary.dirs += 1;
     }
+    let mut empty: Vec<Box<dyn trunc_fs::FileHandle>> = Vec::new();
     for e in items {
         match e.kind {
             ItemKind::Symlink => summary.symlinks_skipped += 1,
             ItemKind::File => summary.files += 1,
             ItemKind::Dir => {}
         }
-        if e.kind != ItemKind::File || e.size > 0 || already_moved(fs, dest, stage, &e.path)? {
+        if e.kind != ItemKind::File || e.size > 0 || already_moved(&e.path)? {
             continue;
         }
         let p = join_rel(stage, &e.path);
-        match fs.metadata(&p)?.map(|m| m.kind) {
-            None => {
-                let h = fs.open_beneath(stage, &p, OpenMode::CreateNew, Share::Exclusive)?;
+        match fs.open_beneath(stage, &p, OpenMode::CreateNew, Share::Exclusive) {
+            Ok(h) => {
                 h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
-                h.flush_data()?;
+                empty.push(h);
                 to_flush.insert(parent_of(&p));
             }
-            Some(NodeKind::File) => check_exact_name(fs, &p)?,
-            Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
+            Err(FsError::AlreadyExists { .. }) => match fs.metadata(&p)?.map(|m| m.kind) {
+                Some(NodeKind::File) => check_exact_name(fs, &p)?,
+                _ => return Err(Error::Refused(format!("{} is not a file", p.display()))),
+            },
+            Err(e) => return Err(e.into()),
         }
     }
-    for d in &to_flush {
-        fs.flush_dir(d)?;
-    }
+    let files: Vec<&dyn trunc_fs::FileHandle> = empty.iter().map(AsRef::as_ref).collect();
+    let dirs: Vec<PathBuf> = to_flush.into_iter().collect();
+    fs.flush_all(&files, &dirs)?;
     Ok(())
 }
 

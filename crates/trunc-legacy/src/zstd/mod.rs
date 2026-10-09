@@ -87,7 +87,7 @@ impl Frame {
         if self.flushed < self.win.len() {
             let data = &self.win[self.flushed..];
             if let Some(x) = &mut self.checksum {
-                x.update(data);
+                trunc_prof::time("zstd.checksum", || x.update(data));
             }
             sink(data)?;
             self.flushed = self.win.len();
@@ -404,6 +404,7 @@ pub fn decode(
                     return Err(corrupt("block larger than allowed"));
                 }
                 let size = usize::try_from(size).expect("<= 128 KiB");
+                let mut prof = trunc_prof::span("zstd.block");
                 let before = f.win.len();
                 match kind {
                     0 => {
@@ -431,6 +432,8 @@ pub fn decode(
                     _ => return Err(corrupt("reserved block type")),
                 }
                 let n = (f.win.len() - before) as u64;
+                prof.add_bytes(n);
+                drop(prof);
                 f.out += n;
                 out += n;
                 since += n;

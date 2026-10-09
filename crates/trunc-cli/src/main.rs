@@ -30,6 +30,10 @@ use fmt::{bytes, parse_size};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Profile the run: write a Chrome trace to FILE (open it in ui.perfetto.dev) and
+    /// print where the time went. `-` prints the summary only. Also TRUNC_PROFILE=FILE.
+    #[arg(long, global = true, value_name = "FILE")]
+    profile: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -212,12 +216,58 @@ fn parse_block_size(s: &str) -> Result<u64, String> {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let profile = cli
+        .profile
+        .clone()
+        .or_else(|| std::env::var_os("TRUNC_PROFILE").map(PathBuf::from));
+    if profile.is_some() {
+        trunc_prof::enable();
+    }
+    let span = trunc_prof::span(match &cli.cmd {
+        Cmd::Create(_) => "cli.create",
+        Cmd::Extract(_) => "cli.extract",
+        Cmd::Resume(_) => "cli.resume",
+        Cmd::Inspect(_) => "cli.inspect",
+        Cmd::Verify(_) => "cli.verify",
+        Cmd::Plan(_) => "cli.plan",
+        Cmd::Key(_) => "cli.key",
+    });
+    let code = match run(cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    };
+    drop(span);
+    if let Some(path) = profile {
+        write_profile(&path);
+    }
+    code
+}
+
+/// Print the profile summary and write the Chrome trace (unless the path is `-`).
+fn write_profile(path: &std::path::Path) {
+    let (events, dropped) = trunc_prof::take();
+    eprintln!();
+    eprint!("{}", trunc_prof::summary(&events, dropped, 30));
+    if path.as_os_str() == "-" {
+        return;
+    }
+    let process = format!(
+        "trunc {}",
+        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+    );
+    match std::fs::write(path, trunc_prof::chrome_trace(&events, &process)) {
+        Ok(()) => eprintln!(
+            "trace written to {} (open it in https://ui.perfetto.dev or chrome://tracing)",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "warning: could not write the trace to {}: {e}",
+            path.display()
+        ),
     }
 }
 

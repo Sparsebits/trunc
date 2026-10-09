@@ -679,3 +679,42 @@ fn split_zip_and_trnc_are_readable_but_not_consumed() {
     let out = trunc(&["x", &first, "-C", "tout", "--consume", "--yes"], w);
     assert!(!out.status.success());
 }
+
+/// `--profile` prints where the time went and writes a Chrome trace; `TRUNC_PROFILE=-` prints
+/// the summary only.
+#[test]
+fn profile_writes_a_trace_and_a_summary() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    write_tgz(&w.join("a.tar.gz"), 9);
+    let out = trunc(&["--profile", "p.json", "verify", "a.tar.gz"], w);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("profile:") && err.contains("decode.gzip"),
+        "{err}"
+    );
+    assert!(
+        err.contains("fs.read") && err.contains("trace written"),
+        "{err}"
+    );
+    let json = std::fs::read_to_string(w.join("p.json")).unwrap();
+    assert!(json.starts_with("{\"displayTimeUnit\"") && json.contains("\"traceEvents\""));
+    assert!(json.contains("\"name\":\"cli.verify\"") && json.contains("\"ph\":\"X\""));
+    let opens = json.matches('{').count();
+    assert_eq!(opens, json.matches('}').count(), "balanced JSON objects");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_trunc"))
+        .args(["verify", "a.tar.gz"])
+        .env("TRUNC_PROFILE", "-")
+        .current_dir(w)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && err.contains("profile:"), "{err}");
+    assert!(!err.contains("trace written"), "{err}");
+
+    // Without profiling, nothing extra is printed.
+    let out = trunc(&["verify", "a.tar.gz"], w);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("profile:"));
+}

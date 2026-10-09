@@ -423,13 +423,17 @@ fn consume_blocks(
     };
 
     for g in groups {
+        let _batch = trunc_prof::span("consume.batch");
         let archive_ref: &Archive = archive;
-        let decoded: Vec<Result<Vec<u8>>> = pool.install(|| {
-            g.clone()
-                .into_par_iter()
-                .map(|i| archive_ref.decode_block(i))
-                .collect()
+        let decoded: Vec<Result<Vec<u8>>> = trunc_prof::time("consume.decode", || {
+            pool.install(|| {
+                g.clone()
+                    .into_par_iter()
+                    .map(|i| archive_ref.decode_block(i))
+                    .collect()
+            })
         });
+        let write = trunc_prof::span("consume.write");
 
         let mut touched: BTreeSet<usize> = BTreeSet::new();
         let mut completed: Vec<usize> = Vec::new();
@@ -458,7 +462,9 @@ fn consume_blocks(
                     hashers.insert(r.entry, trunc_hash::Blake3Hasher::new());
                 }
                 if let Some(hs) = hashers.get_mut(&r.entry) {
-                    hs.update(data);
+                    trunc_prof::time("hash.blake3", || {
+                        hs.update(data);
+                    });
                 }
                 touched.insert(r.entry);
                 summary.bytes_written += r.len;
@@ -484,14 +490,15 @@ fn consume_blocks(
             }
             h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
         }
+        drop(write);
         // Durability before release: data, then directory entries.
-        for entry in &touched {
-            open[entry].flush_data()?;
-        }
-        for d in &new_parents {
-            fs.flush_dir(d)?;
-        }
+        let flush = trunc_prof::span("consume.flush");
+        let files: Vec<&dyn FileHandle> = touched.iter().map(|e| open[e].as_ref()).collect();
+        let dirs: Vec<PathBuf> = new_parents.iter().cloned().collect();
+        fs.flush_all(&files, &dirs)?;
+        drop(flush);
         if opts.verify_media {
+            let _verify = trunc_prof::span("consume.verify_media");
             // Read the batch back from the device and check it before releasing its source.
             for i in g.clone() {
                 let b = &m.blocks[i];
@@ -515,13 +522,13 @@ fn consume_blocks(
                 }
             }
         }
-        for entry in &completed {
-            open.remove(entry);
-        }
+        trunc_fs::close_all(completed.iter().filter_map(|e| open.remove(e)).collect());
         // Release the batch's blocks and make the release itself durable.
+        let release = trunc_prof::span("consume.release");
         let new_len = m.len_after_consuming(fbo, g.end);
         truncate_with_retry(archive.handle(), new_len, opts.retry)?;
         archive.handle().flush_data()?;
+        drop(release);
         archive.note_consumed(g.end);
         summary.batches += 1;
         progress(Progress::Batch {

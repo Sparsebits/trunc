@@ -16,8 +16,9 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALLOCATION_INFO, FILE_ID_INFO, FileAllocationInfo, FileIdInfo, GetDiskFreeSpaceExW,
-    GetDiskFreeSpaceW, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    GetVolumePathNameW, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
+    GetDiskFreeSpaceW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    GetVolumeInformationByHandleW, GetVolumePathNameW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -272,4 +273,29 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     // SAFETY: both strings are NUL-terminated and outlive the call.
     let ok = unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), MOVEFILE_WRITE_THROUGH) };
     check(ok)
+}
+
+/// Where a handle really is, after every junction and link: its volume serial number and its
+/// path within that volume (`\\dir\\file`, case as stored on disk). Leaving out the drive name
+/// (`VOLUME_NAME_NONE`) avoids a slow mount-manager query; the serial tells volumes apart.
+pub(crate) fn final_path(f: &File) -> io::Result<(u64, PathBuf)> {
+    const VOLUME_NAME_NONE: u32 = 0x4;
+    let volume = file_id(f)?.0;
+    let mut buf = vec![0u16; 512];
+    loop {
+        let cap = u32::try_from(buf.len()).expect("small buffer");
+        // SAFETY: valid handle; the output pointer and `cap` describe `buf`, which outlives the
+        // call; the API writes at most `cap` UTF-16 units.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(handle(f), buf.as_mut_ptr(), cap, VOLUME_NAME_NONE)
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok((volume, PathBuf::from(std::ffi::OsString::from_wide(&buf))));
+        }
+        buf.resize(n + 1, 0);
+    }
 }

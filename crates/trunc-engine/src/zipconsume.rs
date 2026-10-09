@@ -294,6 +294,7 @@ fn decode_entry(
     sink: &mut dyn FnMut(&[u8]) -> std::result::Result<(), InflateError>,
     need_free: u64,
 ) -> Result<()> {
+    let _prof = trunc_prof::span("zip.decode_entry").bytes(e.size);
     let (total, crc) = match e.method {
         Method::Deflate => {
             let f = Inflater::new(&Checkpoint::start(), e.size)
@@ -835,6 +836,7 @@ pub fn consume_zip(
         if e.region_end > len {
             continue; // consumed by an earlier run
         }
+        let _entry = trunc_prof::span("zip.entry").bytes(e.size);
         if e.kind == Kind::File && e.size > 0 {
             let p = join_rel(&stage, &e.name);
             if should_punch(layout, e, opts, can_dealloc) {
@@ -871,6 +873,7 @@ pub fn consume_zip(
         }
         let target = after[pos];
         if target < len {
+            let _release = trunc_prof::span("zip.release");
             truncate_with_retry(handle.as_ref(), target, opts.retry)?;
             handle.flush_data()?;
             len = target;

@@ -95,6 +95,7 @@ impl Journal {
     /// The file is written in full under a temporary name and then renamed into place, so a crash
     /// during creation can never leave a partial journal at `path`.
     pub fn create(fs: &dyn FsBackend, path: &Path, preamble: &[u8], slot_cap: u32) -> Result<Self> {
+        let _prof = trunc_prof::span("journal.create").bytes(preamble.len() as u64);
         let tmp = temp_path(path);
         let h = fs.open(&tmp, OpenMode::CreateOrTruncate, Share::Exclusive)?;
         h.write_all_at(&encode_header(slot_cap, preamble), 0)?;
@@ -194,6 +195,7 @@ impl Journal {
 
     /// Durably record `payload` as the newest checkpoint.
     pub fn write(&mut self, payload: &[u8]) -> Result<()> {
+        let _prof = trunc_prof::span("journal.write").bytes(payload.len() as u64);
         if payload.len() > self.slot_cap as usize {
             return Err(JournalError::TooLarge {
                 got: payload.len(),

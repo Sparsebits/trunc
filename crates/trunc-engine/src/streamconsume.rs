@@ -479,6 +479,7 @@ struct StagedHistory<'a> {
 
 impl History for StagedHistory<'_> {
     fn read(&mut self, at: u64, buf: &mut [u8]) -> stream::Result<()> {
+        let _prof = trunc_prof::span("stream.restore_window").bytes(buf.len() as u64);
         let mut done = 0usize;
         while done < buf.len() {
             let o = at + done as u64;
@@ -587,6 +588,7 @@ pub fn scan(
     opts: &StreamOptions,
 ) -> Result<StreamLayout> {
     let file_len = archive.size()?;
+    let _prof = trunc_prof::span("stream.scan").bytes(file_len);
     let (codec, mode) = sniff(archive, opts.raw)?.ok_or_else(|| {
         Error::Input(format!(
             "{} is not a gzip, bzip2, xz or zstd file",
@@ -610,14 +612,21 @@ pub fn scan(
         },
         every,
         &mut |b| match mode {
-            Mode::Tar => reader
-                .borrow_mut()
-                .feed_data(b, &mut |d| {
-                    hasher.borrow_mut().update(d);
-                })
-                .map_err(tar_err(path)),
+            Mode::Tar => {
+                let _p = trunc_prof::span("tar.parse").bytes(b.len() as u64);
+                reader
+                    .borrow_mut()
+                    .feed_data(b, &mut |d| {
+                        trunc_prof::time("hash.blake3", || {
+                            hasher.borrow_mut().update(d);
+                        });
+                    })
+                    .map_err(tar_err(path))
+            }
             Mode::Single => {
-                hasher.borrow_mut().update(b);
+                trunc_prof::time("hash.blake3", || {
+                    hasher.borrow_mut().update(b);
+                });
                 Ok(())
             }
         },
@@ -775,9 +784,29 @@ enum Target<'a> {
 /// The gap log being appended to.
 struct GapLog {
     h: Box<dyn FileHandle>,
+    /// Bytes written to the file.
     len: u64,
+    /// Bytes appended since, not yet written (written in one go when flushed or when large).
+    buf: Vec<u8>,
     dirty: bool,
 }
+
+impl GapLog {
+    fn write_out(&mut self, need_free: u64) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.h
+                .write_all_at(&self.buf, self.len)
+                .map_err(|e| nospace(e, need_free))?;
+            self.len += self.buf.len() as u64;
+            self.buf.clear();
+            self.dirty = true;
+        }
+        Ok(())
+    }
+}
+
+/// Buffered gap-log bytes are written once this much has accumulated.
+const GAP_BUFFER: usize = 4 << 20;
 
 /// Routes the decoded stream's file content into output files (and, with a gap log, the rest
 /// into the log).
@@ -876,18 +905,16 @@ impl<'a> Router<'a> {
     /// Append bytes that are not file content to the gap log, if there is one.
     fn gap(&mut self, b: &[u8]) -> Result<()> {
         if let Some(g) = &mut self.gaps {
-            let end = g.len + b.len() as u64;
-            g.h.preallocate(end)
-                .map_err(|e| nospace(e, self.need_free))?;
-            g.h.write_all_at(b, g.len)
-                .map_err(|e| nospace(e, self.need_free))?;
-            g.len = end;
-            g.dirty = true;
+            g.buf.extend_from_slice(b);
+            if g.buf.len() >= GAP_BUFFER {
+                g.write_out(self.need_free)?;
+            }
         }
         Ok(())
     }
 
     fn write(&mut self, mut b: &[u8]) -> Result<()> {
+        let _prof = trunc_prof::span("stream.route").bytes(b.len() as u64);
         while !b.is_empty() {
             let Some(&i) = self.files.get(self.next) else {
                 self.gap(b)?;
@@ -910,11 +937,13 @@ impl<'a> Router<'a> {
                 self.current = Some(h);
             }
             let h = self.current.as_ref().expect("opened above");
-            h.preallocate(at + n as u64)
-                .map_err(|e| nospace(e, self.need_free))?;
+            // No reservation first: it would cover exactly what this write allocates anyway, and a
+            // full disk fails the write the same way (and pauses).
             h.write_all_at(&b[..n], at)
                 .map_err(|e| nospace(e, self.need_free))?;
-            self.hasher.update(&b[..n]);
+            trunc_prof::time("hash.blake3", || {
+                self.hasher.update(&b[..n]);
+            });
             match self.segments.last_mut() {
                 Some((j, _, end)) if *j == i && *end == at => *end += n as u64,
                 _ => self.segments.push((i, at, at + n as u64)),
@@ -929,9 +958,10 @@ impl<'a> Router<'a> {
                 self.pending.push(h);
                 self.next += 1;
                 if self.pending.len() >= MAX_PENDING {
-                    for h in self.pending.drain(..) {
-                        h.flush_data()?;
-                    }
+                    let pending: Vec<&dyn FileHandle> =
+                        self.pending.iter().map(AsRef::as_ref).collect();
+                    self.fs.flush_all(&pending, &[])?;
+                    trunc_fs::close_all(std::mem::take(&mut self.pending));
                 }
             }
         }
@@ -941,20 +971,20 @@ impl<'a> Router<'a> {
     /// Make everything written so far durable: file data and the gap log, then new directory
     /// entries.
     fn flush(&mut self) -> Result<()> {
-        if let Some(h) = &self.current {
-            h.flush_data()?;
-        }
-        for h in self.pending.drain(..) {
-            h.flush_data()?;
-        }
+        let _prof = trunc_prof::span("stream.flush_outputs");
         if let Some(g) = &mut self.gaps {
-            if g.dirty {
-                g.h.flush_data()?;
-                g.dirty = false;
-            }
+            g.write_out(self.need_free)?;
         }
-        for d in std::mem::take(&mut self.new_dirs) {
-            self.fs.flush_dir(&d)?;
+        let mut files: Vec<&dyn FileHandle> = self.pending.iter().map(AsRef::as_ref).collect();
+        files.extend(self.current.as_deref());
+        if let Some(g) = self.gaps.as_ref().filter(|g| g.dirty) {
+            files.push(g.h.as_ref());
+        }
+        let dirs: Vec<PathBuf> = std::mem::take(&mut self.new_dirs).into_iter().collect();
+        self.fs.flush_all(&files, &dirs)?;
+        trunc_fs::close_all(std::mem::take(&mut self.pending));
+        if let Some(g) = &mut self.gaps {
+            g.dirty = false;
         }
         Ok(())
     }
@@ -962,6 +992,7 @@ impl<'a> Router<'a> {
     /// Hash of the content routed since the last call, and (with `read_back`) whether the same
     /// content reads back from the device.
     fn take_interval(&mut self, read_back: bool) -> Result<([u8; 32], bool)> {
+        let _prof = trunc_prof::span("stream.verify_interval");
         let hash = *std::mem::replace(&mut self.hasher, Blake3Hasher::new())
             .finalize()
             .as_bytes();
@@ -1080,6 +1111,7 @@ pub fn consume_stream(
     opts: &ConsumeOptions,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ConsumeSummary> {
+    let _prof = trunc_prof::span("stream.consume");
     let absolute = |p: &Path| std::path::absolute(p).map_err(|e| Error::Input(e.to_string()));
     let dest = absolute(dest)?;
     let archive_path = &absolute(archive_path)?;
@@ -1308,7 +1340,9 @@ pub fn consume_stream(
     }
 
     let total = layout.ckpts.len() + 1;
-    build_structure(fs, &items, &dest, &stage, &mut summary)?;
+    trunc_prof::time("stage.build", || {
+        build_structure(fs, &items, &dest, &stage, &mut summary)
+    })?;
     if let Some(r) = latest.as_ref().filter(|r| !r.is_end()) {
         // A crash between journaling a checkpoint and freeing its bytes leaves them allocated
         // (or, for a split archive, leaves parts that should be gone).
@@ -1340,6 +1374,7 @@ pub fn consume_stream(
             Some(GapLog {
                 h,
                 len: keep,
+                buf: Vec::new(),
                 dirty: true,
             })
         } else {
@@ -1393,6 +1428,7 @@ pub fn consume_stream(
             layout.every,
             &mut |b| router.borrow_mut().write(b),
             &mut |p| {
+                let _ckpt = trunc_prof::span("stream.checkpoint");
                 seq += 1;
                 let mut r = router.borrow_mut();
                 r.flush()?;
@@ -1426,7 +1462,9 @@ pub fn consume_stream(
                         .encode(pre.v1),
                     )
                     .map_err(journal_err)?;
-                held.free(fs, freed_to, p.free_below, granularity)?;
+                trunc_prof::time("stream.free", || {
+                    held.free(fs, freed_to, p.free_below, granularity)
+                })?;
                 freed_to = p.free_below;
                 progress(Progress::Batch {
                     blocks_done: seq as usize,
@@ -1468,7 +1506,10 @@ pub fn consume_stream(
     }
 
     progress(Progress::Renaming);
-    rename_into_place(fs, &items, &dest, &stage)?;
+    trunc_prof::time("stage.rename", || {
+        rename_into_place(fs, &items, &dest, &stage)
+    })?;
+    let _finish = trunc_prof::span("stream.finish");
     remove_gap_log(fs, archive_path)?;
     held.finish(fs, archive_path, journal, &jpath)?;
     Ok(summary)
@@ -1493,6 +1534,7 @@ pub fn extract_stream(
     overwrite: bool,
     opts: &StreamOptions,
 ) -> Result<ConsumeSummary> {
+    let _prof = trunc_prof::span("stream.extract");
     let h = source::open_read(fs, archive)?;
     let layout = scan(h.as_ref(), &name_path(fs, archive)?, 0, opts)?;
     ensure_dir(fs, dest)?;

@@ -443,7 +443,7 @@ fn emit(blk: &mut Block, sink: &mut Sink<'_>) -> stream::Result<()> {
     let lz = &mut blk.lz;
     if lz.flushed < lz.win.len() {
         let data = &lz.win[lz.flushed..];
-        blk.check.update(data);
+        trunc_prof::time("xz.check", || blk.check.update(data));
         sink(data)?;
         lz.flushed = lz.win.len();
     }
@@ -630,11 +630,14 @@ pub fn decode(
                 };
                 chunk.resize(packed, 0);
                 rd.take(&mut chunk)?;
+                let mut prof = trunc_prof::span("xz.chunk");
                 let room = limits.max_out.saturating_sub(out);
                 let n = blk
                     .lz
                     .chunk(&head, &chunk, room)
                     .map_err(|e| at_err(e, at))? as u64;
+                prof.add_bytes(n);
+                drop(prof);
                 out += n;
                 blk.out += n;
                 since += n;

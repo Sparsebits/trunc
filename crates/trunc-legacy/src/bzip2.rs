@@ -38,15 +38,16 @@ fn corrupt(at_bit: u64, why: &str) -> StreamError {
     ))
 }
 
-/// CRC-32 with the polynomial 0x04C11DB7, most significant bit first (as bzip2 uses it).
+/// CRC-32 with the polynomial 0x04C11DB7, most significant bit first (as bzip2 uses it), with
+/// slicing-by-8 tables (`table[k][i]`: byte `i` followed by `k` zero bytes).
 struct Crc {
-    table: [u32; 256],
+    table: Box<[[u32; 256]; 8]>,
 }
 
 impl Crc {
     fn new() -> Self {
-        let mut table = [0u32; 256];
-        for (i, t) in table.iter_mut().enumerate() {
+        let mut table = Box::new([[0u32; 256]; 8]);
+        for i in 0..256 {
             let mut c = (i as u32) << 24;
             for _ in 0..8 {
                 c = if c & 0x8000_0000 != 0 {
@@ -55,24 +56,46 @@ impl Crc {
                     c << 1
                 };
             }
-            *t = c;
+            table[0][i] = c;
+        }
+        for k in 1..8 {
+            for i in 0..256 {
+                let prev = table[k - 1][i];
+                table[k][i] = (prev << 8) ^ table[0][(prev >> 24) as usize];
+            }
         }
         Self { table }
     }
 
     fn update(&self, mut crc: u32, data: &[u8]) -> u32 {
-        for &b in data {
-            crc = (crc << 8) ^ self.table[((crc >> 24) as u8 ^ b) as usize];
+        let t = &*self.table;
+        let mut words = data.chunks_exact(8);
+        for w in &mut words {
+            let hi = crc ^ u32::from_be_bytes([w[0], w[1], w[2], w[3]]);
+            crc = t[7][(hi >> 24) as usize]
+                ^ t[6][((hi >> 16) & 0xFF) as usize]
+                ^ t[5][((hi >> 8) & 0xFF) as usize]
+                ^ t[4][(hi & 0xFF) as usize]
+                ^ t[3][usize::from(w[4])]
+                ^ t[2][usize::from(w[5])]
+                ^ t[1][usize::from(w[6])]
+                ^ t[0][usize::from(w[7])];
+        }
+        for &b in words.remainder() {
+            crc = (crc << 8) ^ t[0][((crc >> 24) as u8 ^ b) as usize];
         }
         crc
     }
 
     /// `n` copies of `b`.
     fn update_run(&self, mut crc: u32, b: u8, n: usize) -> u32 {
-        for _ in 0..n {
-            crc = (crc << 8) ^ self.table[((crc >> 24) as u8 ^ b) as usize];
+        let block = [b; 64];
+        let mut left = n;
+        while left >= 64 {
+            crc = self.update(crc, &block);
+            left -= 64;
         }
-        crc
+        self.update(crc, &block[..left])
     }
 }
 
@@ -369,6 +392,8 @@ fn block(
     s: &mut Scratch,
     out: &mut Out<'_, '_>,
 ) -> stream::Result<u32> {
+    let mut prof = trunc_prof::span("bzip2.block");
+    let start_out = out.total;
     let at = bits.pos;
     let stored_crc = bits.get(32)?;
     if bits.get(1)? == 1 {
@@ -446,6 +471,7 @@ fn block(
     }
 
     // Huffman + run-length + move-to-front decoding into the BWT block.
+    let huff = trunc_prof::span("bzip2.huffman");
     let max_block = usize::from(level) * 100_000;
     let eob = (alpha - 1) as u16;
     // All 256 byte values may occur, so count in usize before narrowing.
@@ -512,7 +538,9 @@ fn block(
         return Err(corrupt(at, "bad BWT origin pointer"));
     }
 
+    drop(huff);
     // Inverse Burrows–Wheeler transform.
+    let bwt = trunc_prof::span("bzip2.bwt");
     let mut cf = [0usize; 256];
     let mut sum = 0usize;
     for (c, &k) in counts.iter().enumerate() {
@@ -527,6 +555,8 @@ fn block(
         cf[usize::from(b)] += 1;
     }
 
+    drop(bwt);
+    let _rle = trunc_prof::span("bzip2.rle_crc");
     // Undo the initial run-length pass while emitting: after four equal bytes, the next byte
     // is a count of further copies.
     let mut crc = 0xFFFF_FFFFu32;
@@ -565,6 +595,7 @@ fn block(
     if crc != stored_crc {
         return Err(corrupt(at, "block CRC mismatch"));
     }
+    prof.add_bytes(out.total - start_out);
     Ok(crc)
 }
 
@@ -700,6 +731,20 @@ mod tests {
         // CRC-32/BZIP2 of "123456789" is 0xFC891918.
         let c = Crc::new();
         assert_eq!(!c.update(0xFFFF_FFFF, b"123456789"), 0xFC89_1918);
+        // Sliced and bytewise agree at every length, and runs equal repeated bytes.
+        let data: Vec<u8> = (0..200u32).map(|i| (i * 13 + i / 5) as u8).collect();
+        for n in 0..data.len() {
+            let mut slow = 0xFFFF_FFFFu32;
+            for &b in &data[..n] {
+                slow = (slow << 8) ^ c.table[0][((slow >> 24) as u8 ^ b) as usize];
+            }
+            assert_eq!(c.update(0xFFFF_FFFF, &data[..n]), slow, "length {n}");
+            assert_eq!(
+                c.update_run(7, 0x5A, n),
+                c.update(7, &vec![0x5A; n]),
+                "run {n}"
+            );
+        }
     }
 
     #[test]

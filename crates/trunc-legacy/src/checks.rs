@@ -13,8 +13,10 @@ pub struct Crc64 {
     state: u64,
 }
 
-const fn crc64_table() -> [u64; 256] {
-    let mut t = [0u64; 256];
+/// Slicing-by-8 tables: `T[0]` is the byte table, `T[k][i]` the CRC of byte `i` followed by
+/// `k` zero bytes, so eight bytes are folded in one step.
+const fn crc64_tables() -> [[u64; 256]; 8] {
+    let mut t = [[0u64; 256]; 8];
     let mut i = 0;
     while i < 256 {
         let mut c = i as u64;
@@ -27,13 +29,23 @@ const fn crc64_table() -> [u64; 256] {
             };
             k += 1;
         }
-        t[i] = c;
+        t[0][i] = c;
         i += 1;
+    }
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev >> 8) ^ t[0][(prev & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
     }
     t
 }
 
-static CRC64: [u64; 256] = crc64_table();
+static CRC64: [[u64; 256]; 8] = crc64_tables();
 
 impl Default for Crc64 {
     fn default() -> Self {
@@ -47,9 +59,22 @@ impl Crc64 {
     }
 
     pub fn update(&mut self, data: &[u8]) {
+        let t = &CRC64;
         let mut c = self.state;
-        for &b in data {
-            c = CRC64[((c as u8) ^ b) as usize] ^ (c >> 8);
+        let mut words = data.chunks_exact(8);
+        for w in &mut words {
+            let v = c ^ u64::from_le_bytes(w.try_into().expect("8"));
+            c = t[7][(v & 0xFF) as usize]
+                ^ t[6][((v >> 8) & 0xFF) as usize]
+                ^ t[5][((v >> 16) & 0xFF) as usize]
+                ^ t[4][((v >> 24) & 0xFF) as usize]
+                ^ t[3][((v >> 32) & 0xFF) as usize]
+                ^ t[2][((v >> 40) & 0xFF) as usize]
+                ^ t[1][((v >> 48) & 0xFF) as usize]
+                ^ t[0][(v >> 56) as usize];
+        }
+        for &b in words.remainder() {
+            c = t[0][((c as u8) ^ b) as usize] ^ (c >> 8);
         }
         self.state = c;
     }
@@ -460,6 +485,22 @@ mod tests {
         let mut x = Xxh64::new();
         x.update(b"a");
         assert_eq!(x.finish(), 0xD24E_C4F1_A98C_6E5B);
+    }
+
+    #[test]
+    fn crc64_matches_a_bytewise_crc_at_every_length() {
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for n in 0..data.len() {
+            let mut slow = !0u64;
+            for &b in &data[..n] {
+                slow = CRC64[0][((slow as u8) ^ b) as usize] ^ (slow >> 8);
+            }
+            let mut fast = Crc64::new();
+            let (a, b) = data[..n].split_at(n / 3);
+            fast.update(a);
+            fast.update(b);
+            assert_eq!(fast.finish(), !slow, "length {n}");
+        }
     }
 
     #[test]

@@ -157,13 +157,15 @@ pub(super) fn decompress(
     window: u64,
     max_block: usize,
 ) -> stream::Result<()> {
-    let (mut lits, used) = literals(b, ent, max_block)?;
+    let (mut lits, used) = trunc_prof::time("zstd.literals", || literals(b, ent, max_block))?;
     let rest = &b[used..];
     let start = win.len();
     // Slack after the literals lets them be copied in fixed 16-byte chunks.
     let n_lits = lits.len();
     lits.resize(n_lits + WILD, 0);
-    sequences(rest, ent, &lits, n_lits, win, produced, window, max_block)?;
+    trunc_prof::time("zstd.sequences", || {
+        sequences(rest, ent, &lits, n_lits, win, produced, window, max_block)
+    })?;
     if win.len() - start > max_block {
         return Err(corrupt("block output larger than allowed"));
     }

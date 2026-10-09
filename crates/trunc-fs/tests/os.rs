@@ -508,3 +508,73 @@ fn preallocate_reserves_blocks() {
     f.preallocate(1).unwrap();
     assert_eq!(f.size().unwrap(), len);
 }
+
+/// Confined opens and directory creation through a junction in the middle of the path: refused,
+/// and anything created through it is taken back.
+#[cfg(windows)]
+#[test]
+fn confined_opens_refuse_junctions_on_the_way() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    write_file(&outside.join("victim"), b"keep");
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("j"))
+        .arg(&outside)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "mklink /J needs no privileges");
+    let through = root.join("j").join("victim");
+    for mode in [OpenMode::Read, OpenMode::ReadWrite] {
+        let e = fs()
+            .open_beneath(&root, &through, mode, Share::Shared)
+            .unwrap_err();
+        assert!(matches!(e, FsError::Link { .. }), "{mode:?}: {e}");
+    }
+    let e = fs()
+        .open_beneath(
+            &root,
+            &root.join("j").join("new"),
+            OpenMode::CreateNew,
+            Share::Exclusive,
+        )
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(
+        !outside.join("new").exists(),
+        "the file created through the junction was removed"
+    );
+    let e = fs()
+        .create_dir_beneath(&root, &root.join("j").join("newdir"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!outside.join("newdir").exists());
+    assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"keep");
+
+    // Ordinary nested paths work, and opening the root's children stays allowed.
+    fs().create_dir_beneath(&root, &root.join("a")).unwrap();
+    let f = fs()
+        .open_beneath(
+            &root,
+            &root.join("a").join("f"),
+            OpenMode::CreateNew,
+            Share::Exclusive,
+        )
+        .unwrap();
+    f.write_all_at(b"ok", 0).unwrap();
+    drop(f);
+    let f = fs()
+        .open_beneath(
+            &root,
+            &root.join("a").join("f"),
+            OpenMode::ReadWrite,
+            Share::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(f.size().unwrap(), 2);
+}

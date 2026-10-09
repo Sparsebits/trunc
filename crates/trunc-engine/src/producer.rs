@@ -99,7 +99,7 @@ pub fn create(out: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<Cr
         return Err(Error::Input("a dictionary requires the zstd codec".into()));
     }
 
-    let items = walk_inputs(inputs)?;
+    let items = trunc_prof::time("create.walk", || walk_inputs(inputs))?;
     let mut entries = Vec::with_capacity(items.len());
     let mut off = 0u64;
     for it in &items {
@@ -170,20 +170,28 @@ pub fn create(out: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<Cr
     let mut chunks = trunc_chunk::FixedChunker::new(total_u, opts.block_size).peekable();
     while chunks.peek().is_some() {
         let mut raw_blocks = Vec::new();
+        let read = trunc_prof::span("create.read_inputs");
         for r in chunks.by_ref().take(len_usize(per_round)) {
             let mut buf = vec![0u8; len_usize(r.end - r.start)];
             reader.fill(&mut buf)?;
             raw_blocks.push(buf);
         }
+        drop(read);
         let compressed: Vec<Result<_>> = pool.install(|| {
             raw_blocks
                 .par_iter()
                 .map(|raw| {
+                    let _prof = trunc_prof::span("create.compress").bytes(raw.len() as u64);
                     let (codec, comp) = trunc_codec::compress(opts.codec, raw, dict.as_ref())?;
-                    Ok((codec, comp, trunc_hash::blake3(raw)))
+                    Ok((
+                        codec,
+                        comp,
+                        trunc_prof::time("hash.blake3", || trunc_hash::blake3(raw)),
+                    ))
                 })
                 .collect()
         });
+        let _spool = trunc_prof::span("create.spool");
         for (res, raw) in compressed.into_iter().zip(&raw_blocks) {
             let (codec, comp, blake3_u) = res?;
             spool_w
@@ -237,6 +245,7 @@ pub fn create(out: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<Cr
     let header = Header::for_manifest(&region, dict.as_ref().map_or(0, |d| d.0.len() as u64));
 
     // Write the final file: header, manifest, dict, then blocks n-1 .. 0.
+    let assemble = trunc_prof::span("create.assemble");
     let partial = partial_path(out);
     let pf = OpenOptions::new()
         .write(true)
@@ -269,7 +278,8 @@ pub fn create(out: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<Cr
     }
     w.flush().ctx(wctx)?;
     drop(w);
-    pf.sync_all().ctx(at("flushing", &partial))?;
+    drop(assemble);
+    trunc_prof::time("create.sync", || pf.sync_all()).ctx(at("flushing", &partial))?;
     drop(pf);
     drop(spool);
 

@@ -70,6 +70,44 @@ With `--consume`, compressed tarballs and files delete each part as soon as its 
 
 `.trnc` archives only hold names that work on Windows, macOS and Linux. Archives from other tools often don't: Linux tarballs contain names with backslashes or colons, and source trees have files that differ only in case (`Makefile` and `makefile`). On Linux and macOS, trunc accepts the names the system can hold; on Windows it refuses them before writing anything. Names that could reach outside the destination (`..`, absolute paths, `C:` prefixes) are refused everywhere.
 
+## Profiling
+
+`--profile FILE` (any command, or `TRUNC_PROFILE=FILE`) records where a run spends its time.
+When the command finishes, trunc prints a table to stderr and writes a Chrome trace to `FILE`.
+Open the trace in <https://ui.perfetto.dev>, `chrome://tracing` or <https://www.speedscope.app>
+to see every thread on a timeline. `--profile -` prints the table without writing a file.
+
+```console
+$ trunc --profile run.json x big.tar.zst -C out --consume --yes
+profile: 179.5 ms wall, 1949 spans on 1 thread
+      self      total     calls       mean       bytes       MB/s  span
+   65.5 ms    65.5 ms        96   681.9 us                         fs.flush
+   30.6 ms    30.6 ms       591    51.7 us                         fs.metadata
+   25.0 ms    25.0 ms        58   431.9 us                         fs.flush_dir
+   ...
+```
+
+Below the table, *hot paths* list self time by full call path
+(`cli.extract > stream.consume > stage.build > fs.create_dir`), which shows who made the slow
+calls. Each row is one kind of span. *Total* is the time inside it, *self* is that minus the spans
+nested inside it on the same thread, so the rows with the most self time are where the time
+went. With parallel threads (`.trnc` decoding, `create`), self times add up to more than the
+wall time. Spans are named by layer:
+
+| Prefix | What |
+|---|---|
+| `cli.*` | the whole command |
+| `fs.*` | filesystem calls: `open`, `read`, `write`, `flush` (data to disk), `flush_dir`, `deallocate` (punching), `set_len`, `rename`, `metadata`, … |
+| `decode.*`, `inflate.*`, `bzip2.*`, `xz.*`, `zstd.*` | decoders, per block or chunk, with their phases (`zstd.literals`, `zstd.sequences`, `bzip2.bwt`, …) |
+| `hash.*` | BLAKE3 hashing |
+| `journal.*` | journal creation and checkpoint writes |
+| `stream.*` | compressed tarballs: `scan`, `route` (splitting output into files), `checkpoint`, `flush_outputs`, `verify_interval`, `free`, `restore_window` |
+| `trnc.*`, `consume.*`, `extract.*`, `create.*` | `.trnc` blocks and the phases of consume, extract and create |
+| `zip.*` | ZIP entries and releases |
+| `stage.*` | building the staging tree and renaming it into place |
+
+Profiling is off unless asked for; the spans then cost one atomic read each.
+
 ## Exit codes
 
 | Code | Meaning |

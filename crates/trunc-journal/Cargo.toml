@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+trunc-prof.workspace = true
 trunc-fs.workspace = true
 trunc-hash.workspace = true
 thiserror.workspace = true

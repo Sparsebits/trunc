@@ -83,14 +83,18 @@ fn for_each_block(
     let mut i = archive.consumed();
     while i < n {
         let end = (i + per_round).min(n);
-        let decoded: Vec<Result<Vec<u8>>> = pool.install(|| {
-            (i..end)
-                .into_par_iter()
-                .map(|b| archive.decode_block(b))
-                .collect()
+        let decoded: Vec<Result<Vec<u8>>> = trunc_prof::time("extract.decode", || {
+            pool.install(|| {
+                (i..end)
+                    .into_par_iter()
+                    .map(|b| archive.decode_block(b))
+                    .collect()
+            })
         });
         for (k, buf) in decoded.into_iter().enumerate() {
-            apply(i + k, &buf?)?;
+            let buf = buf?;
+            let _apply = trunc_prof::span("extract.apply").bytes(buf.len() as u64);
+            apply(i + k, &buf)?;
         }
         i = end;
     }
@@ -115,7 +119,10 @@ impl<'m> EntryHashes<'m> {
 
     /// Feed a run; returns true when the entry is complete (and verified).
     fn feed(&mut self, entry: usize, data: &[u8]) -> Result<bool> {
-        self.hashers.entry(entry).or_default().update(data);
+        let hasher = self.hashers.entry(entry).or_default();
+        trunc_prof::time("hash.blake3", || {
+            hasher.update(data);
+        });
         self.remaining[entry] -= data.len() as u64;
         if self.remaining[entry] > 0 {
             return Ok(false);
@@ -207,13 +214,16 @@ pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<
 
     // Create every file up front so empty files exist and conflicts surface before any data
     // is written.
+    let create = trunc_prof::span("extract.create_files");
     let mut open: HashMap<usize, File> = HashMap::new();
+    // Finished files, closed in batches.
+    let mut finished: Vec<File> = Vec::new();
     for (i, e) in m.entries.iter().enumerate() {
         if !matches!(e.kind, EntryKind::File) {
             continue;
         }
         let p = dest_path(dest, &e.path);
-        let f = create_output(&p, opts.overwrite)?;
+        let f = trunc_prof::time("extract.create", || create_output(&p, opts.overwrite))?;
         if e.size > 0 {
             f.set_len(e.size).ctx(at("allocating", &p))?;
             open.insert(i, f);
@@ -225,10 +235,12 @@ pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<
                 )));
             }
             finish_file(&f, &p, e)?;
+            finished.push(f);
         }
         summary.files += 1;
     }
 
+    drop(create);
     let mut hashes = EntryHashes::new(m);
     for_each_block(archive, opts.threads, |i, buf| {
         let b = &m.blocks[i];
@@ -240,15 +252,21 @@ pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<
                 .get(&r.entry)
                 .expect("non-empty files are opened up front");
             let p = dest_path(dest, &e.path);
-            write_all_at(f, data, r.entry_off).ctx(at("writing", &p))?;
+            trunc_prof::time("extract.write", || write_all_at(f, data, r.entry_off))
+                .ctx(at("writing", &p))?;
             if hashes.feed(r.entry, data)? {
                 let f = open.remove(&r.entry).expect("present");
-                finish_file(&f, &p, e)?;
+                trunc_prof::time("extract.finish", || finish_file(&f, &p, e))?;
+                finished.push(f);
+                if finished.len() >= 256 {
+                    trunc_fs::close_all(std::mem::take(&mut finished));
+                }
             }
         }
         summary.bytes += b.u_len;
         Ok(())
     })?;
+    trunc_fs::close_all(finished);
     debug_assert!(open.is_empty(), "every file received all its bytes");
 
     let links: std::collections::HashSet<String> = m
@@ -272,6 +290,21 @@ pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<
 }
 
 fn create_output(p: &Path, overwrite: bool) -> Result<File> {
+    if !overwrite {
+        // Creating with "must not exist" refuses an existing file or link by itself.
+        return match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(p)
+        {
+            Ok(f) => Ok(f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(Error::Refused(format!("{} already exists", p.display())))
+            }
+            Err(e) => Err(e).ctx(at("creating", p)),
+        };
+    }
     if let Ok(md) = fs::symlink_metadata(p) {
         if !overwrite {
             return Err(Error::Refused(format!("{} already exists", p.display())));

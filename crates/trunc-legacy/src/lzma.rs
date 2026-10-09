@@ -33,12 +33,14 @@ fn corrupt(why: &str) -> StreamError {
     StreamError::Corrupt(format!("corrupt LZMA2 data: {why}"))
 }
 
-/// Range decoder over one chunk's compressed bytes.
+/// Range decoder over one chunk's compressed bytes. Reading past the end yields zeros and sets
+/// `overrun`, checked once the chunk is done, so decoding a bit cannot fail.
 struct Rc<'a> {
     data: &'a [u8],
     ip: usize,
     range: u32,
     code: u32,
+    overrun: bool,
 }
 
 impl<'a> Rc<'a> {
@@ -51,62 +53,65 @@ impl<'a> Rc<'a> {
             ip: 5,
             range: u32::MAX,
             code: u32::from_be_bytes(data[1..5].try_into().expect("4")),
+            overrun: false,
         })
     }
 
     #[inline]
-    fn normalize(&mut self) -> stream::Result<()> {
+    fn normalize(&mut self) {
         if self.range < 1 << 24 {
-            let &b = self
-                .data
-                .get(self.ip)
-                .ok_or_else(|| corrupt("chunk ends early"))?;
+            let b = match self.data.get(self.ip) {
+                Some(&b) => b,
+                None => {
+                    self.overrun = true;
+                    0
+                }
+            };
             self.ip += 1;
             self.range <<= 8;
             self.code = (self.code << 8) | u32::from(b);
         }
-        Ok(())
     }
 
     #[inline]
-    fn bit(&mut self, p: &mut u16) -> stream::Result<u32> {
-        self.normalize()?;
+    fn bit(&mut self, p: &mut u16) -> u32 {
+        self.normalize();
         let bound = (self.range >> 11) * u32::from(*p);
         if self.code < bound {
             self.range = bound;
             *p += (2048 - *p) >> 5;
-            Ok(0)
+            0
         } else {
             self.range -= bound;
             self.code -= bound;
             *p -= *p >> 5;
-            Ok(1)
+            1
         }
     }
 
-    fn tree(&mut self, probs: &mut [u16], bits: u32) -> stream::Result<u32> {
+    fn tree(&mut self, probs: &mut [u16], bits: u32) -> u32 {
         let mut m = 1usize;
         for _ in 0..bits {
-            m = (m << 1) | self.bit(&mut probs[m])? as usize;
+            m = (m << 1) | self.bit(&mut probs[m]) as usize;
         }
-        Ok(m as u32 - (1 << bits))
+        m as u32 - (1 << bits)
     }
 
-    fn reverse_tree(&mut self, probs: &mut [u16], bits: u32) -> stream::Result<u32> {
+    fn reverse_tree(&mut self, probs: &mut [u16], bits: u32) -> u32 {
         let mut m = 1usize;
         let mut sym = 0u32;
         for i in 0..bits {
-            let b = self.bit(&mut probs[m])?;
+            let b = self.bit(&mut probs[m]);
             m = (m << 1) | b as usize;
             sym |= b << i;
         }
-        Ok(sym)
+        sym
     }
 
-    fn direct(&mut self, bits: u32) -> stream::Result<u32> {
+    fn direct(&mut self, bits: u32) -> u32 {
         let mut v = 0u32;
         for _ in 0..bits {
-            self.normalize()?;
+            self.normalize();
             self.range >>= 1;
             let b = u32::from(self.code >= self.range);
             if b == 1 {
@@ -114,7 +119,7 @@ impl<'a> Rc<'a> {
             }
             v = (v << 1) | b;
         }
-        Ok(v)
+        v
     }
 }
 
@@ -277,11 +282,12 @@ impl Lzma2 {
         let lp_mask = (1u64 << self.lp) - 1;
         let lc = self.lc;
         let end = self.win.len() + unpacked;
+        self.win.reserve(unpacked);
         let dict = u64::from(self.dict_size);
         while self.win.len() < end {
             let pos_state = (self.pos & pb_mask) as usize;
             let s = self.state;
-            if rc.bit(&mut self.probs[IS_MATCH + s * 16 + pos_state])? == 0 {
+            if rc.bit(&mut self.probs[IS_MATCH + s * 16 + pos_state]) == 0 {
                 // Literal.
                 let prev = if self.pos > 0 {
                     u32::from(*self.win.last().expect("pos > 0"))
@@ -291,7 +297,10 @@ impl Lzma2 {
                 let base = LITERAL
                     + 0x300
                         * ((((self.pos & lp_mask) as usize) << lc) + (prev >> (8 - lc)) as usize);
-                let probs = &mut self.probs[base..base + 0x300];
+                // A fixed-size view: indexes below 0x100 need no check.
+                let probs: &mut [u16; 0x300] = (&mut self.probs[base..base + 0x300])
+                    .try_into()
+                    .expect("0x300 literal probabilities");
                 let mut sym = 1usize;
                 if s >= 7 {
                     let d = self.reps[0] as usize + 1;
@@ -299,7 +308,7 @@ impl Lzma2 {
                     loop {
                         let mbit = ((mb >> 7) & 1) as usize;
                         mb <<= 1;
-                        let b = rc.bit(&mut probs[((1 + mbit) << 8) + sym])? as usize;
+                        let b = rc.bit(&mut probs[((1 + mbit) << 8) + sym]) as usize;
                         sym = (sym << 1) | b;
                         if mbit != b || sym >= 0x100 {
                             break;
@@ -307,7 +316,7 @@ impl Lzma2 {
                     }
                 }
                 while sym < 0x100 {
-                    sym = (sym << 1) | rc.bit(&mut probs[sym])? as usize;
+                    sym = (sym << 1) | rc.bit(&mut probs[sym & 0xFF]) as usize;
                 }
                 self.win.push(sym as u8);
                 self.pos += 1;
@@ -321,30 +330,30 @@ impl Lzma2 {
                 continue;
             }
             let len;
-            if rc.bit(&mut self.probs[IS_REP + s])? == 0 {
+            if rc.bit(&mut self.probs[IS_REP + s]) == 0 {
                 // A new match.
-                len = self.length(&mut rc, LEN, pos_state)?;
+                len = self.length(&mut rc, LEN, pos_state);
                 self.state = if s < 7 { 7 } else { 10 };
-                let dist = self.distance(&mut rc, len)?;
+                let dist = self.distance(&mut rc, len);
                 if dist == u32::MAX {
                     return Err(corrupt("end marker inside a chunk"));
                 }
                 self.reps = [dist, self.reps[0], self.reps[1], self.reps[2]];
-            } else if rc.bit(&mut self.probs[IS_REP_G0 + s])? == 0 {
-                if rc.bit(&mut self.probs[IS_REP0_LONG + s * 16 + pos_state])? == 0 {
+            } else if rc.bit(&mut self.probs[IS_REP_G0 + s]) == 0 {
+                if rc.bit(&mut self.probs[IS_REP0_LONG + s * 16 + pos_state]) == 0 {
                     // Short rep: one byte at rep0.
                     self.state = if s < 7 { 9 } else { 11 };
                     self.copy(1, dict)?;
                     continue;
                 }
-                len = self.length(&mut rc, REP_LEN, pos_state)?;
+                len = self.length(&mut rc, REP_LEN, pos_state);
                 self.state = if s < 7 { 8 } else { 11 };
             } else {
                 let d;
-                if rc.bit(&mut self.probs[IS_REP_G1 + s])? == 0 {
+                if rc.bit(&mut self.probs[IS_REP_G1 + s]) == 0 {
                     d = self.reps[1];
                 } else {
-                    if rc.bit(&mut self.probs[IS_REP_G2 + s])? == 0 {
+                    if rc.bit(&mut self.probs[IS_REP_G2 + s]) == 0 {
                         d = self.reps[2];
                     } else {
                         d = self.reps[3];
@@ -354,7 +363,7 @@ impl Lzma2 {
                 }
                 self.reps[1] = self.reps[0];
                 self.reps[0] = d;
-                len = self.length(&mut rc, REP_LEN, pos_state)?;
+                len = self.length(&mut rc, REP_LEN, pos_state);
                 self.state = if s < 7 { 8 } else { 11 };
             }
             let n = len as usize + 2;
@@ -364,8 +373,8 @@ impl Lzma2 {
             self.copy(n, dict)?;
         }
         // Normalization is lazy (before each bit), so the last byte may still be pending.
-        rc.normalize()?;
-        if rc.ip != data.len() || rc.code != 0 {
+        rc.normalize();
+        if rc.overrun || rc.ip != data.len() || rc.code != 0 {
             return Err(corrupt("chunk does not end where its header says"));
         }
         Ok(())
@@ -392,25 +401,25 @@ impl Lzma2 {
         Ok(())
     }
 
-    fn length(&mut self, rc: &mut Rc<'_>, base: usize, pos_state: usize) -> stream::Result<u32> {
+    fn length(&mut self, rc: &mut Rc<'_>, base: usize, pos_state: usize) -> u32 {
         let p = &mut self.probs[base..base + LEN_PROBS];
-        if rc.bit(&mut p[0])? == 0 {
+        if rc.bit(&mut p[0]) == 0 {
             let o = 2 + pos_state * 8;
             return rc.tree(&mut p[o..o + 8], 3);
         }
-        if rc.bit(&mut p[1])? == 0 {
+        if rc.bit(&mut p[1]) == 0 {
             let o = 2 + 128 + pos_state * 8;
-            return Ok(8 + rc.tree(&mut p[o..o + 8], 3)?);
+            return 8 + rc.tree(&mut p[o..o + 8], 3);
         }
-        Ok(16 + rc.tree(&mut p[2 + 256..2 + 256 + 256], 8)?)
+        16 + rc.tree(&mut p[2 + 256..2 + 256 + 256], 8)
     }
 
-    fn distance(&mut self, rc: &mut Rc<'_>, len: u32) -> stream::Result<u32> {
+    fn distance(&mut self, rc: &mut Rc<'_>, len: u32) -> u32 {
         let ls = len.min(3) as usize;
         let o = POS_SLOT + ls * 64;
-        let slot = rc.tree(&mut self.probs[o..o + 64], 6)?;
+        let slot = rc.tree(&mut self.probs[o..o + 64], 6);
         if slot < 4 {
-            return Ok(slot);
+            return slot;
         }
         let nbits = (slot >> 1) - 1;
         let mut dist = (2 | (slot & 1)) << nbits;
@@ -418,12 +427,12 @@ impl Lzma2 {
             // Reverse bit tree over SPEC_POS, offset so that its index 1 lands at
             // `dist - slot`.
             let base = SPEC_POS + (dist - slot) as usize - 1;
-            dist += rc.reverse_tree(&mut self.probs[base..base + (1 << nbits)], nbits)?;
+            dist += rc.reverse_tree(&mut self.probs[base..base + (1 << nbits)], nbits);
         } else {
-            dist += rc.direct(nbits - 4)? << 4;
-            dist += rc.reverse_tree(&mut self.probs[ALIGN..ALIGN + 16], 4)?;
+            dist += rc.direct(nbits - 4) << 4;
+            dist += rc.reverse_tree(&mut self.probs[ALIGN..ALIGN + 16], 4);
         }
-        Ok(dist)
+        dist
     }
 
     /// State at a chunk boundary: `dict u32 | lc lp pb state u8 | reps 4×u32 | need_props u8 |

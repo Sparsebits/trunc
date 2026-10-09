@@ -332,6 +332,10 @@ cargo build --release      # target/release/trunc
 cargo test --workspace
 ```
 
+To see where a run spends its time, add `--profile run.json` to any command: it prints a
+summary and writes a trace for <https://ui.perfetto.dev> (see the
+[user guide](docs/guide.md#profiling)).
+
 The parsers are fuzzed with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). On Linux with
 a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `tar`,
 `inflate`, `bzip2`, `xz`, `zstd`, `manifest`, `header` and `footer`).

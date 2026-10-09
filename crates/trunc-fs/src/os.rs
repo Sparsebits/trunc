@@ -153,8 +153,80 @@ fn beneath_err(op: &'static str, path: &Path, e: io::Error) -> FsError {
     }
 }
 
+/// Run `f(0..n)` on up to 16 threads; the first error wins. Flushes wait on the device, so
+/// running them side by side lets it (and the filesystem journal) serve them together.
+fn in_parallel(n: usize, f: &(dyn Fn(usize) -> Result<()> + Sync)) -> Result<()> {
+    if n <= 2 {
+        return (0..n).try_for_each(f);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Option<FsError>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..n.min(16) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    if let Err(e) = f(i) {
+                        let mut slot = failed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        slot.get_or_insert(e);
+                        next.store(n, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    match failed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Real locations of confinement roots, so each check costs one query on the opened handle.
+#[cfg(windows)]
+type RootMap = std::collections::HashMap<PathBuf, (u64, PathBuf)>;
+#[cfg(windows)]
+static ROOTS: std::sync::Mutex<Option<RootMap>> = std::sync::Mutex::new(None);
+
+/// Whether `opened` (at `path`) is really somewhere outside `root`: a junction on the way led
+/// elsewhere. One query on the handle instead of checking every component before the open, and
+/// it checks the very handle that will be written through.
+#[cfg(windows)]
+fn outside_root(opened: &File, root: &Path, path: &Path) -> Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let real = crate::win::final_path(opened).map_err(err("resolving", path))?;
+    let mut roots = ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = roots.get_or_insert_with(RootMap::new);
+    let root_real = match map.get(root) {
+        Some(r) => r.clone(),
+        None => {
+            let d = OpenOptions::new()
+                .read(true)
+                .custom_flags(crate::win::FILE_FLAG_BACKUP_SEMANTICS)
+                .open(root)
+                .map_err(err("opening directory", root))?;
+            let r = crate::win::final_path(&d).map_err(err("resolving", root))?;
+            map.insert(root.to_path_buf(), r.clone());
+            r
+        }
+    };
+    let inside = real.0 == root_real.0 && real.1 != root_real.1 && real.1.starts_with(&root_real.1);
+    Ok(!inside)
+}
+
 impl FsBackend for OsFs {
     fn open(&self, path: &Path, mode: OpenMode, share: Share) -> Result<Box<dyn FileHandle>> {
+        let _prof = trunc_prof::span("fs.open");
         let file = match open_options(mode, share).open(path) {
             Ok(f) => f,
             // Opening a directory junction as a file fails with a generic access error; report
@@ -175,6 +247,44 @@ impl FsBackend for OsFs {
         finish_open(file, path, mode, share)
     }
 
+    #[cfg(windows)]
+    fn open_beneath(
+        &self,
+        root: &Path,
+        path: &Path,
+        mode: OpenMode,
+        share: Share,
+    ) -> Result<Box<dyn FileHandle>> {
+        let _prof = trunc_prof::span("fs.open");
+        crate::relative_beneath(root, path)?;
+        let file = match open_options(mode, share).open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                if let Ok(Some(Meta {
+                    kind: NodeKind::Link,
+                    ..
+                })) = self.metadata(path)
+                {
+                    return Err(FsError::Link {
+                        path: path.to_path_buf(),
+                    });
+                }
+                return Err(FsError::from_io("opening", path, e));
+            }
+        };
+        if outside_root(&file, root, path)? {
+            drop(file);
+            if mode == OpenMode::CreateNew {
+                // Created through a junction: it is ours and new, so take it back.
+                let _ = fs::remove_file(path);
+            }
+            return Err(FsError::Link {
+                path: path.to_path_buf(),
+            });
+        }
+        finish_open(file, path, mode, share)
+    }
+
     #[cfg(target_os = "linux")]
     fn open_beneath(
         &self,
@@ -183,6 +293,7 @@ impl FsBackend for OsFs {
         mode: OpenMode,
         share: Share,
     ) -> Result<Box<dyn FileHandle>> {
+        let _prof = trunc_prof::span("fs.open");
         use rustix::fs::OFlags;
         let rel = crate::relative_beneath(root, path)?;
         let flags = match mode {
@@ -202,11 +313,36 @@ impl FsBackend for OsFs {
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.create_dir");
         fs::create_dir(path).map_err(err("creating directory", path))
+    }
+
+    #[cfg(windows)]
+    fn create_dir_beneath(&self, root: &Path, path: &Path) -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _prof = trunc_prof::span("fs.create_dir");
+        crate::relative_beneath(root, path)?;
+        fs::create_dir(path).map_err(err("creating directory", path))?;
+        let d = OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                crate::win::FILE_FLAG_BACKUP_SEMANTICS | crate::win::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)
+            .map_err(err("opening directory", path))?;
+        if outside_root(&d, root, path)? {
+            drop(d);
+            let _ = fs::remove_dir(path);
+            return Err(FsError::Link {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     fn create_dir_beneath(&self, root: &Path, path: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.create_dir");
         let rel = crate::relative_beneath(root, path)?;
         match crate::linux::mkdir_beneath(root, rel) {
             Ok(true) => Ok(()),
@@ -219,6 +355,7 @@ impl FsBackend for OsFs {
     }
 
     fn flush_dir(&self, dir: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.flush_dir");
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -238,7 +375,14 @@ impl FsBackend for OsFs {
         }
     }
 
+    fn flush_all(&self, files: &[&dyn FileHandle], dirs: &[PathBuf]) -> Result<()> {
+        let _prof = trunc_prof::span("fs.flush_all");
+        in_parallel(files.len(), &|i| files[i].flush_data())?;
+        in_parallel(dirs.len(), &|i| self.flush_dir(&dirs[i]))
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.rename");
         #[cfg(windows)]
         {
             crate::win::rename_noreplace(from, to).map_err(err("renaming", from))
@@ -260,14 +404,17 @@ impl FsBackend for OsFs {
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.remove");
         fs::remove_file(path).map_err(err("removing", path))
     }
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.remove");
         fs::remove_dir(path).map_err(err("removing directory", path))
     }
 
     fn metadata(&self, path: &Path) -> Result<Option<Meta>> {
+        let _prof = trunc_prof::span("fs.metadata");
         match fs::symlink_metadata(path) {
             Ok(md) => {
                 let ft = md.file_type();
@@ -299,6 +446,7 @@ impl FsBackend for OsFs {
     }
 
     fn read_dir(&self, path: &Path) -> Result<Vec<String>> {
+        let _prof = trunc_prof::span("fs.read_dir");
         let mut names = Vec::new();
         for entry in fs::read_dir(path).map_err(err("listing", path))? {
             let entry = entry.map_err(err("listing", path))?;
@@ -309,6 +457,13 @@ impl FsBackend for OsFs {
     }
 
     fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let _prof = trunc_prof::span("fs.set_mode");
+        // Windows keeps only a read-only flag. Files trunc writes are writable already, so a
+        // mode with any write bit changes nothing and needs no calls.
+        #[cfg(windows)]
+        if mode & 0o222 != 0 {
+            return Ok(());
+        }
         if self.metadata(path)?.map(|m| m.kind) == Some(NodeKind::Link) {
             return Err(FsError::Link {
                 path: path.to_path_buf(),
@@ -331,6 +486,7 @@ impl FsBackend for OsFs {
     }
 
     fn probe_volume(&self, path: &Path) -> Result<VolumeInfo> {
+        let _prof = trunc_prof::span("fs.probe_volume");
         let at = existing_ancestor(path)?;
         let sync = crate::sync::detect_sync(&at);
         #[cfg(windows)]
@@ -520,6 +676,7 @@ impl FileHandle for OsFile {
     }
 
     fn read_exact_at(&self, mut buf: &mut [u8], mut off: u64) -> Result<()> {
+        let _prof = trunc_prof::span("fs.read").bytes(buf.len() as u64);
         while !buf.is_empty() {
             match read_at(&self.file, buf, off) {
                 Ok(0) => {
@@ -542,6 +699,7 @@ impl FileHandle for OsFile {
 
     #[cfg(any(windows, target_os = "linux"))]
     fn read_back(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        let _prof = trunc_prof::span("fs.read_back").bytes(buf.len() as u64);
         let mut guard = self
             .uncached
             .lock()
@@ -572,6 +730,7 @@ impl FileHandle for OsFile {
     }
 
     fn write_all_at(&self, mut buf: &[u8], mut off: u64) -> Result<()> {
+        let _prof = trunc_prof::span("fs.write").bytes(buf.len() as u64);
         while !buf.is_empty() {
             match write_at(&self.file, buf, off) {
                 Ok(0) => {
@@ -601,6 +760,7 @@ impl FileHandle for OsFile {
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
+        let _prof = trunc_prof::span("fs.set_len");
         #[cfg(windows)]
         let shrinking = len < self.size()?;
         self.file.set_len(len).map_err(self.e("resizing"))?;
@@ -612,6 +772,7 @@ impl FileHandle for OsFile {
     }
 
     fn preallocate(&self, len: u64) -> Result<()> {
+        let _prof = trunc_prof::span("fs.preallocate");
         let size = self.size()?;
         if len <= size {
             return Ok(());
@@ -626,10 +787,12 @@ impl FileHandle for OsFile {
     }
 
     fn flush_data(&self) -> Result<()> {
+        let _prof = trunc_prof::span("fs.flush");
         self.file.sync_data().map_err(self.e("flushing"))
     }
 
     fn deallocate(&self, start: u64, end: u64) -> Result<Dealloc> {
+        let _prof = trunc_prof::span("fs.deallocate").bytes(end.saturating_sub(start));
         if start >= end {
             return Ok(Dealloc::Freed {
                 freed: start..start,
@@ -674,6 +837,7 @@ impl FileHandle for OsFile {
     }
 
     fn allocated_ranges(&self) -> Result<Vec<Range<u64>>> {
+        let _prof = trunc_prof::span("fs.allocated_ranges");
         let len = self.size()?;
         #[cfg(windows)]
         {
@@ -720,6 +884,7 @@ impl FileHandle for OsFile {
     }
 
     fn set_modified(&self, t: SystemTime) -> Result<()> {
+        let _prof = trunc_prof::span("fs.set_modified");
         self.file
             .set_modified(t)
             .map_err(self.e("setting mtime of"))

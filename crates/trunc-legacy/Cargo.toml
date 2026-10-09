@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+trunc-prof.workspace = true
 trunc-core.workspace = true
 trunc-fs.workspace = true
 crc32fast.workspace = true

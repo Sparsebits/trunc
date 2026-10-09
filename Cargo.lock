@@ -971,6 +971,7 @@ dependencies = [
  "trunc-engine",
  "trunc-fs",
  "trunc-legacy",
+ "trunc-prof",
  "trunc-testkit",
 ]
 
@@ -1017,6 +1018,7 @@ dependencies = [
  "trunc-hash",
  "trunc-journal",
  "trunc-legacy",
+ "trunc-prof",
  "trunc-testkit",
  "unicode-normalization",
 ]
@@ -1028,6 +1030,7 @@ dependencies = [
  "rustix",
  "tempfile",
  "thiserror",
+ "trunc-prof",
  "windows-sys 0.59.0",
 ]
 
@@ -1048,6 +1051,7 @@ dependencies = [
  "thiserror",
  "trunc-fs",
  "trunc-hash",
+ "trunc-prof",
  "trunc-testkit",
 ]
 
@@ -1062,9 +1066,14 @@ dependencies = [
  "thiserror",
  "trunc-core",
  "trunc-fs",
+ "trunc-prof",
  "trunc-testkit",
  "unicode-normalization",
 ]
+
+[[package]]
+name = "trunc-prof"
+version = "0.1.0"
 
 [[package]]
 name = "trunc-testkit"

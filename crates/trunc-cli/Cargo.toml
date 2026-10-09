@@ -13,6 +13,7 @@ name = "trunc"
 path = "src/main.rs"
 
 [dependencies]
+trunc-prof.workspace = true
 trunc-chunk.workspace = true
 trunc-codec.workspace = true
 trunc-core.workspace = true

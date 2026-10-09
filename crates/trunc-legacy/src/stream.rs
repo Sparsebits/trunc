@@ -239,6 +239,12 @@ pub fn decode(
     sink: &mut Sink<'_>,
     on_point: &mut OnPoint<'_>,
 ) -> Result<StreamEnd> {
+    let _prof = trunc_prof::span(match codec {
+        Codec::Gzip => "decode.gzip",
+        Codec::Bzip2 => "decode.bzip2",
+        Codec::Xz => "decode.xz",
+        Codec::Zstd => "decode.zstd",
+    });
     match codec {
         Codec::Gzip => crate::gzip::decode(input, start, limits, every, sink, on_point),
         Codec::Bzip2 => crate::bzip2::decode(input, start, limits, every, sink, on_point),

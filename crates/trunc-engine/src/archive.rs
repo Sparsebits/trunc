@@ -196,7 +196,8 @@ impl Archive {
         let f = self.read_footer(i)?;
         let mut payload = vec![0u8; len_usize(f.c_len)];
         self.handle.read_exact_at(&mut payload, self.offsets[i])?;
-        if trunc_hash::blake3(&payload) != f.blake3_c {
+        let hash = trunc_prof::time("hash.blake3", || trunc_hash::blake3(&payload));
+        if hash != f.blake3_c {
             return Err(Error::Integrity(format!("block {i} payload hash mismatch")));
         }
         Ok(payload)
@@ -204,12 +205,16 @@ impl Archive {
 
     /// Read, verify and decompress block `i`, checking the decoded BLAKE3.
     pub fn decode_block(&self, i: usize) -> Result<Vec<u8>> {
-        let payload = self.read_payload(i)?;
         let b = &self.manifest().blocks[i];
+        let _prof = trunc_prof::span("trnc.block").bytes(b.u_len);
+        let payload = self.read_payload(i)?;
         let codec = trunc_core::CodecId::try_from(b.codec)?;
         let mut out = vec![0u8; len_usize(b.u_len)];
-        trunc_codec::decompress(codec, &payload, &mut out, self.dict.as_ref())?;
-        if trunc_hash::blake3(&out) != b.blake3_u {
+        trunc_prof::time("trnc.decompress", || {
+            trunc_codec::decompress(codec, &payload, &mut out, self.dict.as_ref())
+        })?;
+        let hash = trunc_prof::time("hash.blake3", || trunc_hash::blake3(&out));
+        if hash != b.blake3_u {
             return Err(Error::Integrity(format!("block {i} decoded hash mismatch")));
         }
         Ok(out)

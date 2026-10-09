@@ -436,6 +436,8 @@ impl Inflater {
         let mut br = BitReader::new(src, base, len, self.start_bit)?;
         let mut fixed: Option<(Huffman, Huffman)> = None;
         loop {
+            let mut prof = trunc_prof::span("inflate.block");
+            let before = self.total;
             let last = br.get(1)? == 1;
             match br.get(2)? {
                 0 => self.stored(&mut br)?,
@@ -450,6 +452,8 @@ impl Inflater {
                 }
                 _ => return Err(InflateError::Corrupt("invalid block type")),
             }
+            prof.add_bytes(self.total - before);
+            drop(prof);
             if self.out.len() - self.flushed >= FLUSH_AT {
                 self.emit(sink)?;
             }

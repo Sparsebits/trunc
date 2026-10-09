@@ -257,6 +257,18 @@ pub trait FsBackend: Send + Sync + Debug {
     }
     /// Make directory entries created, renamed or removed in `dir` durable.
     fn flush_dir(&self, dir: &Path) -> Result<()>;
+    /// Make the data of every file in `files`, then the entries of every directory in `dirs`,
+    /// durable. The OS backend flushes in parallel, which lets the drive and the filesystem
+    /// journal combine the work; the result is the same as flushing one by one.
+    fn flush_all(&self, files: &[&dyn FileHandle], dirs: &[PathBuf]) -> Result<()> {
+        for f in files {
+            f.flush_data()?;
+        }
+        for d in dirs {
+            self.flush_dir(d)?;
+        }
+        Ok(())
+    }
     /// Rename without replacing: fails with [`FsError::AlreadyExists`] if `to` exists.
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
@@ -318,4 +330,24 @@ pub fn check_beneath<F: FsBackend + ?Sized>(fs: &F, root: &Path, path: &Path) ->
         }
     }
     Ok(())
+}
+
+/// Close (drop) `items` on several threads and wait. Closing a file can take a fraction of a
+/// millisecond on Windows (antivirus and indexers look at it), so closing thousands one after
+/// another adds up; nothing about durability depends on the order.
+pub fn close_all<T: Send>(items: Vec<T>) {
+    let _prof = trunc_prof::span("fs.close");
+    if items.len() <= 8 {
+        drop(items);
+        return;
+    }
+    let threads = items.len().div_ceil(64).min(16);
+    let per = items.len().div_ceil(threads);
+    let mut items = items;
+    std::thread::scope(|s| {
+        while !items.is_empty() {
+            let chunk: Vec<T> = items.split_off(items.len().saturating_sub(per));
+            s.spawn(move || drop(chunk));
+        }
+    });
 }

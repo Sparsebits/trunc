@@ -18,8 +18,16 @@ change the command line; the `.trnc` v1 format is frozen.
   file, for every format. With `--consume`, compressed tarballs and files delete each part once
   its data is extracted, which frees space even on FAT32 and exFAT.
 - `--max-window` (default 256M) refuses xz and zstd archives whose decoder would need more memory.
+- `--profile FILE` (or `TRUNC_PROFILE`) on any command prints where the time went (self and
+  total time, bytes and throughput per span) and writes a Chrome trace for Perfetto.
 
 ### Changed
+- Faster with many small files: outputs and directories are flushed to disk in parallel,
+  Windows checks each opened output's real location instead of every path component (fewer
+  calls, and nothing can be written through a junction), and redundant metadata lookups,
+  preallocations and gap-log writes are gone. Consuming a tarball of 4,000 small files went from
+  7.0 s to 2.2 s on Windows; `.trnc` consume and extract of large files are about 1.4x faster.
+- Decoders: zstd about 40% faster, xz about 15% (sliced CRC-64), bzip2's CRC sliced too.
 - On Linux and macOS, tar and ZIP entries may use names that only Windows forbids (backslashes,
   colons, trailing dots, `CON`), and on Linux names that differ only in case are separate files.
   Real Linux tarballs, including the kernel source, failed before. Windows keeps the portable
