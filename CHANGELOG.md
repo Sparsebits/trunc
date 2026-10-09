@@ -4,35 +4,6 @@ All notable changes to trunc. The format follows [Keep a Changelog](https://keep
 and versions follow [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
 change the command line; the `.trnc` v1 format is frozen.
 
-## [Unreleased]
-
-### Added
-- `.tar.gz` support: `trunc x --consume` frees the compressed bytes from the front of the
-  archive as they are decoded, after a read-only pass has checked every gzip CRC, tar header and
-  name. Each 64 MiB stretch of output must hash as it did in that pass before its compressed
-  bytes are released. `x`, `inspect`, `verify`, `plan` and `resume` all handle `.tar.gz`
-  (ustar, GNU long names, PAX, base-256 sizes, several gzip members).
-
-### Fixed
-- A run resumed after a pause or kill could release archive bytes while directory entries
-  created by the interrupted run were still unflushed; a power cut right after could lose those
-  files. Resumed runs now flush the whole staging tree before releasing anything.
-- `--require-signed` and `--trust-key` were silently ignored for ZIP input (a ZIP renamed to
-  `.trnc` passed them). They are now refused for ZIP and `.tar.gz`.
-- Entries whose names the filesystem folds together (8.3 short names such as `LONGFI~1.TXT`,
-  Unicode case variants) could be merged into one output. Such outputs are now refused.
-- A top-level symlink entry made a crash after the rename phase unrecoverable.
-- File times outside 1601–9999 (or crafted values) could panic; they are now clamped.
-- Filesystems trunc cannot identify (network shares, FUSE, WSL's view of Windows drives) now
-  block `--consume` unless `--allow-unjournaled` is given, as ADR-0010 intended.
-- With `--allow-symlinks`, a symlink could escape the destination through another symlink entry.
-- ZIP punch mode now compares each checkpoint with the verification pass before freeing bytes.
-- `trunc resume` refuses archives that were never started instead of starting a fresh consume.
-- Entries named like trunc's own sidecar files next to the archive are refused up front.
-- Resuming with a destination that differs only in case (Windows) or is not valid UTF-8 works.
-- `install.ps1` refuses Windows 10 on ARM (it cannot run the x64 build) and treats
-  `TRUNC_NO_MODIFY_PATH=0` as unset.
-
 ## [0.1.0] - 2026-10-09
 
 The first release.
@@ -64,13 +35,26 @@ The first release.
   saves its position every 64 MiB of output.
 - Overlapping entries (a zip-bomb technique) are refused unless you pass `--allow-overlap`.
 
+### Existing .tar.gz files
+- `trunc x big.tar.gz --consume` frees the compressed bytes from the front of the archive as
+  they are decoded. A read-only pass first checks every gzip CRC, tar header and name; each
+  64 MiB stretch of output must then hash as it did in that pass before its compressed bytes are
+  released.
+- `x`, `inspect`, `verify`, `plan` and `resume` all handle `.tar.gz`: ustar, GNU long names, PAX,
+  base-256 sizes and several gzip members. Hard links, sparse files and multi-volume archives are
+  refused for now; symlinks and device entries are skipped.
+
 ### Safety checks
 - Hostile paths are refused: absolute paths, `..`, drive letters, device names, alternate data
   streams. Links are never followed when writing, and outputs that are hard links to the archive
-  are refused.
+  are refused. Entries whose names the filesystem would fold together (8.3 short names, case
+  variants) are refused instead of merged.
 - Destructive mode refuses archives in OneDrive, Dropbox, Google Drive or iCloud folders, and on
-  FAT32 and exFAT (override with `--allow-sync` or `--allow-unjournaled`). It warns about
-  snapshots, which keep freed space allocated.
+  FAT32, exFAT and filesystems it cannot identify such as network shares and FUSE (override with
+  `--allow-sync` or `--allow-unjournaled`). It warns about snapshots, which keep freed space
+  allocated.
+- `--require-signed` and `--trust-key` apply to `.trnc` only; they are refused for ZIP and
+  `.tar.gz`, which carry no signatures.
 
 ### Platforms
 - Windows (NTFS) and Linux (ext4, XFS, btrfs, ZFS), both with every feature. Prebuilt binaries
@@ -79,5 +63,4 @@ The first release.
 - Install scripts: `install.sh` (Linux) and `install.ps1` (Windows). Both verify the download's
   SHA-256 before installing.
 
-[Unreleased]: https://github.com/Sparsebits/trunc/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Sparsebits/trunc/releases/tag/v0.1.0
