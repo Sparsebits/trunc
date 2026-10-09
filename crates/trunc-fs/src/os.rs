@@ -724,6 +724,14 @@ impl FileHandle for OsFile {
             .set_modified(t)
             .map_err(self.e("setting mtime of"))
     }
+
+    fn modified(&self) -> Result<Option<SystemTime>> {
+        let m = self
+            .file
+            .metadata()
+            .map_err(self.e("reading metadata of"))?;
+        Ok(m.modified().ok())
+    }
 }
 
 /// The largest unallocated sub-range of `[start, end)` given the allocated ranges.

@@ -1,4 +1,5 @@
-//! `trunc x --consume` and `trunc resume`, for `.trnc`, ZIP and `.tar.gz` archives.
+//! `trunc x --consume` and `trunc resume`, for `.trnc`, ZIP, compressed tarballs and compressed
+//! files.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -11,11 +12,12 @@ use trunc_core::space::SpaceParams;
 use trunc_engine::consume::{self, ConsumeOptions, Progress, RetryPolicy};
 use trunc_engine::extract::TrustPolicy;
 use trunc_engine::preflight::{Finding, Severity};
-use trunc_engine::tgzconsume;
+use trunc_engine::streamconsume::{self, StreamOptions};
 use trunc_engine::zipconsume::{self, PunchPolicy, ZipOptions};
 use trunc_engine::{Error, PauseReason};
 use trunc_fs::OsFs;
 
+use crate::Kind;
 use crate::fmt::{bytes, parse_size};
 
 /// Exit code for a safe pause (EX_TEMPFAIL): resume later, nothing was lost.
@@ -55,13 +57,14 @@ pub struct ConsumeFlags {
     /// ZIP: compressed size from which entries are punched while decompressing.
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     pub punch_min: u64,
-    /// ZIP and tar.gz: output bytes between checkpoints that free compressed data.
+    /// ZIP and compressed tarballs and files: output bytes between checkpoints that free
+    /// compressed data.
     #[arg(long, default_value = "64M", value_parser = parse_size)]
     pub checkpoint_every: u64,
 }
 
 impl ConsumeFlags {
-    fn options(&self, trust: TrustPolicy, threads: usize) -> ConsumeOptions {
+    fn options(&self, stream: StreamOptions, trust: TrustPolicy, threads: usize) -> ConsumeOptions {
         ConsumeOptions {
             trust,
             threads,
@@ -85,21 +88,20 @@ impl ConsumeFlags {
                 punch_min: self.punch_min,
                 checkpoint_every: self.checkpoint_every,
             },
+            stream,
         }
     }
 }
 
-fn confirm(archive: &Path, dest: &Path, legacy: Option<&str>) -> Result<bool> {
+fn confirm(archive: &Path, dest: &Path, kind: Kind) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!(
             "--consume destroys the archive; pass --yes to confirm when not running interactively"
         );
     }
-    let legacy_note = match legacy {
-        Some(kind) => {
-            format!("Other {kind} tools cannot open the file once the first step has run.\n")
-        }
-        None => String::new(),
+    let legacy_note = match kind {
+        Kind::Trnc => String::new(),
+        kind => format!("Other {kind} tools cannot open the file once the first step has run.\n"),
     };
     eprint!(
         "--consume destroys {} while extracting into {}.\n\
@@ -118,23 +120,32 @@ pub fn run(
     archive: &Path,
     dest: &Path,
     flags: &ConsumeFlags,
+    stream: &StreamOptions,
     trust: TrustPolicy,
     threads: usize,
 ) -> Result<ExitCode> {
     let fs = OsFs::new();
-    let legacy = crate::legacy_kind(archive);
-    if let Some(kind) = legacy {
-        crate::refuse_trust_flags(&trust, kind)?;
+    let kind = Kind::detect(archive, stream.raw);
+    crate::refuse_trust_flags(&trust, kind)?;
+    if stream.raw && !matches!(kind, Kind::Stream(..)) {
+        bail!("--raw applies only to compressed tarballs");
     }
-    if !flags.yes && !confirm(archive, dest, legacy)? {
+    if !matches!(kind, Kind::Stream(..))
+        && trunc_engine::source::split_parts(&fs, archive)?.is_some()
+    {
+        bail!(
+            "--consume does not support split {kind} archives yet; extract without --consume,              or join the parts into one file first"
+        );
+    }
+    if !flags.yes && !confirm(archive, dest, kind)? {
         eprintln!("cancelled; nothing was changed");
         return Ok(ExitCode::FAILURE);
     }
-    let opts = flags.options(trust, threads);
-    let unit = match legacy {
-        Some("ZIP") => "entries",
-        Some(_) => "checkpoints",
-        None => "blocks",
+    let opts = flags.options(*stream, trust, threads);
+    let unit = match kind {
+        Kind::Zip => "entries",
+        Kind::Stream(..) => "checkpoints",
+        Kind::Trnc => "blocks",
     };
     let tty = std::io::stderr().is_terminal();
     let t = Instant::now();
@@ -168,10 +179,10 @@ pub fn run(
             eprintln!("all {unit} consumed; moving files into place");
         }
     };
-    let result = match legacy {
-        Some("ZIP") => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
-        Some(_) => tgzconsume::consume_tgz(&fs, archive, dest, &opts, &mut progress),
-        None => consume::consume(&fs, archive, dest, &opts, &mut progress),
+    let result = match kind {
+        Kind::Zip => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
+        Kind::Stream(..) => streamconsume::consume_stream(&fs, archive, dest, &opts, &mut progress),
+        Kind::Trnc => consume::consume(&fs, archive, dest, &opts, &mut progress),
     };
     match result {
         Ok(s) => {
@@ -211,7 +222,11 @@ pub fn run(
                 Some(r) => println!("archive   consumed; receipt kept at {}", r.display()),
                 None => println!("archive   consumed and removed"),
             }
-            let steps = if legacy.is_some() { "steps" } else { "batches" };
+            let steps = if kind == Kind::Trnc {
+                "batches"
+            } else {
+                "steps"
+            };
             println!(
                 "time      {:.2}s ({} {steps})",
                 t.elapsed().as_secs_f64(),
@@ -246,12 +261,12 @@ pub fn run(
 }
 
 /// Destination for `trunc resume`: the explicit one, else the one recorded when consumption
-/// started (ZIP or tar.gz journal, or `.trnc` resume note). Refuses archives that were never
+/// started (journal, or `.trnc` resume note). Refuses archives that were never
 /// started, so `resume` cannot begin a fresh destructive run by accident.
 pub fn resume_dest(archive: &Path, dest: Option<PathBuf>) -> Result<PathBuf> {
     let fs = OsFs::new();
     let recorded = zipconsume::journal_dest(&fs, archive)
-        .or_else(|| tgzconsume::journal_dest(&fs, archive))
+        .or_else(|| streamconsume::journal_dest(&fs, archive))
         .or_else(|| consume::read_resume_note(&fs, archive).map(|n| n.dest));
     let started =
         recorded.is_some() || trunc_engine::Archive::open(archive).is_ok_and(|a| a.consumed() > 0);

@@ -70,8 +70,11 @@ pub struct ConsumeOptions {
     /// Keep the archive's remaining header + manifest as `<archive>.receipt`.
     pub keep_receipt: bool,
     pub retry: RetryPolicy,
-    /// ZIP-specific settings (ignored for `.trnc`).
+    /// ZIP-specific settings (ignored for `.trnc`). The checkpoint interval also applies to
+    /// compressed tarballs and files.
     pub zip: crate::zipconsume::ZipOptions,
+    /// Settings for compressed tarballs and files.
+    pub stream: crate::streamconsume::StreamOptions,
     /// Before releasing source bytes, read the outputs back bypassing the OS cache and check
     /// them (costs one extra read of everything written).
     pub verify_media: bool,
@@ -89,6 +92,7 @@ impl Default for ConsumeOptions {
             keep_receipt: true,
             retry: RetryPolicy::default(),
             zip: crate::zipconsume::ZipOptions::default(),
+            stream: crate::streamconsume::StreamOptions::default(),
             verify_media: false,
         }
     }
@@ -402,7 +406,7 @@ fn consume_blocks(
     let protected = [archive.handle().file_id()?];
     let guard = StageGuard {
         root: stage,
-        protected: &protected,
+        protected: &|id| protected.contains(id),
     };
     let mut hashers: HashMap<usize, trunc_hash::Blake3Hasher> = HashMap::new();
 

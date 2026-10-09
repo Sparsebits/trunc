@@ -375,6 +375,14 @@ fn unjournaled_volumes_need_consent() {
 }
 
 fn write_tgz(path: &Path, seed: u64) -> Vec<(String, Vec<u8>)> {
+    write_tarball(path, seed, |t| trunc_testkit::tarbuild::gzip(t, 6))
+}
+
+/// A fixture encoder.
+type Encode = fn(&[u8]) -> Vec<u8>;
+
+/// The fixture tarball's files, written compressed with `enc`.
+fn write_tarball(path: &Path, seed: u64, enc: fn(&[u8]) -> Vec<u8>) -> Vec<(String, Vec<u8>)> {
     use trunc_testkit::tarbuild::{self, Spec};
     let mut rng = trunc_testkit::Rng::new(seed);
     let files = vec![
@@ -393,8 +401,71 @@ fn write_tgz(path: &Path, seed: u64) -> Vec<(String, Vec<u8>)> {
         ("top.txt".to_string(), b"top level".to_vec()),
     ];
     let specs: Vec<Spec> = files.iter().map(|(n, d)| Spec::file(n, d)).collect();
-    std::fs::write(path, tarbuild::gzip(&tarbuild::tar(&specs), 6)).unwrap();
+    std::fs::write(path, enc(&tarbuild::tar(&specs))).unwrap();
     files
+}
+
+/// The compressed formats besides gzip: suffix, label `inspect` prints, encoder.
+fn stream_formats() -> Vec<(&'static str, &'static str, Encode)> {
+    use trunc_testkit::tarbuild;
+    vec![
+        ("bz2", "bzip2", |d| tarbuild::bzip2(d, 1)),
+        ("xz", "xz", |d| tarbuild::xz(d, 6)),
+        ("zst", "zstd", |d| tarbuild::zstd(d, 3)),
+    ]
+}
+
+#[test]
+fn every_compressed_format_through_the_cli() {
+    for (ext, codec, enc) in stream_formats() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        let arc = format!("a.tar.{ext}");
+        let files = write_tarball(&w.join(&arc), 3, enc);
+        let s = ok(&trunc(&["inspect", &arc, "--entries"], w));
+        assert!(s.contains(&format!("(tar.{ext})")), "{s}");
+        let s = ok(&trunc(&["verify", &arc], w));
+        assert!(s.starts_with("ok:") && s.contains(codec), "{s}");
+        let s = ok(&trunc(&["plan", &arc, "-C", "out"], w));
+        assert!(s.contains("consume (--consume)"), "{s}");
+        ok(&trunc(&["x", &arc, "-C", "copy"], w));
+        assert_files(&w.join("copy"), &files);
+        let s = ok(&trunc(&["x", &arc, "-C", "out", "--consume", "--yes"], w));
+        assert!(s.contains("consumed and removed"), "{s}");
+        assert_files(&w.join("out"), &files);
+        assert!(!w.join(&arc).exists() && !w.join(format!("{arc}.trncj")).exists());
+        assert!(
+            !w.join(format!("{arc}.trncg")).exists(),
+            "gap log left behind"
+        );
+
+        // A single compressed file becomes one file named without the suffix.
+        let data = files[1].1.clone();
+        let single = format!("big.log.{ext}");
+        std::fs::write(w.join(&single), enc(&data)).unwrap();
+        let s = ok(&trunc(&["inspect", &single], w));
+        assert!(
+            s.contains(&format!("{codec} file")) && s.contains("big.log"),
+            "{s}"
+        );
+        ok(&trunc(
+            &["x", &single, "-C", "one", "--consume", "--yes"],
+            w,
+        ));
+        assert_eq!(std::fs::read(w.join("one/big.log")).unwrap(), data);
+        assert!(!w.join(&single).exists());
+
+        // --raw keeps a tarball whole.
+        let raw = format!("r.tar.{ext}");
+        write_tarball(&w.join(&raw), 3, enc);
+        let tar = {
+            use trunc_testkit::tarbuild::{self, Spec};
+            let specs: Vec<Spec> = files.iter().map(|(n, d)| Spec::file(n, d)).collect();
+            tarbuild::tar(&specs)
+        };
+        ok(&trunc(&["x", &raw, "-C", "raw", "--raw"], w));
+        assert_eq!(std::fs::read(w.join("raw/r.tar")).unwrap(), tar);
+    }
 }
 
 #[test]
@@ -428,13 +499,27 @@ fn tgz_inspect_verify_plan_extract_consume() {
 /// Kill a tar.gz consume at arbitrary points; `trunc resume` must finish with identical files.
 #[test]
 fn killed_tgz_consume_resumes() {
+    killed_stream_consume_resumes("gz", |t| trunc_testkit::tarbuild::gzip(t, 6));
+}
+
+/// The same for the formats whose window is read back from the output on resume.
+#[test]
+fn killed_xz_and_zstd_consumes_resume() {
+    killed_stream_consume_resumes("xz", |t| trunc_testkit::tarbuild::xz(t, 6));
+    killed_stream_consume_resumes("zst", |t| trunc_testkit::tarbuild::zstd(t, 3));
+}
+
+fn killed_stream_consume_resumes(ext: &str, enc: Encode) {
+    let arc = format!("a.tar.{ext}");
+    let arc = arc.as_str();
+    let journal = format!("{arc}.trncj");
     for (round, delay_ms) in [10u64, 60, 150, 400].into_iter().enumerate() {
         let d = tempfile::tempdir().unwrap();
         let w = d.path();
-        let files = write_tgz(&w.join("a.tar.gz"), 20 + round as u64);
+        let files = write_tarball(&w.join(arc), 20 + round as u64, enc);
         let flags = ["--yes", "--checkpoint-every", "64K"];
         let mut child = Command::new(env!("CARGO_BIN_EXE_trunc"))
-            .args([&["x", "a.tar.gz", "-C", "out", "--consume"][..], &flags].concat())
+            .args([&["x", arc, "-C", "out", "--consume"][..], &flags].concat())
             .current_dir(w)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -443,22 +528,26 @@ fn killed_tgz_consume_resumes() {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let _ = child.kill();
         let _ = child.wait();
-        if w.join("a.tar.gz.trncj").exists() {
-            ok(&trunc(&[&["resume", "a.tar.gz"][..], &flags].concat(), w));
-        } else if w.join("a.tar.gz").exists() {
+        if w.join(&journal).exists() {
+            ok(&trunc(&[&["resume", arc][..], &flags].concat(), w));
+        } else if w.join(arc).exists() {
             ok(&trunc(
-                &[&["x", "a.tar.gz", "-C", "out", "--consume"][..], &flags].concat(),
+                &[&["x", arc, "-C", "out", "--consume"][..], &flags].concat(),
                 w,
             ));
         }
         assert_files(&w.join("out"), &files);
         assert!(
-            !w.join("a.tar.gz").exists(),
-            "round {round}: archive left behind"
+            !w.join(arc).exists(),
+            "{arc} round {round}: archive left behind"
         );
         assert!(
-            !w.join("a.tar.gz.trncj").exists(),
-            "round {round}: journal left behind"
+            !w.join(&journal).exists(),
+            "{arc} round {round}: journal left behind"
+        );
+        assert!(
+            !w.join(format!("{arc}.trncg")).exists(),
+            "{arc} round {round}: gap log left behind"
         );
     }
 }
@@ -495,4 +584,98 @@ fn signature_flags_are_refused_for_unsigned_formats() {
         }
         assert!(w.join(arc).exists(), "{arc} was not touched");
     }
+}
+
+/// Split `path` into `{path}.001`, `{path}.002`, … (or `.aa`, `.ab`, … with `letters`) and
+/// remove the original. Returns the first part's file name.
+fn split_file(path: &Path, part: usize, letters: bool) -> String {
+    let bytes = std::fs::read(path).unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap().to_string();
+    let mut first = String::new();
+    for (i, p) in trunc_testkit::tarbuild::split(&bytes, part)
+        .iter()
+        .enumerate()
+    {
+        let suffix = if letters {
+            let i = u8::try_from(i).unwrap();
+            format!("{}{}", char::from(b'a' + i / 26), char::from(b'a' + i % 26))
+        } else {
+            format!("{:03}", i + 1)
+        };
+        let n = format!("{name}.{suffix}");
+        std::fs::write(path.with_file_name(&n), p).unwrap();
+        if i == 0 {
+            first = n;
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+    first
+}
+
+#[test]
+fn split_tarballs_through_the_cli() {
+    for (letters, ext, enc) in [
+        (
+            false,
+            "zst",
+            (|t| trunc_testkit::tarbuild::zstd(t, 3)) as Encode,
+        ),
+        (true, "gz", |t| trunc_testkit::tarbuild::gzip(t, 6)),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        let files = write_tarball(&w.join(format!("a.tar.{ext}")), 5, enc);
+        let first = split_file(&w.join(format!("a.tar.{ext}")), 400_000, letters);
+        let s = ok(&trunc(&["inspect", &first], w));
+        assert!(s.contains(&format!("(tar.{ext})")), "{s}");
+        ok(&trunc(&["verify", &first], w));
+        ok(&trunc(&["x", &first, "-C", "copy"], w));
+        assert_files(&w.join("copy"), &files);
+        // Naming a later part points at the first.
+        let second = if letters {
+            "a.tar.gz.ab".to_string()
+        } else {
+            "a.tar.zst.002".into()
+        };
+        let out = trunc(&["x", &second, "-C", "never"], w);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("pass the first part"));
+
+        let s = ok(&trunc(&["x", &first, "-C", "out", "--consume", "--yes"], w));
+        assert!(s.contains("consumed and removed"), "{s}");
+        assert_files(&w.join("out"), &files);
+        let left: Vec<_> = std::fs::read_dir(w)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("a.tar."))
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+}
+
+#[test]
+fn split_zip_and_trnc_are_readable_but_not_consumed() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let files = write_zip(&w.join("a.zip"), 6);
+    let first = split_file(&w.join("a.zip"), 700_000, false);
+    assert!(ok(&trunc(&["verify", &first], w)).starts_with("ok:"));
+    ok(&trunc(&["x", &first, "-C", "zcopy"], w));
+    assert_files(&w.join("zcopy"), &files);
+    let out = trunc(&["x", &first, "-C", "zout", "--consume", "--yes"], w);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("split ZIP"));
+    assert!(w.join(&first).exists());
+
+    fixtures::mixed(&w.join("data"), 7);
+    ok(&trunc(
+        &["create", "d.trnc", "data", "--block-size", "64K"],
+        w,
+    ));
+    let first = split_file(&w.join("d.trnc"), 150_000, false);
+    assert!(ok(&trunc(&["verify", &first], w)).starts_with("ok:"));
+    ok(&trunc(&["x", &first, "-C", "tcopy"], w));
+    trunc_testkit::tree::assert_same(&w.join("data"), &w.join("tcopy").join("data"));
+    let out = trunc(&["x", &first, "-C", "tout", "--consume", "--yes"], w);
+    assert!(!out.status.success());
 }

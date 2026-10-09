@@ -21,7 +21,7 @@
   <a href="#how-it-works">How it works</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="#zip-files">ZIP</a> ·
-  <a href="#targz-files">.tar.gz</a> ·
+  <a href="#compressed-tarballs-and-files">.tar.gz, .tar.zst, .xz</a> ·
   <a href="docs/guide.md">User guide</a>
 </p>
 
@@ -33,8 +33,10 @@ An ordinary extractor keeps the whole archive on disk until it finishes, so turn
 archive into 10 GB of files needs 10 GB free. trunc deletes each part of the archive as soon as
 the files from that part are safely on disk, so the same job needs a little over 4 GB.
 
-It reads its own `.trnc` format and the ZIP and `.tar.gz` files you already have. If the power
-goes out halfway, nothing is lost: run `trunc resume` and it carries on from where it stopped.
+It reads its own `.trnc` format and the files you already have: ZIP, tarballs compressed with
+gzip, bzip2, xz or zstd, single compressed files like `disk.img.xz`, and archives split into
+`.001`, `.002`, … parts. If the power goes out halfway, nothing is lost: run `trunc resume` and
+it carries on from where it stopped.
 
 ## Highlights
 
@@ -43,9 +45,9 @@ goes out halfway, nothing is lost: run `trunc resume` and it carries on from whe
   written and flushed to disk.
 - **Plans first.** `trunc plan` tells you how much space each mode needs, and warns about cloud-sync
   folders, snapshots and filesystems where destructive extraction is unsafe.
-- **Works on ZIP and .tar.gz.** ZIP with Stored and Deflate entries, including Zip64, and
-  `.tar.gz` from GNU tar, bsdtar and friends. Both give back space while they decompress, not
-  just when each file finishes.
+- **Works on the archives you have.** ZIP (Stored and Deflate, Zip64), `.tar.gz`, `.tar.bz2`,
+  `.tar.xz` and `.tar.zst`, single compressed files, and split archives. All of them give back
+  space while they decompress, not just when each file finishes.
 - **Checks everything.** Every block is hashed, and archives can be signed. Nothing is deleted until
   the output that replaces it has been verified.
 - **Fast.** Blocks decompress in parallel at over 1 GiB/s.
@@ -65,7 +67,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Spa
 ```
 
 Both scripts download the latest release, check its SHA-256, and install `trunc` to `~/.local/bin`
-or `%LOCALAPPDATA%\Programs	runc`. Set `TRUNC_VERSION=v0.1.0` to pin a version. You can also
+or `%LOCALAPPDATA%\Programs\trunc`. Set `TRUNC_VERSION=v0.1.0` to pin a version. You can also
 download the archives yourself from [Releases](https://github.com/Sparsebits/trunc/releases), or
 build from source with Rust 1.85 or newer:
 
@@ -218,19 +220,35 @@ those bytes stop taking up disk space.
 From the first deletion on, other tools can no longer open the ZIP. trunc tells you this before
 it starts.
 
-## .tar.gz files
+## Compressed tarballs and files
 
-A gzip stream can only be decompressed from the start, so trunc frees a `.tar.gz` from the front:
+A compressed stream can only be decoded from the start, so trunc frees `.tar.gz`, `.tar.bz2`,
+`.tar.xz` and `.tar.zst` archives from the front:
 
-1. It decompresses the whole archive once, writing nothing. This checks every gzip checksum and
-   tar header, validates every file name, and records a hash of each 64 MiB stretch of output.
+1. It decompresses the whole archive once, writing nothing. This checks every checksum and tar
+   header, validates every file name, and records a hash of each 64 MiB stretch of output.
 2. It decompresses again, this time writing files. Every 64 MiB it flushes the files, checks that
    the stretch it just wrote hashes the same as in step 1, saves its position in a journal, and
    releases the compressed bytes it has used.
 
+Saving a position means saving the decompressor's state, which off-the-shelf libraries don't
+allow, so trunc has its own decoders for all four formats. They are tested against the reference
+implementations and fuzzed against them.
+
+A compressed file that isn't a tarball, like `disk.img.xz` or `dump.sql.gz`, becomes one file
+without the suffix. `--raw` does the same for a tarball, turning `big.tar.zst` into `big.tar` in
+place.
+
 Hard links, sparse files and multi-volume archives are refused for now. Symlinks and device
 entries are skipped. Like punch mode for ZIP, freeing space needs a filesystem that can release
 part of a file: NTFS, ext4, XFS, btrfs or ZFS.
+
+## Split archives
+
+Point trunc at the first part, such as `big.tar.zst.001` or `big.tar.zst.aa`, and it reads the
+parts as one archive. With `--consume`, each part is deleted as soon as its data is safely
+extracted, which frees space even on a USB stick formatted FAT32 or exFAT. Split ZIP and `.trnc`
+archives can be extracted, but not consumed yet.
 
 ## When not to use it
 
@@ -271,8 +289,8 @@ it stops cleanly with exit code 75, leaving a valid, shorter archive. Free some 
 <details>
 <summary><b>Can a malicious archive write outside the destination folder?</b></summary>
 
-No. trunc rejects absolute paths, `..`, drive letters, Windows device names like `CON`, and
-alternate data streams. It never follows symlinks or junctions when writing. It creates symlink
+No. trunc rejects absolute paths, `..` and drive letters everywhere, and on Windows also device
+names like `CON` and alternate data streams. It never follows symlinks or junctions when writing. It creates symlink
 entries only with `--allow-symlinks`, and only if they point inside the destination. The
 [security checklist](docs/security.md) lists each rule with the code and test that enforce it.
 
@@ -298,7 +316,8 @@ commit, and Linux builds for x86-64 and ARM64. FAT32 and exFAT drives work with
 
 ## Documentation
 
-- [User guide](docs/guide.md): creating archives, what `--consume` guarantees, ZIP behaviour, exit codes
+- [User guide](docs/guide.md): creating archives, what `--consume` guarantees, ZIP, compressed
+  tarballs and split archives, exit codes
 - [Format spec](docs/spec/trnc-format-v1.md): the `.trnc` v1 file format
 - [Crash-safety invariants](docs/spec/invariants.md): what must hold after any crash, and the test for each
 - [Security checklist](docs/security.md): how hostile archives are handled, and known gaps
@@ -315,7 +334,7 @@ cargo test --workspace
 
 The parsers are fuzzed with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). On Linux with
 a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `tar`,
-`inflate`, `manifest`, `header` and `footer`).
+`inflate`, `bzip2`, `xz`, `zstd`, `manifest`, `header` and `footer`).
 
 <details>
 <summary><b>Repository layout</b></summary>

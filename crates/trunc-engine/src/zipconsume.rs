@@ -808,7 +808,7 @@ pub fn consume_zip(
     let protected = [handle.file_id()?, journal.file_id().map_err(journal_err)?];
     let guard = StageGuard {
         root: &stage,
-        protected: &protected,
+        protected: &|id| protected.contains(id),
     };
     let order = schedule(layout);
     let after = ends_after(layout, &order);
@@ -933,7 +933,7 @@ pub fn is_zip(fs: &dyn FsBackend, path: &Path) -> bool {
     if let Ok((_, pre, _)) = Journal::open(fs, &journal_path(path)) {
         return pre.starts_with(PREAMBLE_MAGIC);
     }
-    let Ok(h) = fs.open(path, OpenMode::Read, Share::Shared) else {
+    let Ok(h) = crate::source::open_read(fs, path) else {
         return false;
     };
     let mut magic = [0u8; 4];
@@ -951,13 +951,13 @@ pub fn journal_dest(fs: &dyn FsBackend, archive: &Path) -> Option<PathBuf> {
 
 /// Parse a ZIP for inspection or planning.
 pub fn open_layout(fs: &dyn FsBackend, archive: &Path) -> Result<Layout> {
-    let h = fs.open(archive, OpenMode::Read, Share::Shared)?;
+    let h = crate::source::open_read(fs, archive)?;
     zip::parse(h.as_ref()).map_err(|e| Error::Input(format!("{}: {e}", archive.display())))
 }
 
 /// Check every entry's CRC without writing anything. Returns (entries, bytes) checked.
 pub fn verify_zip(fs: &dyn FsBackend, archive: &Path) -> Result<(usize, u64)> {
-    let h = fs.open(archive, OpenMode::Read, Share::Shared)?;
+    let h = crate::source::open_read(fs, archive)?;
     let layout =
         zip::parse(h.as_ref()).map_err(|e| Error::Input(format!("{}: {e}", archive.display())))?;
     let mut bytes = 0u64;
@@ -975,7 +975,7 @@ pub fn extract_zip(
     dest: &Path,
     overwrite: bool,
 ) -> Result<ConsumeSummary> {
-    let h = fs.open(archive, OpenMode::Read, Share::Shared)?;
+    let h = crate::source::open_read(fs, archive)?;
     let layout =
         zip::parse(h.as_ref()).map_err(|e| Error::Input(format!("{}: {e}", archive.display())))?;
     if !layout.overlaps.is_empty() {

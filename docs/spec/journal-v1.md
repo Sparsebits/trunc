@@ -1,6 +1,6 @@
 # Journal format, version 1 (`<archive>.trncj`)
 
-Status: implemented in `trunc-journal`. Used by ZIP consumption (ADR-0008) and `.tar.gz` consumption (ADR-0011). Native `.trnc` consumption needs no journal (ADR-0007).
+Status: implemented in `trunc-journal`. Used by ZIP consumption (ADR-0008) and by consumption of compressed tarballs and files (ADR-0011, ADR-0012, ADR-0013). Native `.trnc` consumption needs no journal (ADR-0007).
 
 The journal holds one immutable **preamble** and a **latest checkpoint**. An append-only log was considered (the earlier draft) and rejected: punch mode writes a ~33 KiB checkpoint every 64 MiB of output, so a log would grow without bound on large entries.
 
@@ -25,8 +25,16 @@ SLOT B        same
 - **Preamble:** `"TZJP1"` | archive id [16] | original length u64 | file id (volume u64, file u128) | destination (u32 length + UTF-8) | serialized ZIP layout.
 - **Slot:** entry index u32 | inflate checkpoint (bit position u64, output total u64, CRC u32, window length u32, window).
 
-## Contents for .tar.gz consumption
+## Contents for compressed tarballs and files
 
-- **Preamble:** `"TGJP1"` | archive id [16] | file id (volume u64, file u128) | destination (u32 length + UTF-8) | file length u64 | gzip members u64 | tar stream length u64 | checkpoint interval u64 | tail hash [32] | checkpoint count u64 | per checkpoint: free-below offset u64, tar offset u64, BLAKE3 of the file content since the previous checkpoint [32] | entry list (count u64, then per entry: name length u32, name, kind u8, size u64, data offset u64, mode u32 or `u32::MAX`, mtime seconds i64, mtime nanoseconds u32).
+- **Preamble:** `"TSJP1"` | archive id [16] | file id (volume u64, file u128) | destination (u32 length + UTF-8) | part count u32, then per part of a split archive: name length u16, name, size u64, file id (volume u64, file u128) | codec u8 (1 gzip, 2 bzip2, 3 xz, 4 zstd) | mode u8 (0 tar, 1 single file) | file length u64 | units u64 (members, streams or frames) | decoded length u64 | checkpoint interval u64 | tail hash [32] | checkpoint count u64 | per checkpoint: free-below offset u64, decoded offset u64, BLAKE3 of the file content since the previous checkpoint [32] | entry list (count u64, then per entry: name length u32, name, kind u8, size u64, data offset u64, mode u32 or `u32::MAX`, mtime seconds i64, mtime nanoseconds u32). A single file has one entry.
+- **Slot:** checkpoints passed u32 | free-below offset u64 | decoded offset u64 | decoder cursor (codec-specific, see `trunc_legacy::stream`). For a split archive, a slot with checkpoints passed = `u32::MAX` is the end record: everything is decoded and durable, and the remaining parts may be deleted.
+- **Slot capacity** is the codec's largest cursor plus 64 bytes: about 32 KiB for gzip (the DEFLATE window) and xz (LZMA probabilities), 4 KiB for zstd, 64 bytes for bzip2.
+- **Gap log** `<archive>.trncg` (xz and zstd tarballs only): every decoded byte that is not file content (tar headers, PAX records, padding, end blocks), in stream order, flushed with the outputs before each checkpoint is journaled. On resume it is cut back to the checkpoint, and together with the staged files it gives back the decoder's window. It is removed before the journal.
+- A single archive keeps its length while it is consumed (only ranges below the free-below offset are deallocated). It is truncated to zero once every output is durable, so a zero-length archive with a journal means "only the rename phase and cleanup remain". A split archive loses whole parts instead, once a checkpoint passes their end.
+
+## Contents for .tar.gz consumption by v0.1.0
+
+- **Preamble:** `"TGJP1"` | archive id [16] | file id (volume u64, file u128) | destination (u32 length + UTF-8) | the layout as above without the codec, mode and part table.
 - **Slot:** checkpoints passed u32 | member data offset u64 | member output base u64 | free-below offset u64 | inflate checkpoint.
-- The archive keeps its length while it is consumed (only ranges below the free-below offset are deallocated). It is truncated to zero once every output is durable, so a zero-length archive with a journal means "only the rename phase and cleanup remain".
+- Later versions still resume these journals, writing slots in the same layout.

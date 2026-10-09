@@ -3,8 +3,8 @@
 //!
 //! [`Reader`] is fed the decompressed stream in pieces and records each entry with the offset of
 //! its data in that stream, so a second pass can route bytes to files without parsing again.
-//! Names are validated like ZIP names: relative, NFC, no `..`, portable to Windows, no
-//! case-insensitive duplicates and nothing nested under a file. Hard links, GNU sparse files and
+//! Names are validated like ZIP names: relative, NFC, no `..`, valid on this computer (see
+//! [`trunc_core::path::validate_host`]), no duplicates and nothing nested under a file. Hard links, GNU sparse files and
 //! multi-volume archives are refused.
 
 use std::collections::HashSet;
@@ -355,10 +355,10 @@ impl Reader {
             return Ok(());
         };
         self.state = body(None, kind == Kind::File, size);
-        if !self.seen.insert(trunc_core::path::collision_key(&name)) {
+        if !self.seen.insert(trunc_core::path::host_key(&name)) {
             return Err(TarError::Name {
                 name,
-                reason: "duplicate entry (case-insensitive)".into(),
+                reason: DUPLICATE.into(),
             });
         }
         if self.entries.len() >= MAX_ENTRIES {
@@ -467,6 +467,13 @@ fn number(f: &[u8]) -> Option<u64> {
 }
 
 /// Bytes up to the first NUL.
+/// Why a second entry with the same name (as this computer compares names) is refused.
+const DUPLICATE: &str = if cfg!(any(windows, target_os = "macos")) {
+    "duplicate entry (names differ only in case)"
+} else {
+    "duplicate entry"
+};
+
 fn cstr(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
@@ -485,7 +492,7 @@ fn normalize_name(raw: &[u8], at: u64) -> Result<Option<String>> {
         return Ok(None);
     }
     let name: String = s.nfc().collect();
-    trunc_core::path::validate(&name).map_err(|e| TarError::Name {
+    trunc_core::path::validate_host(&name).map_err(|e| TarError::Name {
         name: name.clone(),
         reason: format!("{e} (at byte {at})"),
     })?;
@@ -541,12 +548,12 @@ fn check_nesting(entries: &[Entry]) -> Result<()> {
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| trunc_core::path::collision_key(&e.name))
+        .map(|e| trunc_core::path::host_key(&e.name))
         .collect();
     for e in entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&trunc_core::path::collision_key(pp)) {
+            if files.contains(&trunc_core::path::host_key(pp)) {
                 return Err(TarError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),

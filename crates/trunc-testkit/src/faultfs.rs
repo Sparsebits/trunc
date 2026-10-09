@@ -117,6 +117,12 @@ struct State {
     handles: HashMap<u64, (usize, usize, usize)>,
     granularity: u64,
     dealloc_supported: bool,
+    /// Report file ids the way Linux reports inode numbers: a number is handed out again once
+    /// its file is unlinked and closed.
+    reuse_ids: bool,
+    inodes: HashMap<u64, u64>,
+    free_inodes: Vec<u64>,
+    next_inode: u64,
     /// A drive that acknowledges flushes without persisting anything.
     flush_lies: bool,
 }
@@ -385,6 +391,38 @@ impl State {
     }
 }
 
+impl State {
+    /// The id `file_id` reports for internal file `id`.
+    fn inode(&mut self, id: u64) -> u64 {
+        if !self.reuse_ids {
+            return id;
+        }
+        if let Some(&i) = self.inodes.get(&id) {
+            return i;
+        }
+        let i = self.free_inodes.pop().unwrap_or_else(|| {
+            let i = self.next_inode;
+            self.next_inode += 1;
+            i
+        });
+        self.inodes.insert(id, i);
+        i
+    }
+
+    /// Give internal file `id`'s reported id back once nothing links to it or holds it open.
+    fn maybe_release(&mut self, id: u64) {
+        if !self.reuse_ids || self.handles.contains_key(&id) {
+            return;
+        }
+        if self.tree.values().any(|n| *n == Node::File(id)) {
+            return;
+        }
+        if let Some(i) = self.inodes.remove(&id) {
+            self.free_inodes.push(i);
+        }
+    }
+}
+
 impl FaultFs {
     pub fn new(model: CrashModel) -> Self {
         Self {
@@ -405,6 +443,10 @@ impl FaultFs {
                 handles: HashMap::new(),
                 granularity: 4096,
                 dealloc_supported: true,
+                reuse_ids: false,
+                inodes: HashMap::new(),
+                free_inodes: Vec::new(),
+                next_inode: 1,
                 flush_lies: false,
             })),
         }
@@ -453,6 +495,12 @@ impl FaultFs {
     /// Make `deallocate` report `Unsupported` (as on FAT/exFAT).
     pub fn set_dealloc_supported(&self, yes: bool) {
         self.st().dealloc_supported = yes;
+    }
+
+    /// Reuse file ids like Linux reuses inode numbers: once a file is unlinked and its last
+    /// handle closed, the next file to ask for an id may get the same one.
+    pub fn set_reuse_ids(&self, yes: bool) {
+        self.st().reuse_ids = yes;
     }
 
     /// Bytes currently allocated by all files.
@@ -704,14 +752,15 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let mut s = self.st();
         s.alive()?;
-        match s.node(&k) {
-            Some(Node::File(_)) => {}
+        let id = match s.node(&k) {
+            Some(Node::File(id)) => id,
             Some(Node::Dir) => return Err(other("removing", path, "is a directory")),
             None => return Err(not_found(path)),
-        }
+        };
         s.begin(Kind::Other, path)?;
         s.tree_change(TreeChange::Remove(k));
         s.recompute_used();
+        s.maybe_release(id);
         Ok(())
     }
 
@@ -845,6 +894,7 @@ impl Drop for MemHandle {
             }
             if e.0 == 0 {
                 s.handles.remove(&self.id);
+                s.maybe_release(self.id);
             }
         }
     }
@@ -983,10 +1033,10 @@ impl FileHandle for MemHandle {
     }
 
     fn file_id(&self) -> Result<FileId> {
-        drop(self.st()?);
+        let mut s = self.st()?;
         Ok(FileId {
             volume: 0xFA17,
-            file: u128::from(self.id),
+            file: u128::from(s.inode(self.id)),
         })
     }
 

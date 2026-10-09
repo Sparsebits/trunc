@@ -46,13 +46,22 @@ pub(crate) fn join_rel(base: &Path, rel: &str) -> PathBuf {
 }
 
 /// Where staged outputs may be written, and what they must never turn out to be.
-#[derive(Debug)]
 pub(crate) struct StageGuard<'a> {
     /// The staging directory. Outputs are opened beneath it without following links.
     pub root: &'a Path,
-    /// The archive and its journal: an output that is one of these (e.g. a hard link planted in
-    /// the staging directory) is refused.
-    pub protected: &'a [trunc_fs::FileId],
+    /// Whether a file id is the archive or its journal, as they exist now: an output that is one
+    /// of these (e.g. a hard link planted in the staging directory) is refused. It is asked at
+    /// each open, because a deleted part of a split archive frees its id for reuse (Linux hands
+    /// inode numbers out again at once).
+    pub protected: &'a dyn Fn(&trunc_fs::FileId) -> bool,
+}
+
+impl std::fmt::Debug for StageGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StageGuard")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Open (or create) a staging output. Returns the handle and whether the file was created.
@@ -70,7 +79,7 @@ pub(crate) fn open_staged_output(
         }
         Some(_) => return Err(Error::Refused(format!("{} is not a file", p.display()))),
     };
-    if guard.protected.contains(&h.file_id()?) {
+    if (guard.protected)(&h.file_id()?) {
         return Err(Error::Refused(format!(
             "{} is the archive (or its journal) under another name; refusing to write to it",
             p.display()

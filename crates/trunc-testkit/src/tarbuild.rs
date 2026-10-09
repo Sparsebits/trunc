@@ -194,7 +194,100 @@ pub fn gzip(data: &[u8], level: u32) -> Vec<u8> {
 /// gzip-compress `data` as several members of `chunk` input bytes each (like `pigz -i` output
 /// or concatenated `.gz` files).
 pub fn gzip_members(data: &[u8], chunk: usize, level: u32) -> Vec<u8> {
+    if data.is_empty() {
+        return gzip(data, level);
+    }
     data.chunks(chunk.max(1))
         .flat_map(|c| gzip(c, level))
         .collect()
+}
+
+/// bzip2-compress `data` as one stream (`level` 1-9 sets the block size).
+pub fn bzip2(data: &[u8], level: u32) -> Vec<u8> {
+    let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(level));
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// bzip2-compress `data` as several streams of `chunk` input bytes each (like `pbzip2`).
+pub fn bzip2_streams(data: &[u8], chunk: usize, level: u32) -> Vec<u8> {
+    if data.is_empty() {
+        return bzip2(data, level);
+    }
+    data.chunks(chunk.max(1))
+        .flat_map(|c| bzip2(c, level))
+        .collect()
+}
+
+/// Integrity check an xz stream carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XzCheck {
+    None,
+    Crc32,
+    Crc64,
+    Sha256,
+}
+
+/// xz-compress `data` (`preset` 0-9) as one stream with one block.
+pub fn xz(data: &[u8], preset: u32) -> Vec<u8> {
+    xz_with(data, preset, XzCheck::Crc64, None)
+}
+
+/// xz-compress `data` with a given check, and with blocks of `block_size` input bytes (as
+/// multi-threaded `xz -T` writes them) when set.
+pub fn xz_with(data: &[u8], preset: u32, check: XzCheck, block_size: Option<u64>) -> Vec<u8> {
+    use liblzma::stream::{Check, MtStreamBuilder, Stream};
+    let check = match check {
+        XzCheck::None => Check::None,
+        XzCheck::Crc32 => Check::Crc32,
+        XzCheck::Crc64 => Check::Crc64,
+        XzCheck::Sha256 => Check::Sha256,
+    };
+    let stream = match block_size {
+        None => Stream::new_easy_encoder(preset, check).unwrap(),
+        Some(bs) => MtStreamBuilder::new()
+            .preset(preset)
+            .threads(1)
+            .block_size(bs)
+            .check(check)
+            .encoder()
+            .unwrap(),
+    };
+    let mut e = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// zstd-compress `data` as one frame with a content checksum.
+pub fn zstd(data: &[u8], level: i32) -> Vec<u8> {
+    zstd_with(data, level, true, None)
+}
+
+/// zstd-compress `data`, optionally without the checksum and with a forced window size
+/// (`window_log`, as `--long=N` sets it).
+pub fn zstd_with(data: &[u8], level: i32, checksum: bool, window_log: Option<u32>) -> Vec<u8> {
+    let mut e = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+    e.include_checksum(checksum).unwrap();
+    e.include_contentsize(false).unwrap();
+    if let Some(w) = window_log {
+        e.long_distance_matching(true).unwrap();
+        e.window_log(w).unwrap();
+    }
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// zstd-compress `data` as several frames of `chunk` input bytes each (like `pzstd`).
+pub fn zstd_frames(data: &[u8], chunk: usize, level: i32) -> Vec<u8> {
+    if data.is_empty() {
+        return zstd(data, level);
+    }
+    data.chunks(chunk.max(1))
+        .flat_map(|c| zstd(c, level))
+        .collect()
+}
+
+/// Split `data` into parts of `part` bytes (the last may be shorter), as `split -b` does.
+pub fn split(data: &[u8], part: usize) -> Vec<Vec<u8>> {
+    data.chunks(part.max(1)).map(<[u8]>::to_vec).collect()
 }

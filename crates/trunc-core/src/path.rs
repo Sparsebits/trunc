@@ -4,6 +4,11 @@
 //! deliberately the intersection of what Windows, macOS and Linux accept, so an archive created
 //! anywhere extracts the same everywhere, and so no entry can name something outside the
 //! destination directory.
+//!
+//! Archives made by other tools (tar, ZIP) are checked with [`validate_host`] instead: names
+//! that are ordinary on this computer but illegal on Windows (a backslash, `:`, a trailing dot)
+//! are accepted on Linux and macOS, so real Linux tarballs extract there. Everything that could
+//! escape the destination is refused on every platform.
 
 use crate::FormatError;
 use unicode_normalization::is_nfc;
@@ -26,6 +31,17 @@ fn err(path: &str, reason: &'static str) -> FormatError {
 
 /// Validate one entry path. Returns `Ok(())` if it is safe and portable.
 pub fn validate(path: &str) -> Result<(), FormatError> {
+    validate_with(path, true)
+}
+
+/// Validate a path from an archive made by another tool, for extraction on this computer: the
+/// portable rules on Windows, and elsewhere the safety rules alone (no absolute paths, `..`,
+/// empty components, control characters or Windows drive prefixes).
+pub fn validate_host(path: &str) -> Result<(), FormatError> {
+    validate_with(path, cfg!(windows))
+}
+
+fn validate_with(path: &str, portable: bool) -> Result<(), FormatError> {
     if path.is_empty() {
         return Err(err(path, "empty"));
     }
@@ -41,12 +57,17 @@ pub fn validate(path: &str) -> Result<(), FormatError> {
         if depth > MAX_DEPTH {
             return Err(err(path, "too deep"));
         }
-        validate_component(path, comp)?;
+        validate_component(path, comp, portable)?;
+        // "C:" first is a Windows absolute path, whatever this computer makes of it.
+        let b = comp.as_bytes();
+        if depth == 1 && b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+            return Err(err(path, "Windows drive prefix"));
+        }
     }
     Ok(())
 }
 
-fn validate_component(path: &str, comp: &str) -> Result<(), FormatError> {
+fn validate_component(path: &str, comp: &str, portable: bool) -> Result<(), FormatError> {
     if comp.is_empty() {
         return Err(err(
             path,
@@ -63,9 +84,12 @@ fn validate_component(path: &str, comp: &str) -> Result<(), FormatError> {
         if (ch as u32) < 0x20 || ch == '\u{7f}' {
             return Err(err(path, "control character"));
         }
-        if matches!(ch, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') {
+        if portable && matches!(ch, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') {
             return Err(err(path, "character not allowed on Windows"));
         }
+    }
+    if !portable {
+        return Ok(());
     }
     if comp.ends_with('.') || comp.ends_with(' ') {
         return Err(err(path, "trailing '.' or space (stripped by Windows)"));
@@ -85,6 +109,17 @@ fn validate_component(path: &str, comp: &str) -> Result<(), FormatError> {
 /// Key used to detect entries that would collide on a case-insensitive filesystem.
 pub fn collision_key(path: &str) -> String {
     path.to_lowercase()
+}
+
+/// Key used to detect entries that would be the same file on this computer: case-insensitive
+/// on Windows and macOS, exact on Linux (where `Makefile` and `makefile` are different files).
+/// Writes still check the exact name created, which catches case-insensitive Linux folders.
+pub fn host_key(path: &str) -> String {
+    if cfg!(any(windows, target_os = "macos")) {
+        collision_key(path)
+    } else {
+        path.to_owned()
+    }
 }
 
 /// Parent path of `path`, or `None` for a top-level entry.
@@ -135,6 +170,40 @@ mod tests {
         for p in bad {
             assert!(validate(p).is_err(), "accepted {p:?}");
         }
+    }
+
+    #[test]
+    fn host_rules_accept_ordinary_unix_names_off_windows() {
+        let unixy = [
+            "lib/systemd/system/system-systemd\\x2dcryptsetup.slice",
+            "a:b",
+            "what?",
+            "dir/CON",
+            "trailing.",
+        ];
+        for p in unixy {
+            assert_eq!(validate_host(p).is_ok(), !cfg!(windows), "{p:?}");
+            assert!(validate(p).is_err(), "{p:?} is not portable");
+        }
+        let hostile = [
+            "",
+            "/abs",
+            "a//b",
+            "../up",
+            "a/../b",
+            "./a",
+            "C:/x",
+            "c:",
+            "nul\0byte",
+            "tab\tname",
+        ];
+        for p in hostile {
+            assert!(validate_host(p).is_err(), "accepted {p:?}");
+        }
+        assert_eq!(
+            host_key("Makefile") == host_key("makefile"),
+            cfg!(any(windows, target_os = "macos"))
+        );
     }
 
     #[test]

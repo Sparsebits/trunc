@@ -141,14 +141,19 @@ fn rejects_hostile_names() {
         "/etc/passwd",
         "C:/Windows/x",
         "a/../../b",
-        "CON",
         "a/b\0c",
     ] {
         let e = parse(&build(&[Spec::file(bad, b"x")])).unwrap_err();
         assert!(matches!(e, ZipError::Name { .. }), "{bad:?}: {e}");
     }
-    let dup = [Spec::file("Same.txt", b"1"), Spec::file("same.TXT", b"2")];
+    let dup = [Spec::file("same.txt", b"1"), Spec::file("same.txt", b"2")];
     assert!(matches!(parse(&build(&dup)), Err(ZipError::Name { .. })));
+    // Names that differ only in case are one file on Windows and macOS, two on Linux.
+    let case = [Spec::file("Same.txt", b"1"), Spec::file("same.TXT", b"2")];
+    assert_eq!(
+        matches!(parse(&build(&case)), Err(ZipError::Name { .. })),
+        cfg!(any(windows, target_os = "macos"))
+    );
     let nested = [Spec::file("a", b"file"), Spec::file("a/b", b"under a file")];
     assert!(matches!(parse(&build(&nested)), Err(ZipError::Name { .. })));
 }

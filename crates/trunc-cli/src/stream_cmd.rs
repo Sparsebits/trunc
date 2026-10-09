@@ -1,21 +1,73 @@
-//! `.tar.gz` support for `x`, `inspect`, `verify` and `plan`.
+//! Compressed tarballs and single compressed files (gzip, bzip2, xz, zstd) for `x`, `inspect`,
+//! `verify` and `plan`.
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
+use clap::Args;
 use trunc_core::space::SpaceParams;
 use trunc_engine::preflight::{self, Severity};
-use trunc_engine::tgzconsume;
+use trunc_engine::streamconsume::{self, Mode, StreamLayout, StreamOptions};
 use trunc_engine::zipconsume::ZipOptions;
-use trunc_fs::{FsBackend, OsFs};
+use trunc_fs::OsFs;
+use trunc_legacy::stream::{Codec, Limits};
 use trunc_legacy::tar::Kind;
 
-use crate::fmt::bytes;
+use crate::fmt::{bytes, parse_size};
 
-pub fn is_tgz(path: &Path) -> bool {
-    tgzconsume::is_tgz(&OsFs::new() as &dyn FsBackend, path)
+#[derive(Debug, Args)]
+pub struct StreamArgs {
+    /// Compressed tarballs: decompress into one `.tar` file instead of unpacking it.
+    #[arg(long)]
+    pub raw: bool,
+    /// zstd and xz: refuse streams whose decoder window (memory) is larger than this.
+    #[arg(long, default_value = "256M", value_parser = parse_size)]
+    pub max_window: u64,
+}
+
+impl StreamArgs {
+    pub fn options(&self) -> StreamOptions {
+        StreamOptions {
+            raw: self.raw,
+            max_window: self.max_window.max(1),
+        }
+    }
+}
+
+impl Default for StreamArgs {
+    fn default() -> Self {
+        Self {
+            raw: false,
+            max_window: Limits::DEFAULT_MAX_WINDOW,
+        }
+    }
+}
+
+/// `tar.gz`, `tar.zst`, ... for tarballs; `gzip file`, `zstd file`, ... for single files.
+pub fn label(codec: Codec, mode: Mode) -> String {
+    match mode {
+        Mode::Tar => format!(
+            "tar.{}",
+            match codec {
+                Codec::Gzip => "gz",
+                Codec::Bzip2 => "bz2",
+                Codec::Xz => "xz",
+                Codec::Zstd => "zst",
+            }
+        ),
+        Mode::Single => format!("{} file", codec.name()),
+    }
+}
+
+fn units(l: &StreamLayout) -> String {
+    let unit = l.codec.unit();
+    if l.units == 1 {
+        format!("1 {}", unit.trim_end_matches('s'))
+    } else {
+        format!("{} {unit}", l.units)
+    }
 }
 
 pub fn extract(
@@ -23,18 +75,20 @@ pub fn extract(
     dest: &Path,
     overwrite: bool,
     ignore_space: bool,
+    opts: &StreamOptions,
 ) -> Result<ExitCode> {
     let fs = OsFs::new();
     let t = Instant::now();
     if !ignore_space {
-        // gzip records no sizes, so the archive is scanned first to learn what it will write.
-        let layout = tgzconsume::open_layout(&fs, archive, 0)?;
+        // Compressed streams record no reliable sizes, so the archive is scanned first to learn
+        // what it will write.
+        let layout = streamconsume::open_layout(&fs, archive, 0, opts)?;
         let vc = preflight::check_volumes(&fs, archive, dest, None)?;
         let params = SpaceParams {
             cluster_size: u64::from(vc.destination.cluster_size.max(1)),
             ..SpaceParams::default()
         };
-        let sp = tgzconsume::tgz_space(&layout, false, 1, &params);
+        let sp = streamconsume::stream_space(&layout, false, 1, &[], &params);
         if let Some(free) = vc.destination.free_bytes.filter(|f| *f < sp.extract_extra) {
             anyhow::bail!(
                 "not enough free space at {}: extracting needs about {}, {} are free (--ignore-space to try anyway)",
@@ -44,7 +98,7 @@ pub fn extract(
             );
         }
     }
-    let s = tgzconsume::extract_tgz(&fs, archive, dest, overwrite)?;
+    let s = streamconsume::extract_stream(&fs, archive, dest, overwrite, opts)?;
     println!(
         "extracted {} files, {} directories, {} into {}",
         s.files,
@@ -65,23 +119,31 @@ pub fn extract(
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn verify(archive: &Path) -> Result<ExitCode> {
+pub fn verify(archive: &Path, opts: &StreamOptions) -> Result<ExitCode> {
     let t = Instant::now();
-    let l = tgzconsume::verify_tgz(&OsFs::new(), archive)?;
+    let l = streamconsume::verify_stream(&OsFs::new(), archive, opts)?;
+    let (what, checked) = match l.mode {
+        Mode::Tar => (
+            format!("{} entries", l.entries.len()),
+            format!("{} checksums and tar headers", l.codec.name()),
+        ),
+        Mode::Single => ("1 file".into(), format!("{} checksums", l.codec.name())),
+    };
     println!(
-        "ok: {} entries, {} decoded, gzip CRC and tar headers checked in {:.2}s",
-        l.entries.len(),
+        "ok: {what}, {} decoded, {checked} checked in {:.2}s",
         bytes(l.content_bytes()),
         t.elapsed().as_secs_f64()
     );
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn inspect(archive: &Path, list: bool) -> Result<ExitCode> {
+pub fn inspect(archive: &Path, list: bool, opts: &StreamOptions) -> Result<ExitCode> {
     let fs = OsFs::new();
-    if let Some(dest) = tgzconsume::journal_dest(&fs, archive) {
+    if let Some(dest) = streamconsume::journal_dest(&fs, archive) {
+        let kind = streamconsume::detect(&fs, archive, opts.raw)
+            .map_or_else(|| "compressed".into(), |(c, m)| label(c, m));
         println!(
-            "archive    {} (tar.gz, being consumed into {})",
+            "archive    {} ({kind}, being consumed into {})",
             archive.display(),
             dest.display()
         );
@@ -91,21 +153,27 @@ pub fn inspect(archive: &Path, list: bool) -> Result<ExitCode> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let l = tgzconsume::open_layout(&fs, archive, 0)?;
-    let files = l.entries.iter().filter(|e| e.kind == Kind::File).count();
-    println!("archive    {} (tar.gz)", archive.display());
+    let l = streamconsume::open_layout(&fs, archive, 0, opts)?;
     println!(
-        "entries    {files} files, {} directories/links",
-        l.entries.len() - files
+        "archive    {} ({})",
+        archive.display(),
+        label(l.codec, l.mode)
     );
-    println!("content    {}", bytes(l.content_bytes()));
-    println!(
-        "file size  {} ({} gzip member{})",
-        bytes(l.file_len),
-        l.members,
-        if l.members == 1 { "" } else { "s" }
-    );
-    if list {
+    match l.mode {
+        Mode::Tar => {
+            let files = l.entries.iter().filter(|e| e.kind == Kind::File).count();
+            println!(
+                "entries    {files} files, {} directories/links",
+                l.entries.len() - files
+            );
+            println!("content    {}", bytes(l.content_bytes()));
+        }
+        Mode::Single => {
+            println!("output     {} ({})", l.entries[0].name, bytes(l.out_len));
+        }
+    }
+    println!("file size  {} ({})", bytes(l.file_len), units(&l));
+    if list && l.mode == Mode::Tar {
         println!();
         for e in &l.entries {
             let size = match e.kind {
@@ -120,9 +188,10 @@ pub fn inspect(archive: &Path, list: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn plan(archive: &Path, dest: &Path) -> Result<ExitCode> {
+pub fn plan(archive: &Path, dest: &Path, opts: &StreamOptions) -> Result<ExitCode> {
     let fs = OsFs::new();
-    let layout = tgzconsume::open_layout(&fs, archive, ZipOptions::default().checkpoint_every)?;
+    let layout =
+        streamconsume::open_layout(&fs, archive, ZipOptions::default().checkpoint_every, opts)?;
     let largest = layout
         .entries
         .iter()
@@ -134,10 +203,11 @@ pub fn plan(archive: &Path, dest: &Path) -> Result<ExitCode> {
         cluster_size: u64::from(vc.destination.cluster_size.max(1)),
         ..SpaceParams::default()
     };
-    let sp = tgzconsume::tgz_space(
+    let sp = streamconsume::stream_space(
         &layout,
         can_dealloc,
         u64::from(vc.archive_volume.sparse_granularity.max(1)),
+        &trunc_engine::source::part_sizes(&fs, archive)?,
         &params,
     );
     let consume_needs = if vc.same_volume {
@@ -151,8 +221,9 @@ pub fn plan(archive: &Path, dest: &Path) -> Result<ExitCode> {
         None => "unknown",
     };
     println!(
-        "archive       {} (tar.gz, {})",
+        "archive       {} ({}, {})",
         archive.display(),
+        label(layout.codec, layout.mode),
         bytes(layout.file_len)
     );
     println!("content       {} to write", bytes(sp.content));

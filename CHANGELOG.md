@@ -4,6 +4,29 @@ All notable changes to trunc. The format follows [Keep a Changelog](https://keep
 and versions follow [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
 change the command line; the `.trnc` v1 format is frozen.
 
+## [Unreleased]
+
+### Added
+- `.tar.bz2`, `.tar.xz` and `.tar.zst`, alongside `.tar.gz`: `x`, `inspect`, `verify`, `plan`,
+  `--consume` and `resume`. trunc has its own resumable bzip2, xz (LZMA2) and zstd decoders, so
+  consuming frees space every 64 MiB on any file, not just at frame boundaries. Files made by
+  `pigz`, `pbzip2`, `xz -T0`, `pzstd` and `zstd --long` work.
+- Single compressed files (`disk.img.xz`, `dump.sql.gz`, `model.bin.zst`, `notes.bz2`) are
+  decompressed into one file named without the suffix, with or without `--consume`. `--raw`
+  does the same for a tarball (`big.tar.zst` becomes `big.tar`).
+- Split archives: pass the first part (`name.001` or `name.aa`) and the parts are read as one
+  file, for every format. With `--consume`, compressed tarballs and files delete each part once
+  its data is extracted, which frees space even on FAT32 and exFAT.
+- `--max-window` (default 256M) refuses xz and zstd archives whose decoder would need more memory.
+
+### Changed
+- On Linux and macOS, tar and ZIP entries may use names that only Windows forbids (backslashes,
+  colons, trailing dots, `CON`), and on Linux names that differ only in case are separate files.
+  Real Linux tarballs, including the kernel source, failed before. Windows keeps the portable
+  rules, and `.trnc` archives always use them.
+- The journal for compressed archives is now `TSJP1`; `.tar.gz` consumes paused by 0.1.0 still
+  resume.
+
 ## [0.1.0] - 2026-10-09
 
 The first release.
@@ -63,4 +86,5 @@ The first release.
 - Install scripts: `install.sh` (Linux) and `install.ps1` (Windows). Both verify the download's
   SHA-256 before installing.
 
+[Unreleased]: https://github.com/Sparsebits/trunc/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Sparsebits/trunc/releases/tag/v0.1.0

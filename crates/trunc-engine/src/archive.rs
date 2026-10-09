@@ -40,7 +40,12 @@ impl Archive {
         mode: OpenMode,
         share: Share,
     ) -> Result<Self> {
-        let handle = fs.open(path, mode, share)?;
+        // Read-only opens see a split archive's parts as one file.
+        let handle = if mode == OpenMode::Read {
+            crate::source::open_read(fs, path)?
+        } else {
+            fs.open(path, mode, share)?
+        };
         let file_len = handle.size()?;
         if file_len < HEADER_LEN as u64 {
             return Err(Error::Integrity(format!(

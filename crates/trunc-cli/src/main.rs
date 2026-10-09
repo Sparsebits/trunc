@@ -11,11 +11,13 @@ use trunc_core::space::SpaceParams;
 use trunc_core::{CodecId, EntryKind};
 use trunc_engine::extract::{ExtractOptions, TrustPolicy};
 use trunc_engine::producer::{CreateOptions, DictMode};
+use trunc_engine::streamconsume::{self, Mode};
 use trunc_engine::{Archive, keys};
+use trunc_legacy::stream::Codec;
 
 mod consume_cmd;
 mod fmt;
-mod tgz_cmd;
+mod stream_cmd;
 mod zip_cmd;
 use fmt::{bytes, parse_size};
 
@@ -112,6 +114,8 @@ struct ExtractArgs {
     consume: bool,
     #[command(flatten)]
     consume_flags: consume_cmd::ConsumeFlags,
+    #[command(flatten)]
+    stream: stream_cmd::StreamArgs,
     /// Replace existing files at destination paths.
     #[arg(long)]
     overwrite: bool,
@@ -134,6 +138,8 @@ struct ResumeArgs {
     #[command(flatten)]
     consume_flags: consume_cmd::ConsumeFlags,
     #[command(flatten)]
+    stream: stream_cmd::StreamArgs,
+    #[command(flatten)]
     trust: TrustArgs,
     /// Decode threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
@@ -149,6 +155,8 @@ struct InspectArgs {
     /// List blocks.
     #[arg(long)]
     blocks: bool,
+    #[command(flatten)]
+    stream: stream_cmd::StreamArgs,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +164,8 @@ struct VerifyArgs {
     archive: PathBuf,
     #[command(flatten)]
     trust: TrustArgs,
+    #[command(flatten)]
+    stream: stream_cmd::StreamArgs,
     #[arg(long, default_value_t = 0)]
     threads: usize,
 }
@@ -169,6 +179,8 @@ struct PlanArgs {
     /// Decoded bytes per consume batch (one flush + truncate per batch).
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     batch: u64,
+    #[command(flatten)]
+    stream: stream_cmd::StreamArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -219,6 +231,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &a.archive,
                 &dest,
                 &a.consume_flags,
+                &a.stream.options(),
                 a.trust.policy()?,
                 a.threads,
             )
@@ -279,32 +292,40 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
             &a.archive,
             &a.dest,
             &a.consume_flags,
+            &a.stream.options(),
             a.trust.policy()?,
             a.threads,
         );
     }
-    let legacy = legacy_kind(&a.archive);
-    if let Some(kind) = legacy {
+    let kind = Kind::detect(&a.archive, a.stream.raw);
+    if kind != Kind::Trnc {
         refuse_trust_flags(&a.trust.policy()?, kind)?;
         if a.allow_symlinks {
             anyhow::bail!("--allow-symlinks is not supported for {kind} archives");
         }
     }
-    if legacy == Some("tar.gz") {
-        return tgz_cmd::extract(
-            &a.archive,
-            &a.dest,
-            a.overwrite,
-            a.consume_flags.ignore_space,
-        );
+    match kind {
+        Kind::Stream(..) => {
+            return stream_cmd::extract(
+                &a.archive,
+                &a.dest,
+                a.overwrite,
+                a.consume_flags.ignore_space,
+                &a.stream.options(),
+            );
+        }
+        Kind::Zip => {
+            return zip_cmd::extract(
+                &a.archive,
+                &a.dest,
+                a.overwrite,
+                a.consume_flags.ignore_space,
+            );
+        }
+        Kind::Trnc => {}
     }
-    if legacy == Some("ZIP") {
-        return zip_cmd::extract(
-            &a.archive,
-            &a.dest,
-            a.overwrite,
-            a.consume_flags.ignore_space,
-        );
+    if a.stream.raw {
+        anyhow::bail!("--raw applies only to compressed tarballs");
     }
     let archive = Archive::open(&a.archive)?;
     // Refuse up front when the declared output cannot fit (guards against archives that expand
@@ -355,23 +376,45 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `Some("tar.gz")` or `Some("ZIP")` for formats other than `.trnc`, detected by content.
-pub(crate) fn legacy_kind(archive: &std::path::Path) -> Option<&'static str> {
-    if tgz_cmd::is_tgz(archive) {
-        Some("tar.gz")
-    } else if zip_cmd::is_zip(archive) {
-        Some("ZIP")
-    } else {
-        None
+/// What an archive is, detected by content (never by its name). Archives being consumed are
+/// recognised by their journal, since their front may already be gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Trnc,
+    Zip,
+    Stream(Codec, Mode),
+}
+
+impl Kind {
+    pub(crate) fn detect(archive: &std::path::Path, raw: bool) -> Self {
+        let fs = trunc_fs::OsFs::new();
+        if let Some((codec, mode)) = streamconsume::detect(&fs, archive, raw) {
+            Kind::Stream(codec, mode)
+        } else if zip_cmd::is_zip(archive) {
+            Kind::Zip
+        } else {
+            Kind::Trnc
+        }
     }
 }
 
-/// ZIP and tar.gz carry no signatures. Asking for one must not be silently ignored: a file
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Kind::Trnc => f.write_str(".trnc"),
+            Kind::Zip => f.write_str("ZIP"),
+            Kind::Stream(c, m) => f.write_str(&stream_cmd::label(*c, *m)),
+        }
+    }
+}
+
+/// Only `.trnc` archives carry signatures. Asking for one must not be silently ignored: a file
 /// named `.trnc` might really be a ZIP.
-pub(crate) fn refuse_trust_flags(trust: &TrustPolicy, kind: &str) -> Result<()> {
-    if trust.require_signed || !trust.trusted_keys.is_empty() {
+pub(crate) fn refuse_trust_flags(trust: &TrustPolicy, kind: Kind) -> Result<()> {
+    if kind != Kind::Trnc && (trust.require_signed || !trust.trusted_keys.is_empty()) {
         anyhow::bail!(
-            "this is a {kind} archive, which cannot be signed; --require-signed and --trust-key              apply only to .trnc archives"
+            "this is a {kind} archive, which cannot be signed; --require-signed and --trust-key \
+             apply only to .trnc archives"
         );
     }
     Ok(())
@@ -385,11 +428,12 @@ fn signer_line(archive: &Archive) -> String {
 }
 
 fn inspect(a: InspectArgs) -> Result<ExitCode> {
-    if tgz_cmd::is_tgz(&a.archive) {
-        return tgz_cmd::inspect(&a.archive, a.entries);
-    }
-    if zip_cmd::is_zip(&a.archive) {
-        return zip_cmd::inspect(&a.archive, a.entries);
+    match Kind::detect(&a.archive, a.stream.raw) {
+        Kind::Stream(..) => {
+            return stream_cmd::inspect(&a.archive, a.entries, &a.stream.options());
+        }
+        Kind::Zip => return zip_cmd::inspect(&a.archive, a.entries),
+        Kind::Trnc => {}
     }
     let archive = Archive::open(&a.archive)?;
     let m = archive.manifest();
@@ -477,13 +521,12 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
 }
 
 fn verify(a: VerifyArgs) -> Result<ExitCode> {
-    if let Some(kind) = legacy_kind(&a.archive) {
-        refuse_trust_flags(&a.trust.policy()?, kind)?;
-        return if kind == "tar.gz" {
-            tgz_cmd::verify(&a.archive)
-        } else {
-            zip_cmd::verify(&a.archive)
-        };
+    let kind = Kind::detect(&a.archive, a.stream.raw);
+    refuse_trust_flags(&a.trust.policy()?, kind)?;
+    match kind {
+        Kind::Stream(..) => return stream_cmd::verify(&a.archive, &a.stream.options()),
+        Kind::Zip => return zip_cmd::verify(&a.archive),
+        Kind::Trnc => {}
     }
     let archive = Archive::open(&a.archive)?;
     let t = Instant::now();
@@ -532,11 +575,12 @@ fn fits(f: Option<bool>) -> &'static str {
 }
 
 fn plan(a: PlanArgs) -> Result<ExitCode> {
-    if tgz_cmd::is_tgz(&a.archive) {
-        return tgz_cmd::plan(&a.archive, &a.dest);
-    }
-    if zip_cmd::is_zip(&a.archive) {
-        return zip_cmd::plan(&a.archive, &a.dest, true);
+    match Kind::detect(&a.archive, a.stream.raw) {
+        Kind::Stream(..) => {
+            return stream_cmd::plan(&a.archive, &a.dest, &a.stream.options());
+        }
+        Kind::Zip => return zip_cmd::plan(&a.archive, &a.dest, true),
+        Kind::Trnc => {}
     }
     use trunc_engine::preflight::{self, Severity};
     let archive = Archive::open(&a.archive)?;

@@ -14,6 +14,10 @@ trunc-hash = { path = "../crates/trunc-hash" }
 trunc-fs = { path = "../crates/trunc-fs" }
 trunc-legacy = { path = "../crates/trunc-legacy" }
 trunc-testkit = { path = "../crates/trunc-testkit" }
+# Reference decoders the stream targets compare against.
+bzip2 = "0.6"
+liblzma = { version = "0.4", features = ["static"] }
+zstd = { version = "0.13", default-features = false }
 
 [[bin]]
 name = "header"
@@ -53,6 +57,27 @@ bench = false
 [[bin]]
 name = "tar"
 path = "fuzz_targets/tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bzip2"
+path = "fuzz_targets/bzip2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xz"
+path = "fuzz_targets/xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zstd"
+path = "fuzz_targets/zstd.rs"
 test = false
 doc = false
 bench = false

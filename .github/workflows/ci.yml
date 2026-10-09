@@ -24,6 +24,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: compression tools for the interop tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd xz-utils bzip2 pigz pbzip2 lbzip2 pixz
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

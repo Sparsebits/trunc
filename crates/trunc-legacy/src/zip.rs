@@ -172,7 +172,7 @@ fn clean_name(name: &str) -> Result<(String, bool)> {
     let is_dir = unified.ends_with('/');
     let trimmed = unified.trim_end_matches('/');
     let nfc: String = trimmed.nfc().collect();
-    trunc_core::path::validate(&nfc).map_err(|e| name_err(e.to_string()))?;
+    trunc_core::path::validate_host(&nfc).map_err(|e| name_err(e.to_string()))?;
     Ok((nfc, is_dir))
 }
 
@@ -333,10 +333,15 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
         if is_dir && usize_ != 0 {
             return Err(corrupt(format!("directory {name:?} has content")));
         }
-        if !seen.insert(trunc_core::path::collision_key(&name)) {
+        if !seen.insert(trunc_core::path::host_key(&name)) {
             return Err(ZipError::Name {
                 name,
-                reason: "duplicate entry (case-insensitive)".into(),
+                reason: if cfg!(any(windows, target_os = "macos")) {
+                    "duplicate entry (names differ only in case)"
+                } else {
+                    "duplicate entry"
+                }
+                .into(),
             });
         }
         let mtime_unix = extra
@@ -438,12 +443,12 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| trunc_core::path::collision_key(&e.name))
+        .map(|e| trunc_core::path::host_key(&e.name))
         .collect();
     for e in &entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&trunc_core::path::collision_key(pp)) {
+            if files.contains(&trunc_core::path::host_key(pp)) {
                 return Err(ZipError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),
@@ -531,7 +536,7 @@ impl Layout {
             let mtime_unix = i64::from_le_bytes(r.take(8)?.try_into().ok()?);
             let nl = r.u32()? as usize;
             let name = String::from_utf8(r.take(nl)?.to_vec()).ok()?;
-            trunc_core::path::validate(&name).ok()?;
+            trunc_core::path::validate_host(&name).ok()?;
             entries.push(Entry {
                 name,
                 kind,
@@ -601,7 +606,7 @@ mod tests {
     fn names() {
         assert_eq!(clean_name("dir/").unwrap(), ("dir".into(), true));
         assert_eq!(clean_name("a\\b.txt").unwrap(), ("a/b.txt".into(), false));
-        for bad in ["../x", "/abs", "C:/x", "a/../../b", "", "con.txt"] {
+        for bad in ["../x", "/abs", "C:/x", "a/../../b", ""] {
             assert!(clean_name(bad).is_err(), "{bad:?} accepted");
         }
     }

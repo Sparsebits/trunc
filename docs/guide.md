@@ -42,19 +42,33 @@ Smaller blocks (`--block-size 4M`) mean less extra space during `--consume`; lar
 
 ## ZIP files
 
-`trunc x file.zip -C out --consume` handles Stored and Deflate entries, Zip64, self-extracting archives and names in UTF-8 or the old DOS code page. Encrypted archives, other compression methods and multi-part archives are refused.
+`trunc x file.zip -C out --consume` handles Stored and Deflate entries, Zip64, self-extracting archives and names in UTF-8 or the old DOS code page. Encrypted archives, other compression methods and spanned archives (`.z01`, `.z02`, …) are refused; parts cut by `split` or 7-Zip (`.001`) are read as one file (see [Split archives](#split-archives)).
 
 For ZIPs containing a few very large files, **punch mode** frees space *inside* each large entry as it decompresses, on NTFS and other filesystems that support sparse files. It applies to entries whose compressed size is at least `--punch-min` (default 256 MiB). Each such entry is fully verified once before any of it is freed. `--no-punch` turns it off.
 
-## .tar.gz files
+## Compressed tarballs and files
 
-`trunc x file.tar.gz -C out --consume` handles gzip-compressed tar archives from GNU tar, bsdtar, Python and most other writers: ustar, GNU long names, PAX headers, files over 8 GiB, and several gzip members back to back. Symlinks and device entries are skipped. Hard links, sparse files and multi-volume archives are refused for now.
+`trunc x file.tar.gz -C out --consume` handles tar archives compressed with gzip, bzip2, xz or zstd (`.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`), from GNU tar, bsdtar, Python and most other writers: ustar, GNU long names, PAX headers, files over 8 GiB, and several gzip members, bzip2 streams, xz streams or zstd frames back to back (as `pigz`, `pbzip2`, `xz -T0` and `pzstd` write them). The format is recognised from the content, not the name. Symlinks and device entries are skipped. Hard links, sparse files and multi-volume archives are refused for now.
 
-gzip can only be decompressed from the start, so trunc frees space from the front of the archive. It first decompresses the whole archive once to check every CRC and tar header, without writing anything. Then it extracts, and every 64 MiB of output (`--checkpoint-every`) it confirms the output matches that first pass, saves its position in a small journal, and frees the compressed bytes already used. The file keeps its size, but those bytes stop taking up disk space. That needs a filesystem that can free space inside a file (NTFS, ext4, XFS, btrfs, ZFS). Elsewhere `--consume` still works, but needs as much space as a normal extraction.
+A compressed file that is not a tar archive (`disk.img.xz`, `dump.sql.gz`) is decompressed into one file named without the suffix, in the destination: `trunc x disk.img.xz --consume` leaves `disk.img`. `--raw` does the same for a tarball, so `trunc x big.tar.zst --raw --consume` turns it into `big.tar` in place.
 
-The scan means a `.tar.gz` is decompressed twice. `trunc plan`, `inspect` and `verify` scan it too, since gzip records no sizes.
+A compressed stream can only be decoded from the start, so trunc frees space from the front of the archive. It first decompresses the whole archive once to check every checksum and tar header, without writing anything. Then it extracts, and every 64 MiB of output (`--checkpoint-every`) it confirms the output matches that first pass, saves its position in a small journal, and frees the compressed bytes already used. The file keeps its size, but those bytes stop taking up disk space. That needs a filesystem that can free space inside a file (NTFS, ext4, XFS, btrfs, ZFS). Elsewhere `--consume` still works, but needs as much space as a normal extraction.
 
-Signatures apply only to `.trnc` archives: `--require-signed` and `--trust-key` are refused for ZIP and `.tar.gz` files rather than ignored.
+xz and zstd decoders look back up to 8-128 MiB. When a consume resumes, trunc reads that window back from the files it has already written, plus a small sidecar (`<archive>.trncg`) holding the tar headers, so the journal stays small. `--max-window` (default 256M) refuses archives that would need more memory than that.
+
+The scan means the archive is decompressed twice. `trunc plan`, `inspect` and `verify` scan it too, since compressed streams record no reliable sizes.
+
+Signatures apply only to `.trnc` archives: `--require-signed` and `--trust-key` are refused for ZIP and compressed files rather than ignored.
+
+## Split archives
+
+Pass the first part of a split archive (`big.tar.zst.001` or `big.tar.zst.aa`) and trunc reads the parts as one file: `x`, `inspect`, `verify` and `plan` work for every format. Naming a later part is an error that points at the first.
+
+With `--consume`, compressed tarballs and files delete each part as soon as its data is safely extracted. This frees space on any filesystem, FAT32 and exFAT included (which still need `--allow-unjournaled`). Split ZIP and `.trnc` archives can be extracted but not consumed yet.
+
+## Names on Linux and macOS
+
+`.trnc` archives only hold names that work on Windows, macOS and Linux. Archives from other tools often don't: Linux tarballs contain names with backslashes or colons, and source trees have files that differ only in case (`Makefile` and `makefile`). On Linux and macOS, trunc accepts the names the system can hold; on Windows it refuses them before writing anything. Names that could reach outside the destination (`..`, absolute paths, `C:` prefixes) are refused everywhere.
 
 ## Exit codes
 

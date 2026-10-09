@@ -223,6 +223,10 @@ pub trait FileHandle: Send + Sync + Debug {
     fn allocated_ranges(&self) -> Result<Vec<Range<u64>>>;
     fn file_id(&self) -> Result<FileId>;
     fn set_modified(&self, t: SystemTime) -> Result<()>;
+    /// Last modification time, where the backend records one.
+    fn modified(&self) -> Result<Option<SystemTime>> {
+        Ok(None)
+    }
 }
 
 /// Filesystem operations the engine needs. Paths are never followed through links: opening or
