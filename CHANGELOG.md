@@ -4,48 +4,6 @@ All notable changes to trunc. The format follows [Keep a Changelog](https://keep
 and versions follow [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may
 change the command line; the `.trnc` v1 format is frozen.
 
-## [Unreleased]
-
-### Added
-- `.tar.bz2`, `.tar.xz` and `.tar.zst`, alongside `.tar.gz`: `x`, `inspect`, `verify`, `plan`,
-  `--consume` and `resume`. trunc has its own resumable bzip2, xz (LZMA2) and zstd decoders, so
-  consuming frees space every 64 MiB on any file, not just at frame boundaries. Files made by
-  `pigz`, `pbzip2`, `xz -T0`, `pzstd` and `zstd --long` work.
-- Single compressed files (`disk.img.xz`, `dump.sql.gz`, `model.bin.zst`, `notes.bz2`) are
-  decompressed into one file named without the suffix, with or without `--consume`. `--raw`
-  does the same for a tarball (`big.tar.zst` becomes `big.tar`).
-- Split archives: pass the first part (`name.001` or `name.aa`) and the parts are read as one
-  file, for every format. With `--consume`, compressed tarballs and files delete each part once
-  its data is extracted, which frees space even on FAT32 and exFAT.
-- `--max-window` (default 256M) refuses xz and zstd archives whose decoder would need more memory.
-- `--profile FILE` (or `TRUNC_PROFILE`) on any command prints where the time went (self and
-  total time, bytes and throughput per span) and writes a Chrome trace for Perfetto.
-
-### Changed
-- Faster with many small files: outputs and directories are flushed to disk in parallel,
-  Windows checks each opened output's real location instead of every path component (fewer
-  calls, and nothing can be written through a junction), and redundant metadata lookups,
-  preallocations and gap-log writes are gone. Consuming a tarball of 4,000 small files went from
-  7.0 s to 2.2 s on Windows; `.trnc` consume and extract of large files are about 1.4x faster.
-  ZIP consume flushes and truncates once per group of small entries instead of once per entry
-  (8.3 s to 2.5 s for 4,000 files), outputs are opened ahead and closed behind on worker
-  threads, and `create` walks directories and reads input files in parallel (1.3 s to 0.5 s
-  for 4,000 files). Archives keep the same bytes.
-- Planning and consuming `.trnc` archives with millions of blocks no longer takes time
-  quadratic in the block count.
-- Decoders: bzip2 blocks, the blocks of multi-block xz streams (what `xz -T0` writes) and
-  zstd frames that declare their size decode on all cores, which speeds up both passes of
-  `--consume` as well as `x` and `verify`. On a 437 MiB tarball, consuming `.tar.xz` went from
-  8.8 s to 1.9 s and `.tar.bz2` from 17.4 s to 4.5 s. On one core, gzip decodes about 1.7x
-  faster, zstd about 40%, xz about 15% (sliced CRC-64). Multi-block xz streams now free space
-  between blocks rather than inside them.
-- On Linux and macOS, tar and ZIP entries may use names that only Windows forbids (backslashes,
-  colons, trailing dots, `CON`), and on Linux names that differ only in case are separate files.
-  Real Linux tarballs, including the kernel source, failed before. Windows keeps the portable
-  rules, and `.trnc` archives always use them.
-- The journal for compressed archives is now `TSJP1`; `.tar.gz` consumes paused by 0.1.0 still
-  resume.
-
 ## [0.1.0] - 2026-10-09
 
 The first release.
@@ -58,6 +16,8 @@ The first release.
   Ed25519 (`trunc key gen`, `--sign`, `--require-signed`, `--trust-key`).
 - `trunc inspect`, `trunc verify` and `trunc plan` show what is inside, check every hash, and work
   out the free space each kind of extraction needs.
+- `--profile FILE` (or `TRUNC_PROFILE`) on any command prints where the time went (self and
+  total time, bytes and throughput per span) and writes a Chrome trace for Perfetto.
 
 ### Extracting while freeing the archive
 - `trunc x --consume` extracts a `.trnc` archive and shrinks it as each batch of files reaches the
@@ -77,14 +37,26 @@ The first release.
   saves its position every 64 MiB of output.
 - Overlapping entries (a zip-bomb technique) are refused unless you pass `--allow-overlap`.
 
-### Existing .tar.gz files
-- `trunc x big.tar.gz --consume` frees the compressed bytes from the front of the archive as
-  they are decoded. A read-only pass first checks every gzip CRC, tar header and name; each
-  64 MiB stretch of output must then hash as it did in that pass before its compressed bytes are
-  released.
-- `x`, `inspect`, `verify`, `plan` and `resume` all handle `.tar.gz`: ustar, GNU long names, PAX,
-  base-256 sizes and several gzip members. Hard links, sparse files and multi-volume archives are
-  refused for now; symlinks and device entries are skipped.
+### Existing compressed tarballs and files
+- `trunc x big.tar.zst --consume` (also `.tar.gz`, `.tar.xz`, `.tar.bz2`) frees the compressed
+  bytes from the front of the archive as they are decoded. A read-only pass first checks every
+  codec checksum, tar header and name; each 64 MiB stretch of output must then hash as it did in
+  that pass before its compressed bytes are released.
+- trunc has its own resumable gzip, bzip2, xz (LZMA2) and zstd decoders, so it frees space every
+  64 MiB on any file, not just at frame boundaries. Files made by `pigz`, `pbzip2`, `xz -T0`,
+  `pzstd` and `zstd --long` work. bzip2 blocks, multi-block xz streams and zstd frames that
+  declare their size decode on all cores.
+- Single compressed files (`disk.img.xz`, `dump.sql.gz`, `model.bin.zst`, `notes.bz2`) are
+  decompressed into one file named without the suffix, with or without `--consume`. `--raw`
+  does the same for a tarball (`big.tar.zst` becomes `big.tar`).
+- Split archives: pass the first part (`name.001` or `name.aa`) and the parts are read as one
+  file, for every format. With `--consume`, compressed tarballs and files delete each part once
+  its data is extracted, which frees space even on FAT32 and exFAT.
+- `x`, `inspect`, `verify`, `plan` and `resume` all handle them: ustar, GNU long names, PAX,
+  base-256 sizes, several gzip members or zstd frames, concatenated xz and bzip2 streams. Hard
+  links, sparse files and multi-volume tar archives are refused for now; symlinks and device
+  entries are skipped. `--max-window` (default 256M) refuses xz and zstd archives whose decoder
+  would need more memory.
 
 ### Safety checks
 - Hostile paths are refused: absolute paths, `..`, drive letters, device names, alternate data
@@ -96,7 +68,11 @@ The first release.
   `--allow-sync` or `--allow-unjournaled`). It warns about snapshots, which keep freed space
   allocated.
 - `--require-signed` and `--trust-key` apply to `.trnc` only; they are refused for ZIP and
-  `.tar.gz`, which carry no signatures.
+  compressed tarballs, which carry no signatures.
+- On Linux and macOS, tar and ZIP entries may use names that only Windows forbids (backslashes,
+  colons, trailing dots, `CON`), and on Linux names that differ only in case are separate files,
+  so real Linux tarballs such as the kernel source extract. Windows keeps the portable rules,
+  and `.trnc` archives always use them.
 
 ### Platforms
 - Windows (NTFS) and Linux (ext4, XFS, btrfs, ZFS), both with every feature. Prebuilt binaries
@@ -105,5 +81,4 @@ The first release.
 - Install scripts: `install.sh` (Linux) and `install.ps1` (Windows). Both verify the download's
   SHA-256 before installing.
 
-[Unreleased]: https://github.com/Sparsebits/trunc/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Sparsebits/trunc/releases/tag/v0.1.0
