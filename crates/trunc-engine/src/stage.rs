@@ -53,7 +53,7 @@ pub(crate) struct StageGuard<'a> {
     /// of these (e.g. a hard link planted in the staging directory) is refused. It is asked at
     /// each open, because a deleted part of a split archive frees its id for reuse (Linux hands
     /// inode numbers out again at once).
-    pub protected: &'a dyn Fn(&trunc_fs::FileId) -> bool,
+    pub protected: &'a (dyn Fn(&trunc_fs::FileId) -> bool + Sync),
 }
 
 impl std::fmt::Debug for StageGuard<'_> {
@@ -344,11 +344,13 @@ pub(crate) fn rename_into_place(
         }
     }
     let tops = top_level_names(items);
+    // One listing instead of a lookup per name (archives often have thousands at the top).
+    let staged: std::collections::HashSet<String> = fs.read_dir(stage)?.into_iter().collect();
     for name in &tops {
-        let from = stage.join(name);
-        if fs.metadata(&from)?.is_none() {
+        if !staged.contains(name) {
             continue; // already moved by an earlier run
         }
+        let from = stage.join(name);
         match fs.rename(&from, &dest.join(name)) {
             Ok(()) => {}
             Err(FsError::AlreadyExists { path }) => {
@@ -360,10 +362,9 @@ pub(crate) fn rename_into_place(
             Err(e) => return Err(e.into()),
         }
     }
-    if let Some(missing) = tops
-        .iter()
-        .find(|n| fs.metadata(&dest.join(n)).ok().flatten().is_none())
-    {
+    let present = fs.read_dir(dest)?;
+    let present: std::collections::HashSet<&str> = present.iter().map(String::as_str).collect();
+    if let Some(missing) = tops.iter().find(|n| !present.contains(n.as_str())) {
         return Err(Error::Integrity(format!(
             "{} is missing from {} after moving files into place",
             missing,

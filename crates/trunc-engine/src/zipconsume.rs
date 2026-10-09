@@ -14,6 +14,7 @@
 //! are deallocated. The entry's CRC is verified in a read-only pass first, because once bytes
 //! are punched a corrupt entry could no longer be retried.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use trunc_core::space::SpaceParams;
@@ -183,6 +184,47 @@ fn ends_after(layout: &Layout, order: &[usize]) -> Vec<u64> {
     after
 }
 
+/// Files in one group at most (each stays open until the group is flushed).
+const GROUP_MAX_FILES: usize = 256;
+
+/// Positions in `order`, grouped: entries in a group are extracted, then flushed together and
+/// released with one truncation. Punch-mode entries stand alone (they release as they go);
+/// other entries fill a group up to `batch_max_u` bytes of output or `GROUP_MAX_FILES` files.
+/// The planner and the consumer both use this, so they agree on the peak.
+fn groups(
+    order: &[usize],
+    layout: &Layout,
+    punch: &dyn Fn(&Entry) -> bool,
+    batch_max_u: u64,
+) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes, mut files) = (0usize, 0u64, 0usize);
+    for (pos, &i) in order.iter().enumerate() {
+        let e = &layout.entries[i];
+        if punch(e) {
+            if pos > start {
+                out.push(start..pos);
+            }
+            out.push(pos..pos + 1);
+            (start, bytes, files) = (pos + 1, 0, 0);
+            continue;
+        }
+        let is_file = e.kind == Kind::File && e.size > 0;
+        if pos > start && is_file && (bytes + e.size > batch_max_u || files >= GROUP_MAX_FILES) {
+            out.push(start..pos);
+            (start, bytes, files) = (pos, 0, 0);
+        }
+        if is_file {
+            bytes += e.size;
+            files += 1;
+        }
+    }
+    if start < order.len() {
+        out.push(start..order.len());
+    }
+    out
+}
+
 fn should_punch(layout: &Layout, e: &Entry, opts: &ConsumeOptions, can_dealloc: bool) -> bool {
     opts.zip.punch == PunchPolicy::Auto
         && can_dealloc
@@ -223,19 +265,26 @@ pub fn zip_space(
     let mut written = 0u64;
     let mut remaining_u = 0u64;
     let mut slack = 0u64;
-    for (pos, &i) in order.iter().enumerate() {
-        let e = &layout.entries[i];
-        if e.region_end > len {
-            continue;
-        }
-        slack += params.per_entry_overhead;
-        if e.kind == Kind::File {
+    let punch = |e: &Entry| should_punch(layout, e, opts, can_dealloc);
+    for g in groups(&order, layout, &punch, params.batch_max_u) {
+        // A group's outputs all exist before its truncation.
+        let mut group_out = 0u64;
+        for &i in &order[g.clone()] {
+            let e = &layout.entries[i];
+            if e.region_end > len {
+                continue;
+            }
+            slack += params.per_entry_overhead;
+            if e.kind != Kind::File {
+                continue;
+            }
             let cl = params.cluster_size.max(1);
             slack += e.size.div_ceil(cl) * cl - e.size;
             remaining_u += e.size;
-            let entry_mode = len + written + e.size;
+            group_out += e.size;
+            let entry_mode = len + written + group_out;
             guaranteed = guaranteed.max(entry_mode);
-            let est = if should_punch(layout, e, opts, can_dealloc) && e.size > 0 {
+            let est = if punch(e) && e.size > 0 {
                 let window = opts.zip.checkpoint_every + BLOCK_SLACK;
                 let tail = u64::try_from(
                     u128::from(window) * u128::from(e.compressed_size) / u128::from(e.size),
@@ -249,9 +298,9 @@ pub fn zip_space(
                 est.min(entry_mode)
                     .max(len + written + window_floor(opts, e)),
             );
-            written += e.size;
         }
-        len = len.min(after[pos]);
+        written += group_out;
+        len = len.min(after[g.end - 1]);
     }
     let margin = params.margin_fixed + remaining_u / 1_000_000 * params.margin_ppm;
     let consume_peak = peak + slack + margin;
@@ -372,16 +421,17 @@ fn media_mismatch(name: &str) -> Error {
     ))
 }
 
-/// Extract one entry into the staging area (whole entry before any of it is released).
+/// Extract one entry into the staging area (whole entry before any of it is released). The
+/// caller flushes it (with the rest of its group) and checks the media; returns the output and
+/// whether it was created.
 fn extract_whole(
     fs: &dyn FsBackend,
     archive: &dyn FileHandle,
     e: &Entry,
     p: &Path,
     need_free: u64,
-    verify: bool,
     guard: &StageGuard<'_>,
-) -> Result<()> {
+) -> Result<(Box<dyn FileHandle>, bool)> {
     let (out, created) = open_staged_output(fs, guard, p)?;
     out.preallocate(e.size).map_err(|x| nospace(x, need_free))?;
     let mut off = 0u64;
@@ -397,14 +447,7 @@ fn extract_whole(
     )?;
     out.set_len(e.size)?;
     out.set_modified(system_time(e.mtime_unix, 0))?;
-    out.flush_data()?;
-    if created {
-        fs.flush_dir(&parent_of(p))?;
-    }
-    if verify && verified_crc(out.as_ref(), 0, e.size, 0)? != Some(e.crc32) {
-        return Err(media_mismatch(&e.name));
-    }
-    Ok(())
+    Ok((out, created))
 }
 
 /// Extract one entry, freeing its compressed bytes as checkpoints are reached.
@@ -831,47 +874,64 @@ pub fn consume_zip(
         len = all_max;
     }
 
-    for (pos, &i) in order.iter().enumerate() {
-        let e = &layout.entries[i];
-        if e.region_end > len {
-            continue; // consumed by an earlier run
-        }
-        let _entry = trunc_prof::span("zip.entry").bytes(e.size);
-        if e.kind == Kind::File && e.size > 0 {
-            let p = join_rel(&stage, &e.name);
-            if should_punch(layout, e, opts, can_dealloc) {
-                let index = u32::try_from(i).expect("entry count fits u32");
-                let resume = latest
-                    .as_ref()
-                    .filter(|c| c.entry == index)
-                    .map(|c| c.inflate.clone());
-                extract_punching(
-                    fs,
-                    handle.as_ref(),
-                    &mut journal,
-                    index,
-                    e,
-                    &p,
-                    resume,
-                    opts.zip.checkpoint_every.max(1),
-                    need_free,
-                    opts.verify_media,
-                    &guard,
-                )?;
-            } else {
-                extract_whole(
-                    fs,
-                    handle.as_ref(),
-                    e,
-                    &p,
-                    need_free,
-                    opts.verify_media,
-                    &guard,
-                )?;
+    let punch = |e: &Entry| should_punch(layout, e, opts, can_dealloc);
+    for g in groups(&order, layout, &punch, opts.space.batch_max_u) {
+        let _group = trunc_prof::span("zip.group");
+        // Outputs of this group, flushed together before its compressed bytes are released.
+        let mut outs: Vec<(Box<dyn FileHandle>, &Entry)> = Vec::new();
+        let mut new_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        for pos in g.clone() {
+            let i = order[pos];
+            let e = &layout.entries[i];
+            if e.region_end > len {
+                continue; // consumed by an earlier run
             }
-            summary.bytes_written += e.size;
+            let _entry = trunc_prof::span("zip.entry").bytes(e.size);
+            if e.kind == Kind::File && e.size > 0 {
+                let p = join_rel(&stage, &e.name);
+                if punch(e) {
+                    let index = u32::try_from(i).expect("entry count fits u32");
+                    let resume = latest
+                        .as_ref()
+                        .filter(|c| c.entry == index)
+                        .map(|c| c.inflate.clone());
+                    extract_punching(
+                        fs,
+                        handle.as_ref(),
+                        &mut journal,
+                        index,
+                        e,
+                        &p,
+                        resume,
+                        opts.zip.checkpoint_every.max(1),
+                        need_free,
+                        opts.verify_media,
+                        &guard,
+                    )?;
+                } else {
+                    let (out, created) =
+                        extract_whole(fs, handle.as_ref(), e, &p, need_free, &guard)?;
+                    if created {
+                        new_dirs.insert(parent_of(&p));
+                    }
+                    outs.push((out, e));
+                }
+                summary.bytes_written += e.size;
+            }
         }
-        let target = after[pos];
+        // Durability before release: the group's data, then its new directory entries.
+        let files: Vec<&dyn FileHandle> = outs.iter().map(|(h, _)| h.as_ref()).collect();
+        let dirs: Vec<PathBuf> = new_dirs.into_iter().collect();
+        fs.flush_all(&files, &dirs)?;
+        if opts.verify_media {
+            for (out, e) in &outs {
+                if verified_crc(out.as_ref(), 0, e.size, 0)? != Some(e.crc32) {
+                    return Err(media_mismatch(&e.name));
+                }
+            }
+        }
+        trunc_fs::close_all(outs.into_iter().map(|(h, _)| h).collect());
+        let target = after[g.end - 1];
         if target < len {
             let _release = trunc_prof::span("zip.release");
             truncate_with_retry(handle.as_ref(), target, opts.retry)?;
@@ -880,7 +940,7 @@ pub fn consume_zip(
         }
         summary.batches += 1;
         progress(Progress::Batch {
-            blocks_done: pos + 1,
+            blocks_done: g.end,
             blocks_total: order.len(),
             bytes_written: summary.bytes_written,
             archive_len: len,
@@ -1017,27 +1077,34 @@ pub fn extract_zip(
         }
         summary.dirs += 1;
     }
-    for e in &layout.entries {
-        match e.kind {
-            Kind::Dir => continue,
-            Kind::Symlink => {
-                summary.symlinks_skipped += 1;
-                continue;
-            }
-            Kind::File => {}
-        }
+    summary.symlinks_skipped = layout
+        .entries
+        .iter()
+        .filter(|e| e.kind == Kind::Symlink)
+        .count();
+    let files: Vec<&Entry> = layout
+        .entries
+        .iter()
+        .filter(|e| e.kind == Kind::File)
+        .collect();
+    let one = |e: &Entry| -> Result<u64> {
         let p = join_rel(dest, &e.name);
-        if let Some(m) = fs.metadata(&p)? {
-            if !overwrite || m.kind != NodeKind::File {
-                return Err(Error::Refused(format!("{} already exists", p.display())));
-            }
+        // Without --overwrite, creating "new" refuses an existing file or link by itself.
+        if overwrite && fs.metadata(&p)?.is_some_and(|m| m.kind != NodeKind::File) {
+            return Err(Error::Refused(format!("{} already exists", p.display())));
         }
         let mode = if overwrite {
             OpenMode::CreateOrTruncate
         } else {
             OpenMode::CreateNew
         };
-        let out = fs.open(&p, mode, Share::Exclusive)?;
+        let out = match fs.open(&p, mode, Share::Exclusive) {
+            Ok(o) => o,
+            Err(FsError::AlreadyExists { .. }) => {
+                return Err(Error::Refused(format!("{} already exists", p.display())));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut off = 0u64;
         decode_entry(
             h.as_ref(),
@@ -1054,8 +1121,19 @@ pub fn extract_zip(
         if let Some(m) = e.mode {
             fs.set_mode(&p, m)?;
         }
+        Ok(e.size)
+    };
+    // Entries are independent: decode and write them on several threads where the backend
+    // allows it.
+    let done: Vec<Result<u64>> = if fs.parallel_io() {
+        use rayon::prelude::*;
+        files.par_iter().map(|e| one(e)).collect()
+    } else {
+        files.iter().map(|e| one(e)).collect()
+    };
+    for r in done {
+        summary.bytes_written += r?;
         summary.files += 1;
-        summary.bytes_written += e.size;
     }
     Ok(summary)
 }

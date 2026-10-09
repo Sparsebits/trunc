@@ -116,9 +116,17 @@ impl Archive {
     /// Record that the file was truncated to just past `consumed` blocks.
     pub(crate) fn note_consumed(&mut self, consumed: usize) {
         self.consumed = consumed;
-        self.file_len = self
-            .manifest()
-            .len_after_consuming(self.header.first_block_off(), consumed);
+        self.file_len = self.len_after_consuming(consumed);
+    }
+
+    /// Bytes left in the file once `consumed` blocks are gone (from the offsets computed at
+    /// open, so this is constant time).
+    pub(crate) fn len_after_consuming(&self, consumed: usize) -> u64 {
+        if consumed == 0 {
+            self.manifest().archive_len(self.header.first_block_off())
+        } else {
+            self.offsets[consumed - 1]
+        }
     }
 
     pub fn path(&self) -> &Path {

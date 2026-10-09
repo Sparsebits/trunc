@@ -257,6 +257,12 @@ pub trait FsBackend: Send + Sync + Debug {
     }
     /// Make directory entries created, renamed or removed in `dir` durable.
     fn flush_dir(&self, dir: &Path) -> Result<()>;
+    /// Whether callers may issue calls from several threads at once to hide latency (the OS
+    /// backend). The fault-injecting test backend says no, so its operations keep a fixed
+    /// order and crash points stay reproducible.
+    fn parallel_io(&self) -> bool {
+        false
+    }
     /// Make the data of every file in `files`, then the entries of every directory in `dirs`,
     /// durable. The OS backend flushes in parallel, which lets the drive and the filesystem
     /// journal combine the work; the result is the same as flushing one by one.

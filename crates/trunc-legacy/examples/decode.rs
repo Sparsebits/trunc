@@ -1,5 +1,6 @@
 //! Time a decoder alone: `cargo run --release -p trunc-legacy --example decode -- <file>`.
-//! Detects the codec, decodes the whole file, discards the output.
+//! Detects the codec, decodes the whole file, discards the output. `TRUNC_THREADS=1` decodes
+//! on one thread.
 
 use std::path::Path;
 use std::time::Instant;
@@ -30,7 +31,13 @@ fn main() {
             },
             None,
             &mut NoHistory,
-            Limits::new(u64::MAX),
+            Limits {
+                threads: std::env::var("TRUNC_THREADS")
+                    .ok()
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0),
+                ..Limits::new(u64::MAX)
+            },
             0,
             &mut |b| {
                 out += b.len() as u64;

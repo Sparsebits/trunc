@@ -104,8 +104,14 @@ pub fn bound(m: &Manifest, first_block_off: u64, consumed: usize, p: &SpaceParam
     let mut peak = archive_len; // before anything happens
     let mut written = 0u64;
     let groups = batches(m, consumed, p.batch_max_u);
+    // Offsets once: asking `len_after_consuming` per group would make this quadratic.
+    let offs = m.block_offsets(first_block_off);
     for g in &groups {
-        let before = m.len_after_consuming(first_block_off, g.start);
+        let before = if g.start == 0 {
+            m.archive_len(first_block_off)
+        } else {
+            offs[g.start - 1]
+        };
         let batch_u: u64 = m.blocks[g.clone()].iter().map(|b| b.u_len).sum();
         // Outputs for this batch are allocated while its source blocks still exist.
         peak = peak.max(before + written + batch_u);
@@ -174,6 +180,23 @@ mod tests {
         assert_eq!(later.remaining_u, 22);
         assert!(later.archive_len < fresh.archive_len);
         assert_eq!(later.batches, 1);
+    }
+
+    /// Millions of blocks, one per batch: the bound is linear in the block count (it used to
+    /// rebuild the offset table for every batch).
+    #[test]
+    fn many_blocks_stay_linear() {
+        let mut m = sample();
+        let one = m.blocks[0];
+        m.blocks = vec![one; 2_000_000];
+        let t = std::time::Instant::now();
+        let b = bound(&m, 1000, 0, &no_allowances(1));
+        assert_eq!(b.batches, 2_000_000);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

@@ -30,6 +30,17 @@ fn decode(
     history: &mut dyn History,
     every: u64,
 ) -> Result<(Vec<u8>, Vec<Point>, stream::StreamEnd), StreamError> {
+    decode_threads(codec, h, start, history, every, 0)
+}
+
+fn decode_threads(
+    codec: Codec,
+    h: &dyn FileHandle,
+    start: Option<&[u8]>,
+    history: &mut dyn History,
+    every: u64,
+    threads: usize,
+) -> Result<(Vec<u8>, Vec<Point>, stream::StreamEnd), StreamError> {
     let mut out = Vec::new();
     let mut points = Vec::new();
     let len = h.size().unwrap();
@@ -38,7 +49,10 @@ fn decode(
         Input { src: h, len },
         start,
         history,
-        Limits::new(u64::MAX),
+        Limits {
+            threads,
+            ..Limits::new(u64::MAX)
+        },
         every,
         &mut |b| {
             out.extend_from_slice(b);
@@ -347,5 +361,79 @@ fn zstd_refuses_huffman_tables_the_reference_refuses() {
     match decode(Codec::Zstd, h.as_ref(), None, &mut NoHistory, 0) {
         Err(StreamError::Corrupt(_)) => {}
         other => panic!("{:?}", other.map(|r| r.0)),
+    }
+}
+
+/// Files whose blocks or frames decode on several threads: the output and every safe point are
+/// the same as with one thread, and resuming works from each.
+#[test]
+fn parallel_decoding_matches_sequential() {
+    let mut rng = Rng::new(35);
+    let mut d = fixtures::noise_bytes(&mut rng, 2 << 20);
+    d.extend(fixtures::text_bytes(&mut rng, 3 << 20));
+    d.extend(structured(36, 1 << 20));
+    // Each case with the output ranges where a safe point may fall inside a unit (a block or
+    // frame decoded piece by piece); everywhere else they fall between units.
+    let mb = |n: u64| n << 20;
+    let last_frame = mb(5) + 1..=mb(6);
+    let cases: Vec<(Codec, Vec<u8>, Vec<std::ops::RangeInclusive<u64>>)> = vec![
+        (Codec::Bzip2, tarbuild::bzip2(&d, 1), vec![]),
+        (
+            Codec::Bzip2,
+            tarbuild::bzip2_streams(&d, 1 << 20, 3),
+            vec![],
+        ),
+        (
+            Codec::Xz,
+            tarbuild::xz_with(&d, 1, XzCheck::Crc64, Some(1 << 20)),
+            vec![],
+        ),
+        (
+            Codec::Xz,
+            tarbuild::xz_with(&d, 6, XzCheck::Sha256, Some(700_000)),
+            vec![],
+        ),
+        // The last frame is followed by nothing, so it is not decoded whole.
+        (
+            Codec::Zstd,
+            tarbuild::zstd_frames(&d, 1 << 20, 3),
+            vec![last_frame.clone()],
+        ),
+        // Nor is a frame that does not declare its size.
+        (
+            Codec::Zstd,
+            {
+                let mut b = tarbuild::zstd_frames(&d[..2 << 20], 1 << 20, 3);
+                b.extend(tarbuild::zstd(&d[2 << 20..3 << 20], 3));
+                b.extend(tarbuild::zstd_frames(&d[3 << 20..], 1 << 20, 3));
+                b
+            },
+            vec![mb(2) + 1..=mb(3), last_frame],
+        ),
+    ];
+    for (codec, bytes, inside) in cases {
+        let (_fs, h) = host(&bytes);
+        let one = decode_threads(codec, h.as_ref(), None, &mut NoHistory, 256 << 10, 1).unwrap();
+        let many = decode_threads(codec, h.as_ref(), None, &mut NoHistory, 256 << 10, 8).unwrap();
+        assert!(one.0 == d && many.0 == d, "{codec:?}: output");
+        assert_eq!(one.1, many.1, "{codec:?}: safe points");
+        assert!(one.1.len() > 5, "{codec:?}: {} safe points", one.1.len());
+        // Cursor tags between units: xz 3 (blocks of a multi-block stream), zstd 0 (frames);
+        // bzip2 cursors are always between blocks.
+        let between = match codec {
+            Codec::Xz => Some(3),
+            Codec::Zstd => Some(0),
+            _ => None,
+        };
+        if let Some(tag) = between {
+            for p in &one.1 {
+                assert!(
+                    p.0[0] == tag || inside.iter().any(|r| r.contains(&p.1)),
+                    "{codec:?}: a safe point inside a unit at {}",
+                    p.1
+                );
+            }
+        }
+        check(codec, &d, &bytes, 256 << 10);
     }
 }

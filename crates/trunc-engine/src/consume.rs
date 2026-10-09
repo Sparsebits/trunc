@@ -438,6 +438,34 @@ fn consume_blocks(
         let mut touched: BTreeSet<usize> = BTreeSet::new();
         let mut completed: Vec<usize> = Vec::new();
         let mut new_parents: BTreeSet<PathBuf> = BTreeSet::new();
+        if fs.parallel_io() {
+            // Open this batch's new outputs on several threads before writing them.
+            let mut fresh: Vec<usize> = Vec::new();
+            for i in g.clone() {
+                let b = &m.blocks[i];
+                for r in archive_ref.stream().runs(b.stream_off, b.u_len) {
+                    if !open.contains_key(&r.entry) && fresh.last() != Some(&r.entry) {
+                        fresh.push(r.entry);
+                    }
+                }
+            }
+            let opened: Result<Vec<_>> = pool.install(|| {
+                fresh
+                    .par_iter()
+                    .map(|&entry| {
+                        let p = join_rel(stage, &m.entries[entry].path);
+                        let (h, created) = open_staged_output(fs, &guard, &p)?;
+                        Ok((entry, h, created))
+                    })
+                    .collect()
+            });
+            for (entry, h, created) in opened? {
+                if created {
+                    new_parents.insert(parent_of(&join_rel(stage, &m.entries[entry].path)));
+                }
+                open.insert(entry, h);
+            }
+        }
         for (i, buf) in g.clone().zip(decoded) {
             let buf = buf?;
             let b = &m.blocks[i];
@@ -525,7 +553,7 @@ fn consume_blocks(
         trunc_fs::close_all(completed.iter().filter_map(|e| open.remove(e)).collect());
         // Release the batch's blocks and make the release itself durable.
         let release = trunc_prof::span("consume.release");
-        let new_len = m.len_after_consuming(fbo, g.end);
+        let new_len = archive.len_after_consuming(g.end);
         truncate_with_retry(archive.handle(), new_len, opts.retry)?;
         archive.handle().flush_data()?;
         drop(release);

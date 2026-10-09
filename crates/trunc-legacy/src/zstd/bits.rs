@@ -151,6 +151,13 @@ impl<'a> Backward<'a> {
         self.acc >> (64 - n)
     }
 
+    /// The next `n` bits (1 <= n, and no more than [`Backward::ensure`] made sure of) without
+    /// consuming them.
+    #[inline]
+    pub(super) fn peek_filled(&self, n: u32) -> u64 {
+        self.acc >> (64 - n)
+    }
+
     /// Consume `n` bits after a [`Backward::peek`] of at least `n`.
     #[inline]
     pub(super) fn skip(&mut self, n: u32) {

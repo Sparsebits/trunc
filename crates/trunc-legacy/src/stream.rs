@@ -195,6 +195,9 @@ pub struct Limits {
     pub max_out: u64,
     /// Largest decoder window (and so memory) allowed.
     pub max_window: u64,
+    /// Threads for decoding independent blocks or frames side by side (0: one per core, 1: no
+    /// extra threads). The output and the safe points are the same whatever the count.
+    pub threads: usize,
 }
 
 impl Limits {
@@ -204,8 +207,96 @@ impl Limits {
         Self {
             max_out,
             max_window: Self::DEFAULT_MAX_WINDOW,
+            threads: 0,
         }
     }
+
+    /// Worker threads to use: the configured count, or one per core.
+    pub(crate) fn workers(&self) -> usize {
+        match self.threads {
+            0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            n => n,
+        }
+    }
+}
+
+/// Decode `n` independent units on up to `threads` threads and hand each result to `take` in
+/// order, from the calling thread. Workers run at most `ahead` units past the one being taken,
+/// which bounds memory. The first error (from a unit or from `take`) stops everything.
+pub(crate) fn ordered_parallel<T: Send>(
+    n: usize,
+    threads: usize,
+    ahead: usize,
+    work: &(dyn Fn(usize) -> Result<T> + Sync),
+    take: &mut dyn FnMut(usize, T) -> Result<()>,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::{Condvar, Mutex, PoisonError};
+    if threads <= 1 || n <= 1 {
+        for i in 0..n {
+            take(i, work(i)?)?;
+        }
+        return Ok(());
+    }
+    struct State<T> {
+        claimed: usize,
+        taken: usize,
+        stop: bool,
+        done: BTreeMap<usize, Result<T>>,
+    }
+    let state = Mutex::new(State {
+        claimed: 0,
+        taken: 0,
+        stop: false,
+        done: BTreeMap::new(),
+    });
+    let cv = Condvar::new();
+    let ahead = ahead.max(1);
+    let lock = || state.lock().unwrap_or_else(PoisonError::into_inner);
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(n) {
+            s.spawn(|| {
+                let mut st = lock();
+                loop {
+                    while !st.stop && st.claimed < n && st.claimed >= st.taken + ahead {
+                        st = cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+                    }
+                    if st.stop || st.claimed >= n {
+                        return;
+                    }
+                    let i = st.claimed;
+                    st.claimed += 1;
+                    drop(st);
+                    let r = work(i);
+                    st = lock();
+                    st.done.insert(i, r);
+                    cv.notify_all();
+                }
+            });
+        }
+        let result = (|| {
+            for i in 0..n {
+                let r = {
+                    let mut st = lock();
+                    loop {
+                        if let Some(r) = st.done.remove(&i) {
+                            st.taken = i + 1;
+                            cv.notify_all();
+                            break r;
+                        }
+                        st = cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+                    }
+                };
+                take(i, r?)?;
+            }
+            Ok(())
+        })();
+        let mut st = lock();
+        st.stop = true;
+        cv.notify_all();
+        drop(st);
+        result
+    })
 }
 
 /// How a complete decode ended.
@@ -262,7 +353,11 @@ pub fn peek(codec: Codec, input: Input<'_>, n: usize) -> Result<Vec<u8>> {
         input,
         None,
         &mut NoHistory,
-        Limits::new(u64::MAX),
+        // No threads: they would decode whole blocks ahead that nobody reads.
+        Limits {
+            threads: 1,
+            ..Limits::new(u64::MAX)
+        },
         0,
         &mut |b| {
             let take = (n - first.len()).min(b.len());
@@ -346,4 +441,124 @@ impl<'a> Fields<'a> {
 
 pub(crate) fn bad_cursor() -> StreamError {
     StreamError::Corrupt("journaled decoder state is unreadable".into())
+}
+
+/// Units decoded ahead on worker threads and taken by index, in increasing order (indices
+/// that are skipped are dropped). See [`with_ahead`].
+pub(crate) struct Ahead<'w, T> {
+    state: std::sync::Mutex<AheadState<T>>,
+    cv: std::sync::Condvar,
+    work: &'w (dyn Fn(usize) -> T + Sync),
+    n: usize,
+    ahead: usize,
+}
+
+struct AheadState<T> {
+    /// Next index a worker will claim.
+    claimed: usize,
+    /// Indices below this are no longer wanted.
+    taken: usize,
+    stop: bool,
+    done: std::collections::BTreeMap<usize, T>,
+}
+
+impl<T: Send> Ahead<'_, T> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, AheadState<T>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn work(&self) {
+        let mut st = self.lock();
+        loop {
+            while !st.stop && st.claimed < self.n && st.claimed >= st.taken + self.ahead {
+                st = self
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if st.stop || st.claimed >= self.n {
+                return;
+            }
+            let i = st.claimed.max(st.taken);
+            st.claimed = i + 1;
+            drop(st);
+            let r = (self.work)(i);
+            st = self.lock();
+            if i >= st.taken {
+                st.done.insert(i, r);
+            }
+            self.cv.notify_all();
+        }
+    }
+
+    /// The result for unit `i` (waiting for it); units before `i` are dropped.
+    pub(crate) fn get(&self, i: usize) -> T {
+        let mut st = self.lock();
+        if i >= st.taken {
+            st.taken = i;
+            st.done.retain(|&k, _| k >= i);
+            if st.claimed < i {
+                st.claimed = i;
+            }
+            self.cv.notify_all();
+        }
+        loop {
+            if let Some(r) = st.done.remove(&i) {
+                st.taken = i + 1;
+                self.cv.notify_all();
+                return r;
+            }
+            if st.claimed <= i && !st.stop {
+                // Nobody has it: do it here.
+                st.claimed = i + 1;
+                st.taken = i + 1;
+                drop(st);
+                return (self.work)(i);
+            }
+            st = self
+                .cv
+                .wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// Run `f` with `n` units decoded ahead by `work` on `threads` workers, at most `ahead` units
+/// past the one last taken. With one thread (or one unit) `f` gets `None` and does the work
+/// itself. Workers have stopped when this returns.
+pub(crate) fn with_ahead<T: Send, R>(
+    n: usize,
+    threads: usize,
+    ahead: usize,
+    work: &(dyn Fn(usize) -> T + Sync),
+    f: impl FnOnce(Option<&Ahead<'_, T>>) -> R,
+) -> R {
+    if threads <= 1 || n <= 1 {
+        return f(None);
+    }
+    let a = Ahead {
+        state: std::sync::Mutex::new(AheadState {
+            claimed: 0,
+            taken: 0,
+            stop: false,
+            done: std::collections::BTreeMap::new(),
+        }),
+        cv: std::sync::Condvar::new(),
+        work,
+        n,
+        ahead: ahead.max(1),
+    };
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(n) {
+            s.spawn(|| a.work());
+        }
+        let r = f(Some(&a));
+        let mut st = a.lock();
+        st.stop = true;
+        a.cv.notify_all();
+        drop(st);
+        r
+    })
 }

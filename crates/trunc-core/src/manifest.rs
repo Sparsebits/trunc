@@ -348,7 +348,8 @@ impl Manifest {
         offs.iter().position(|&o| o == file_len).map(|i| i + 1)
     }
 
-    /// Bytes still present in a file that has consumed `consumed` blocks.
+    /// Bytes still present in a file that has consumed `consumed` blocks. This walks the block
+    /// table; callers asking repeatedly should keep [`Manifest::block_offsets`] instead.
     pub fn len_after_consuming(&self, first_block_off: u64, consumed: usize) -> u64 {
         if consumed == 0 {
             return self.archive_len(first_block_off);

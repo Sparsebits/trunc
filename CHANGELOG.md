@@ -27,7 +27,18 @@ change the command line; the `.trnc` v1 format is frozen.
   calls, and nothing can be written through a junction), and redundant metadata lookups,
   preallocations and gap-log writes are gone. Consuming a tarball of 4,000 small files went from
   7.0 s to 2.2 s on Windows; `.trnc` consume and extract of large files are about 1.4x faster.
-- Decoders: zstd about 40% faster, xz about 15% (sliced CRC-64), bzip2's CRC sliced too.
+  ZIP consume flushes and truncates once per group of small entries instead of once per entry
+  (8.3 s to 2.5 s for 4,000 files), outputs are opened ahead and closed behind on worker
+  threads, and `create` walks directories and reads input files in parallel (1.3 s to 0.5 s
+  for 4,000 files). Archives keep the same bytes.
+- Planning and consuming `.trnc` archives with millions of blocks no longer takes time
+  quadratic in the block count.
+- Decoders: bzip2 blocks, the blocks of multi-block xz streams (what `xz -T0` writes) and
+  zstd frames that declare their size decode on all cores, which speeds up both passes of
+  `--consume` as well as `x` and `verify`. On a 437 MiB tarball, consuming `.tar.xz` went from
+  8.8 s to 1.9 s and `.tar.bz2` from 17.4 s to 4.5 s. On one core, gzip decodes about 1.7x
+  faster, zstd about 40%, xz about 15% (sliced CRC-64). Multi-block xz streams now free space
+  between blocks rather than inside them.
 - On Linux and macOS, tar and ZIP entries may use names that only Windows forbids (backslashes,
   colons, trailing dots, `CON`), and on Linux names that differ only in case are separate files.
   Real Linux tarballs, including the kernel source, failed before. Windows keeps the portable

@@ -169,14 +169,19 @@ pub fn create(out: &Path, inputs: &[PathBuf], opts: &CreateOptions) -> Result<Cr
     let mut stream_pos = 0u64;
     let mut chunks = trunc_chunk::FixedChunker::new(total_u, opts.block_size).peekable();
     while chunks.peek().is_some() {
-        let mut raw_blocks = Vec::new();
-        let read = trunc_prof::span("create.read_inputs");
-        for r in chunks.by_ref().take(len_usize(per_round)) {
-            let mut buf = vec![0u8; len_usize(r.end - r.start)];
-            reader.fill(&mut buf)?;
-            raw_blocks.push(buf);
+        let ranges: Vec<_> = chunks.by_ref().take(len_usize(per_round)).collect();
+        let round_len: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        let mut round = vec![0u8; len_usize(round_len)];
+        trunc_prof::time("create.read_inputs", || {
+            pool.install(|| reader.fill(&mut round))
+        })?;
+        let mut raw_blocks: Vec<&[u8]> = Vec::with_capacity(ranges.len());
+        let mut from = 0usize;
+        for r in &ranges {
+            let n = len_usize(r.end - r.start);
+            raw_blocks.push(&round[from..from + n]);
+            from += n;
         }
-        drop(read);
         let compressed: Vec<Result<_>> = pool.install(|| {
             raw_blocks
                 .par_iter()
@@ -331,74 +336,112 @@ fn train(items: &[crate::walk::Item]) -> Result<Option<Dict>> {
     Ok(trunc_codec::train_dict(&samples, DICT_TARGET_SIZE).ok())
 }
 
-/// Reads the concatenated contents of all file items in order, hashing each file.
+/// Reads the concatenated contents of all file items in order, hashing each file. A fill reads
+/// the pieces of every file it covers on several threads (opening and reading many small files
+/// is mostly waiting); each file's hash still advances in order.
 struct StreamReader<'a> {
     items: &'a [crate::walk::Item],
-    next: usize,
-    current: Option<(usize, File, u64, trunc_hash::Blake3Hasher)>,
+    /// Non-empty files: (item index, offset in the stream, size).
+    files: Vec<(usize, u64, u64)>,
+    /// First file not yet completely read.
+    cursor: usize,
+    /// Stream offset of the next byte.
+    pos: u64,
+    /// Hashes of files read partway.
+    partial: std::collections::HashMap<usize, trunc_hash::Blake3Hasher>,
     done: Vec<(usize, [u8; 32])>,
 }
 
 impl<'a> StreamReader<'a> {
     fn new(items: &'a [crate::walk::Item]) -> Self {
+        let mut files = Vec::new();
+        let mut off = 0u64;
+        for (i, it) in items.iter().enumerate() {
+            if it.kind == ItemKind::File && it.size > 0 {
+                files.push((i, off, it.size));
+                off += it.size;
+            }
+        }
         Self {
             items,
-            next: 0,
-            current: None,
+            files,
+            cursor: 0,
+            pos: 0,
+            partial: std::collections::HashMap::new(),
             done: Vec::new(),
         }
     }
 
     /// Fill `buf` completely with the next stream bytes.
-    fn fill(&mut self, mut buf: &mut [u8]) -> Result<()> {
-        while !buf.is_empty() {
-            if self.current.is_none() {
-                self.open_next()?;
-            }
-            let (idx, file, left, hasher) = self
-                .current
-                .as_mut()
-                .expect("open_next sets current or errors");
-            let it = &self.items[*idx];
-            let want = buf.len().min(len_usize((*left).min(usize::MAX as u64)));
-            let n = file.read(&mut buf[..want]).ctx(at("reading", &it.abs))?;
-            if n == 0 {
-                return Err(Error::Input(format!(
-                    "{} shrank while being archived",
-                    it.abs.display()
-                )));
-            }
-            hasher.update(&buf[..n]);
-            *left -= n as u64;
-            buf = &mut buf[n..];
-            if *left == 0 {
-                let (idx, _, _, hasher) = self.current.take().expect("current is set");
-                self.done.push((idx, *hasher.finalize().as_bytes()));
+    fn fill(&mut self, buf: &mut [u8]) -> Result<()> {
+        let end = self.pos + buf.len() as u64;
+        // The pieces of the files this range covers, in order; they tile it exactly.
+        struct Piece<'b> {
+            item: usize,
+            file_off: u64,
+            last: bool,
+            out: &'b mut [u8],
+            hasher: trunc_hash::Blake3Hasher,
+        }
+        let mut pieces: Vec<Piece<'_>> = Vec::new();
+        let mut rest: &mut [u8] = buf;
+        let mut k = self.cursor;
+        while !rest.is_empty() {
+            let &(item, off, size) = self.files.get(k).ok_or_else(|| {
+                Error::Input("inputs ended before the expected total size".into())
+            })?;
+            let start = self.pos.max(off);
+            let stop = end.min(off + size);
+            let (out, tail) = std::mem::take(&mut rest).split_at_mut(len_usize(stop - start));
+            rest = tail;
+            let hasher = self.partial.remove(&item).unwrap_or_default();
+            pieces.push(Piece {
+                item,
+                file_off: start - off,
+                last: stop == off + size,
+                out,
+                hasher,
+            });
+            if stop == off + size {
+                k += 1;
             }
         }
+        let items = self.items;
+        let read: Vec<Result<(usize, bool, trunc_hash::Blake3Hasher)>> = pieces
+            .into_par_iter()
+            .map(|mut p| {
+                let it = &items[p.item];
+                let f = File::open(&it.abs).ctx(at("opening", &it.abs))?;
+                match read_exact_at(&f, p.out, p.file_off) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Err(Error::Input(format!(
+                            "{} shrank while being archived",
+                            it.abs.display()
+                        )));
+                    }
+                    Err(e) => return Err(e).ctx(at("reading", &it.abs)),
+                }
+                p.hasher.update(p.out);
+                Ok((p.item, p.last, p.hasher))
+            })
+            .collect();
+        for r in read {
+            let (item, last, hasher) = r?;
+            if last {
+                self.done.push((item, *hasher.finalize().as_bytes()));
+            } else {
+                self.partial.insert(item, hasher);
+            }
+        }
+        self.cursor = k;
+        self.pos = end;
         Ok(())
-    }
-
-    fn open_next(&mut self) -> Result<()> {
-        while self.next < self.items.len() {
-            let idx = self.next;
-            self.next += 1;
-            let it = &self.items[idx];
-            if it.kind != ItemKind::File || it.size == 0 {
-                continue;
-            }
-            let f = File::open(&it.abs).ctx(at("opening", &it.abs))?;
-            self.current = Some((idx, f, it.size, trunc_hash::Blake3Hasher::new()));
-            return Ok(());
-        }
-        Err(Error::Input(
-            "inputs ended before the expected total size".into(),
-        ))
     }
 
     /// Per-file hashes of every non-empty file read.
     fn finish(self) -> Result<Vec<(usize, [u8; 32])>> {
-        if self.current.is_some() {
+        if !self.partial.is_empty() || self.cursor != self.files.len() {
             return Err(Error::Input("stream reader finished mid-file".into()));
         }
         Ok(self.done)

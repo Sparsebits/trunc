@@ -718,6 +718,47 @@ fn crash_sweep_every_codec() {
     }
 }
 
+/// Multi-block xz and multi-frame zstd decode their units on worker threads, with safe points
+/// between units only; consuming them survives a crash anywhere.
+#[test]
+fn crash_sweep_independent_units() {
+    let mut rng = Rng::new(43);
+    let sp = vec![
+        Spec::file("a/one.txt", &fixtures::text_bytes(&mut rng, 120_000)),
+        Spec::file("a/two.bin", &fixtures::noise_bytes(&mut rng, 150_000)),
+        Spec::file("b.txt", b"b"),
+        Spec::file("c.bin", &fixtures::noise_bytes(&mut rng, 90_000)),
+    ];
+    let tar = tarbuild::tar(&sp);
+    let want = expected(&sp);
+    let cases = [
+        (
+            "xz",
+            tarbuild::xz_with(&tar, 1, tarbuild::XzCheck::Crc64, Some(64 << 10)),
+        ),
+        ("zst", tarbuild::zstd_frames(&tar, 64 << 10, 3)),
+    ];
+    for (ext, bytes) in cases {
+        let o = opts(48 << 10);
+        let arc = format!("/a.tar.{ext}");
+        assert!(
+            checkpoints(&arc, &bytes, &o) >= 4,
+            "{ext}: too few checkpoints"
+        );
+        let n = sweep_at(CrashModel::LoseUnflushed, &arc, &bytes, &want, &o, false);
+        assert!(n > 40, "{ext}: {n} crash points");
+        sweep_at(CrashModel::WriteThrough, &arc, &bytes, &want, &o, false);
+        sweep_at(
+            CrashModel::RandomSubset { seed: 11 },
+            &arc,
+            &bytes,
+            &want,
+            &o,
+            false,
+        );
+    }
+}
+
 fn checkpoints(arc: &str, bytes: &[u8], o: &ConsumeOptions) -> usize {
     let fs = fresh_at(CrashModel::WriteThrough, arc, bytes);
     let h = fs

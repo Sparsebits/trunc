@@ -6,7 +6,7 @@
 //! the only way to continue is from the saved bit position, the last 32 KiB of output (the
 //! LZ77 window) and the running CRC-32. At a block boundary there is no other decoder state.
 //!
-//! Decoding uses a 10-bit primary lookup table per Huffman code with a canonical slow path for
+//! Decoding uses an 11-bit primary lookup table per Huffman code with a canonical slow path for
 //! longer codes. Correctness is tested against flate2 (`tests/inflate.rs`).
 
 use std::fmt;
@@ -15,7 +15,7 @@ use trunc_fs::{FileHandle, FsError};
 
 /// Size of the LZ77 history window.
 pub const WINDOW: usize = 32 * 1024;
-const FAST_BITS: u32 = 10;
+const FAST_BITS: u32 = 11;
 const MAX_BITS: usize = 15;
 /// Pending output is handed to the sink once this much has accumulated beyond the window.
 const FLUSH_AT: usize = 1 << 20;
@@ -187,6 +187,19 @@ impl<'a> BitReader<'a> {
     }
 
     fn fill(&mut self) -> Result<()> {
+        // Fast path: eight bytes at once while the buffer has them.
+        if self.buf_pos + 8 <= self.buf.len() {
+            let w = u64::from_le_bytes(
+                self.buf[self.buf_pos..self.buf_pos + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
+            self.bits |= w << self.nbits;
+            let n = (63 - self.nbits) / 8;
+            self.buf_pos += n as usize;
+            self.nbits += n * 8;
+            return Ok(());
+        }
         while self.nbits <= 56 {
             let b = self.next_byte()?;
             self.bits |= u64::from(b) << self.nbits;
@@ -214,6 +227,15 @@ impl<'a> BitReader<'a> {
             return Err(InflateError::Overrun);
         }
         Ok(v)
+    }
+
+    /// `n` bits that are known to be in the buffer already.
+    fn take(&mut self, n: u32) -> u32 {
+        debug_assert!(n <= self.nbits && n <= 32);
+        #[allow(clippy::cast_possible_truncation)] // n <= 32
+        let v = (self.bits & ((1u64 << n) - 1)) as u32;
+        self.consume(n);
+        v
     }
 
     fn align(&mut self) -> Result<()> {
@@ -302,6 +324,22 @@ impl Huffman {
             }
             return Ok(e >> 4);
         }
+        self.slow(br)
+    }
+
+    /// Decode with at least 15 bits in the buffer (no refill on the fast path).
+    #[inline]
+    fn decode_filled(&self, br: &mut BitReader<'_>) -> Result<u16> {
+        let e = self.fast[(br.bits & ((1 << FAST_BITS) - 1)) as usize];
+        if e != 0 {
+            br.consume(u32::from(e & 15));
+            return Ok(e >> 4);
+        }
+        self.slow(br)
+    }
+
+    #[cold]
+    fn slow(&self, br: &mut BitReader<'_>) -> Result<u16> {
         // Canonical decoding, one bit at a time (codes longer than FAST_BITS).
         let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
         for len in 1..=MAX_BITS {
@@ -386,26 +424,6 @@ impl Inflater {
             return Err(InflateError::TooLong(self.max_out));
         }
         self.out.push(b);
-        Ok(())
-    }
-
-    fn copy(&mut self, dist: usize, len: usize) -> Result<()> {
-        if dist > self.out.len() || dist as u64 > self.total {
-            return Err(InflateError::Corrupt("distance too far back"));
-        }
-        self.total += len as u64;
-        if self.total > self.max_out {
-            return Err(InflateError::TooLong(self.max_out));
-        }
-        let start = self.out.len() - dist;
-        if dist >= len {
-            self.out.extend_from_within(start..start + len);
-        } else {
-            for i in 0..len {
-                let b = self.out[start + i];
-                self.out.push(b);
-            }
-        }
         Ok(())
     }
 
@@ -496,26 +514,112 @@ impl Inflater {
         dist: &Huffman,
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
+        // Decode into room beyond the output (`out[..op]` is real), so literals and matches are
+        // plain stores and copies can go in 16-byte chunks that overshoot into the room.
+        let mut op = self.out.len();
+        let r = self.codes_into(br, lit, dist, sink, &mut op);
+        self.out.truncate(op);
+        r
+    }
+
+    fn codes_into(
+        &mut self,
+        br: &mut BitReader<'_>,
+        lit: &Huffman,
+        dist: &Huffman,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        op: &mut usize,
+    ) -> Result<()> {
+        // Longest match plus a chunk's overshoot.
+        const ROOM: usize = 258 + 16;
+        const GROW: usize = 64 * 1024;
+        let limit = br.len.saturating_mul(8);
+        let mut o = *op;
         loop {
-            let sym = lit.decode(br)?;
-            match sym {
-                0..=255 => self.push(u8::try_from(sym).expect("literal"))?,
-                256 => return Ok(()),
-                257..=285 => {
-                    let i = usize::from(sym - 257);
-                    let len = usize::from(LBASE[i]) + br.get(u32::from(LEXT[i]))? as usize;
-                    let ds = usize::from(dist.decode(br)?);
-                    if ds >= 30 {
-                        return Err(InflateError::Corrupt("invalid distance symbol"));
-                    }
-                    let d = usize::from(DBASE[ds]) + br.get(u32::from(DEXT[ds]))? as usize;
-                    self.copy(d, len)?;
+            if o + ROOM > self.out.len() {
+                self.out.truncate(o);
+                if self.out.len() - self.flushed >= FLUSH_AT + WINDOW {
+                    self.emit(sink)?;
                 }
-                _ => return Err(InflateError::Corrupt("invalid literal/length symbol")),
+                o = self.out.len();
+                self.out.resize(o + GROW, 0);
             }
-            if self.out.len() - self.flushed >= FLUSH_AT + WINDOW {
-                self.emit(sink)?;
+            // One refill covers a whole length/distance pair: at most 15 + 5 + 15 + 13 bits.
+            if br.nbits < 48 {
+                br.fill()?;
             }
+            let sym = lit.decode_filled(br)?;
+            if br.consumed > limit {
+                *op = o;
+                return Err(InflateError::Overrun);
+            }
+            if sym < 256 {
+                self.total += 1;
+                if self.total > self.max_out {
+                    *op = o;
+                    return Err(InflateError::TooLong(self.max_out));
+                }
+                #[allow(clippy::cast_possible_truncation)] // below 256
+                let b = sym as u8;
+                self.out[o] = b;
+                o += 1;
+                continue;
+            }
+            if sym == 256 {
+                *op = o;
+                return Ok(());
+            }
+            if sym > 285 {
+                *op = o;
+                return Err(InflateError::Corrupt("invalid literal/length symbol"));
+            }
+            let i = usize::from(sym - 257);
+            if br.nbits < 40 {
+                br.fill()?;
+            }
+            let len = usize::from(LBASE[i]) + br.take(u32::from(LEXT[i])) as usize;
+            let ds = usize::from(dist.decode_filled(br)?);
+            if ds >= 30 {
+                *op = o;
+                return Err(InflateError::Corrupt("invalid distance symbol"));
+            }
+            if br.nbits < 13 {
+                br.fill()?;
+            }
+            let d = usize::from(DBASE[ds]) + br.take(u32::from(DEXT[ds])) as usize;
+            if br.consumed > limit {
+                *op = o;
+                return Err(InflateError::Overrun);
+            }
+            if d > o || d as u64 > self.total {
+                *op = o;
+                return Err(InflateError::Corrupt("distance too far back"));
+            }
+            self.total += len as u64;
+            if self.total > self.max_out {
+                *op = o;
+                return Err(InflateError::TooLong(self.max_out));
+            }
+            let src = o - d;
+            let buf = self.out.as_mut_slice();
+            if d >= 16 {
+                // Each chunk reads only bytes already written.
+                let mut k = 0;
+                while k < len {
+                    let t: [u8; 16] = buf[src + k..src + k + 16].try_into().expect("16");
+                    buf[o + k..o + k + 16].copy_from_slice(&t);
+                    k += 16;
+                }
+            } else {
+                // A short period: copy whole periods from the start of the match, doubling.
+                let mut done = 0;
+                while done < len {
+                    let n = (len - done).min(d + done);
+                    buf.copy_within(src..src + n, o + done);
+                    done += n;
+                }
+            }
+            o += len;
         }
     }
 }

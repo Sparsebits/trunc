@@ -44,6 +44,24 @@ consuming them would free nothing until the end.
   output is one file named after the archive without its suffix (`disk.img.xz` → `disk.img`,
   `backup.tgz` → `backup.tar`, anything else gets `.out`). `--raw` forces this for tarballs, so
   `trunc x big.tar.zst --raw --consume` turns the archive into `big.tar` in place.
+- **Independent units decode in parallel.** Some units need nothing from the ones before them,
+  so worker threads decode them ahead while the decoding loop takes them in order:
+  - bzip2 blocks. Block starts are found by searching for the 48-bit block magic at every bit
+    offset. Workers decode each candidate, and the loop uses only the one that starts exactly
+    where the previous block ended, so a false match inside compressed data is ignored. Safe
+    points are unchanged (they were already between blocks).
+  - Blocks of xz streams with two or more blocks (what `xz -T` writes). The stream's index,
+    read from the end of the file, gives every block's position and sizes without decoding.
+    In such streams, as long as no block produces more than 256 MiB, safe points are between
+    blocks only, so a block is always decoded whole and no window needs restoring.
+  - zstd frames that declare their size (up to 128 MiB) and are followed by more of the file
+    (`pzstd`, `zstd:chunked`). Their only safe point is at the end.
+
+  Which units are decoded whole depends only on the file, never on the thread count, so the
+  scan, the consume pass and a resume see the same safe points. Tests check that one thread
+  and eight give the same output and safe points. Blocks decoded ahead and not yet taken hold
+  at most about 512 MiB. Both passes of `--consume` benefit, so keeping the scan (refuse
+  before destroying anything) costs far less on multi-block files.
 - **Journal `TSJP1`.** The preamble adds the codec and mode to ADR-0011's layout. Journals
   written by v0.1.0 (`TGJP1`, gzip only) are still read, and resume with their old slot format.
 
@@ -52,9 +70,15 @@ consuming them would free nothing until the end.
   at many levels, resumed from every safe point with the input before it zeroed, and fuzzed
   differentially (anything trunc accepts, the reference decoder must accept with the same
   output).
-- Decoding speed on one core: gzip and bzip2 match or beat `gzip -t` and `bzip2 -t`, xz is
-  about 25% slower than liblzma, and zstd decodes at about 600-680 MB/s, roughly 60% of libzstd
-  (`cargo run --release -p trunc-legacy --example decode -- <file>` times a decoder alone).
+- Decoding speed on one core: gzip at about 500 MB/s and bzip2 match or beat `gzip -t` and
+  `bzip2 -t`, xz is about 25% slower than liblzma, and zstd decodes at about 600-680 MB/s,
+  roughly 60% of libzstd (`cargo run --release -p trunc-legacy --example decode -- <file>`
+  times a decoder alone; `TRUNC_THREADS=1` keeps it to one core). bzip2, multi-block xz and
+  multi-frame zstd scale with cores: a 437 MiB `.tar.xz` from `xz -T0` verifies in 0.65 s
+  instead of 4.1 s.
+- Multi-block xz streams free space a block at a time rather than an LZMA2 chunk at a time
+  (`xz -T0` blocks are 3x the dictionary, 24 MiB at the default level). The space planner
+  works from the scan's safe points, so its numbers include this.
 - A tarball consume of an xz or zstd archive writes the tar metadata twice: once into the gap
   log, which is removed at the end. The space planner counts it.
 - BCJ and delta xz filters, zstd dictionaries and the obsolete randomized bzip2 blocks are

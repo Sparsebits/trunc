@@ -218,23 +218,36 @@ pub fn extract(archive: &Archive, dest: &Path, opts: &ExtractOptions) -> Result<
     let mut open: HashMap<usize, File> = HashMap::new();
     // Finished files, closed in batches.
     let mut finished: Vec<File> = Vec::new();
-    for (i, e) in m.entries.iter().enumerate() {
-        if !matches!(e.kind, EntryKind::File) {
-            continue;
-        }
-        let p = dest_path(dest, &e.path);
-        let f = trunc_prof::time("extract.create", || create_output(&p, opts.overwrite))?;
-        if e.size > 0 {
-            f.set_len(e.size).ctx(at("allocating", &p))?;
+    // Every output is known up front, so create them on several threads: creating a file
+    // costs a fraction of a millisecond on Windows, mostly waiting.
+    let files: Vec<usize> = (0..m.entries.len())
+        .filter(|&i| matches!(m.entries[i].kind, EntryKind::File))
+        .collect();
+    let created: Vec<Result<(usize, File)>> = files
+        .par_iter()
+        .map(|&i| {
+            let e = &m.entries[i];
+            let p = dest_path(dest, &e.path);
+            let f = trunc_prof::time("extract.create", || create_output(&p, opts.overwrite))?;
+            if e.size > 0 {
+                f.set_len(e.size).ctx(at("allocating", &p))?;
+            } else {
+                if e.blake3 != trunc_hash::blake3(b"") {
+                    return Err(Error::Integrity(format!(
+                        "content hash mismatch for {:?}",
+                        e.path
+                    )));
+                }
+                finish_file(&f, &p, e)?;
+            }
+            Ok((i, f))
+        })
+        .collect();
+    for r in created {
+        let (i, f) = r?;
+        if m.entries[i].size > 0 {
             open.insert(i, f);
         } else {
-            if e.blake3 != trunc_hash::blake3(b"") {
-                return Err(Error::Integrity(format!(
-                    "content hash mismatch for {:?}",
-                    e.path
-                )));
-            }
-            finish_file(&f, &p, e)?;
             finished.push(f);
         }
         summary.files += 1;

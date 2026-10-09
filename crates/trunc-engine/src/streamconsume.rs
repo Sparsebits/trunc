@@ -79,6 +79,8 @@ pub struct StreamOptions {
     pub raw: bool,
     /// Refuse streams whose decoder window is larger than this.
     pub max_window: u64,
+    /// Threads for decoding independent blocks or frames (0: one per core).
+    pub threads: usize,
 }
 
 impl Default for StreamOptions {
@@ -86,6 +88,7 @@ impl Default for StreamOptions {
         Self {
             raw: false,
             max_window: Limits::DEFAULT_MAX_WINDOW,
+            threads: 0,
         }
     }
 }
@@ -609,6 +612,7 @@ pub fn scan(
         Limits {
             max_out: u64::MAX,
             max_window: opts.max_window,
+            threads: opts.threads,
         },
         every,
         &mut |b| match mode {
@@ -808,6 +812,173 @@ impl GapLog {
 /// Buffered gap-log bytes are written once this much has accumulated.
 const GAP_BUFFER: usize = 4 << 20;
 
+/// Files opened ahead of their data.
+const OPEN_AHEAD: usize = 32;
+/// Worker threads for opening ahead and closing behind.
+const IO_WORKERS: usize = 8;
+
+type Opened = Result<(Box<dyn FileHandle>, bool)>;
+
+/// Open (or create) output `name` under the router's target. Returns the handle and whether it
+/// was created.
+fn open_output(fs: &dyn FsBackend, target: &Target<'_>, name: &str) -> Opened {
+    match target {
+        Target::Stage(g) => open_staged_output(fs, g, &join_rel(g.root, name)),
+        Target::Dest { root, overwrite } => {
+            let p = join_rel(root, name);
+            if let Some(m) = fs.metadata(&p)? {
+                if !*overwrite || m.kind != NodeKind::File {
+                    return Err(Error::Refused(format!("{} already exists", p.display())));
+                }
+            }
+            let mode = if *overwrite {
+                OpenMode::CreateOrTruncate
+            } else {
+                OpenMode::CreateNew
+            };
+            Ok((fs.open(&p, mode, Share::Exclusive)?, true))
+        }
+    }
+}
+
+#[derive(Default)]
+struct AheadState {
+    /// Entry indices to open, in order.
+    queue: std::collections::VecDeque<usize>,
+    /// Opened (or failed), not yet taken.
+    ready: std::collections::HashMap<usize, Opened>,
+    /// Being opened right now.
+    busy: std::collections::HashSet<usize>,
+    /// Flushed handles to close.
+    closing: Vec<Box<dyn FileHandle>>,
+    stop: bool,
+}
+
+/// Opens upcoming outputs ahead of their data and closes finished ones on worker threads, so
+/// the routing thread does not wait on either (each costs a fraction of a millisecond on
+/// Windows). Only used where the backend allows parallel calls.
+struct IoAhead<'a> {
+    state: std::sync::Mutex<AheadState>,
+    cv: std::sync::Condvar,
+    open: &'a (dyn Fn(usize) -> Opened + Sync),
+}
+
+impl<'a> IoAhead<'a> {
+    fn new(open: &'a (dyn Fn(usize) -> Opened + Sync)) -> Self {
+        Self {
+            state: std::sync::Mutex::new(AheadState::default()),
+            cv: std::sync::Condvar::new(),
+            open,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AheadState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The worker loop: open queued entries, close handed-over handles, until stopped and idle.
+    fn work(&self) {
+        let mut st = self.lock();
+        loop {
+            if !st.closing.is_empty() {
+                let batch = std::mem::take(&mut st.closing);
+                drop(st);
+                drop(batch);
+                st = self.lock();
+                continue;
+            }
+            if let Some(i) = st.queue.pop_front() {
+                st.busy.insert(i);
+                drop(st);
+                let r = (self.open)(i);
+                st = self.lock();
+                st.busy.remove(&i);
+                st.ready.insert(i, r);
+                self.cv.notify_all();
+                continue;
+            }
+            if st.stop {
+                return;
+            }
+            st = self
+                .cv
+                .wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn request(&self, entries: &[usize]) {
+        let mut st = self.lock();
+        st.queue.extend(entries.iter().copied());
+        self.cv.notify_all();
+    }
+
+    /// Entry `i`, opened ahead if it was requested; `None` means open it here.
+    fn take(&self, i: usize) -> Option<Opened> {
+        let mut st = self.lock();
+        loop {
+            if let Some(r) = st.ready.remove(&i) {
+                return Some(r);
+            }
+            if let Some(k) = st.queue.iter().position(|&q| q == i) {
+                st.queue.remove(k);
+                return None;
+            }
+            if !st.busy.contains(&i) {
+                return None;
+            }
+            st = self
+                .cv
+                .wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn close(&self, handles: Vec<Box<dyn FileHandle>>) {
+        let mut st = self.lock();
+        st.closing.extend(handles);
+        self.cv.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut st = self.lock();
+        st.stop = true;
+        st.queue.clear();
+        self.cv.notify_all();
+    }
+}
+
+/// Stops the workers when dropped (also on errors), so the thread scope can end.
+struct StopAhead<'r, 'a>(&'r IoAhead<'a>);
+
+impl Drop for StopAhead<'_, '_> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+/// Run `f` with an [`IoAhead`] whose workers open outputs via `open`, when `parallel`; otherwise
+/// with none. The workers have finished (every handle closed) when this returns.
+fn with_io_ahead<T>(
+    parallel: bool,
+    open: &(dyn Fn(usize) -> Opened + Sync),
+    f: impl FnOnce(Option<&IoAhead<'_>>) -> T,
+) -> T {
+    if !parallel {
+        return f(None);
+    }
+    let ahead = IoAhead::new(open);
+    std::thread::scope(|s| {
+        for _ in 0..IO_WORKERS {
+            s.spawn(|| ahead.work());
+        }
+        let _stop = StopAhead(&ahead);
+        f(Some(&ahead))
+    })
+}
+
 /// Routes the decoded stream's file content into output files (and, with a gap log, the rest
 /// into the log).
 struct Router<'a> {
@@ -831,6 +1002,10 @@ struct Router<'a> {
     segments: Vec<(usize, u64, u64)>,
     written: u64,
     need_free: u64,
+    /// Opens ahead and closes behind on worker threads, where the backend allows.
+    ahead: Option<&'a IoAhead<'a>>,
+    /// Position in `files` up to which opens have been requested.
+    requested: usize,
 }
 
 impl<'a> Router<'a> {
@@ -864,7 +1039,14 @@ impl<'a> Router<'a> {
             segments: Vec::new(),
             written: 0,
             need_free,
+            ahead: None,
+            requested: next + 1,
         }
+    }
+
+    fn with_ahead(mut self, ahead: Option<&'a IoAhead<'a>>) -> Self {
+        self.ahead = ahead;
+        self
     }
 
     fn root(&self) -> &Path {
@@ -877,21 +1059,18 @@ impl<'a> Router<'a> {
     /// Open entry `i` for writing at `at`: earlier bytes are kept, later ones discarded.
     fn open(&mut self, i: usize, at: u64) -> Result<Box<dyn FileHandle>> {
         let p = join_rel(self.root(), &self.entries[i].name);
-        let (h, created) = match &self.target {
-            Target::Stage(g) => open_staged_output(self.fs, g, &p)?,
-            Target::Dest { overwrite, .. } => {
-                if let Some(m) = self.fs.metadata(&p)? {
-                    if !*overwrite || m.kind != NodeKind::File {
-                        return Err(Error::Refused(format!("{} already exists", p.display())));
-                    }
-                }
-                let mode = if *overwrite {
-                    OpenMode::CreateOrTruncate
-                } else {
-                    OpenMode::CreateNew
-                };
-                (self.fs.open(&p, mode, Share::Exclusive)?, true)
+        if let Some(a) = self.ahead {
+            // Keep the next few files opening while this one is written.
+            let upto = (self.next + 1 + OPEN_AHEAD).min(self.files.len());
+            if self.requested < upto {
+                a.request(&self.files[self.requested..upto]);
+                self.requested = upto;
             }
+        }
+        let opened = self.ahead.and_then(|a| a.take(i));
+        let (h, created) = match opened {
+            Some(r) => r?,
+            None => open_output(self.fs, &self.target, &self.entries[i].name)?,
         };
         if created {
             self.new_dirs.insert(parent_of(&p));
@@ -961,11 +1140,20 @@ impl<'a> Router<'a> {
                     let pending: Vec<&dyn FileHandle> =
                         self.pending.iter().map(AsRef::as_ref).collect();
                     self.fs.flush_all(&pending, &[])?;
-                    trunc_fs::close_all(std::mem::take(&mut self.pending));
+                    self.close_pending();
                 }
             }
         }
         Ok(())
+    }
+
+    /// Close flushed files: on the workers if there are any, else here, in parallel.
+    fn close_pending(&mut self) {
+        let done = std::mem::take(&mut self.pending);
+        match self.ahead {
+            Some(a) => a.close(done),
+            None => trunc_fs::close_all(done),
+        }
     }
 
     /// Make everything written so far durable: file data and the gap log, then new directory
@@ -982,7 +1170,7 @@ impl<'a> Router<'a> {
         }
         let dirs: Vec<PathBuf> = std::mem::take(&mut self.new_dirs).into_iter().collect();
         self.fs.flush_all(&files, &dirs)?;
-        trunc_fs::close_all(std::mem::take(&mut self.pending));
+        self.close_pending();
         if let Some(g) = &mut self.gaps {
             g.dirty = false;
         }
@@ -1033,6 +1221,7 @@ fn limits(layout: &StreamLayout, opts: &StreamOptions) -> Limits {
     Limits {
         max_out: layout.out_len,
         max_window: opts.max_window,
+        threads: opts.threads,
     }
 }
 
@@ -1400,95 +1589,104 @@ pub fn consume_stream(
         });
         let mut freed_to = latest.as_ref().map_or(0, |r| r.free_below);
         let mut seq = latest.as_ref().map_or(0, |r| r.seq);
-        let router = RefCell::new(Router::new(
-            fs,
-            Target::Stage(&guard),
-            &layout.entries,
-            start_out,
-            gaps,
-            need_free,
-        ));
-        let mut history = StagedHistory {
-            fs,
-            root: &stage,
-            entries: &layout.entries,
-            map: &map,
-            gap_path: layout.gap_log().then_some(gpath.as_path()),
-        };
-        let verify = opts.verify_media;
-        run(
-            layout.codec,
-            Input {
-                src: held.input(),
-                len: layout.file_len,
-            },
-            latest.as_ref().map(|r| r.cursor.as_slice()),
-            &mut history,
-            limits(layout, &opts.stream),
-            layout.every,
-            &mut |b| router.borrow_mut().write(b),
-            &mut |p| {
-                let _ckpt = trunc_prof::span("stream.checkpoint");
-                seq += 1;
-                let mut r = router.borrow_mut();
-                r.flush()?;
-                let expected = (seq as usize)
-                    .checked_sub(1)
-                    .and_then(|i| layout.ckpts.get(i))
-                    .ok_or_else(|| {
-                        Error::Integrity("more checkpoints than the scan found".into())
-                    })?;
-                let (hash, media_ok) = r.take_interval(verify)?;
-                if hash != expected.hash
-                    || p.out != expected.out
-                    || p.free_below != expected.free_below
-                {
-                    return Err(Error::Integrity(format!(
-                        "decoded content differs from the verified scan before checkpoint {seq}; \
+        let open_target = Target::Stage(&guard);
+        let open_one = |i: usize| open_output(fs, &open_target, &layout.entries[i].name);
+        with_io_ahead(fs.parallel_io(), &open_one, |ahead| -> Result<()> {
+            let router = RefCell::new(
+                Router::new(
+                    fs,
+                    Target::Stage(&guard),
+                    &layout.entries,
+                    start_out,
+                    gaps,
+                    need_free,
+                )
+                .with_ahead(ahead),
+            );
+            let mut history = StagedHistory {
+                fs,
+                root: &stage,
+                entries: &layout.entries,
+                map: &map,
+                gap_path: layout.gap_log().then_some(gpath.as_path()),
+            };
+            let verify = opts.verify_media;
+            run(
+                layout.codec,
+                Input {
+                    src: held.input(),
+                    len: layout.file_len,
+                },
+                latest.as_ref().map(|r| r.cursor.as_slice()),
+                &mut history,
+                limits(layout, &opts.stream),
+                layout.every,
+                &mut |b| router.borrow_mut().write(b),
+                &mut |p| {
+                    let _ckpt = trunc_prof::span("stream.checkpoint");
+                    seq += 1;
+                    let mut r = router.borrow_mut();
+                    r.flush()?;
+                    let expected = (seq as usize)
+                        .checked_sub(1)
+                        .and_then(|i| layout.ckpts.get(i))
+                        .ok_or_else(|| {
+                            Error::Integrity("more checkpoints than the scan found".into())
+                        })?;
+                    let (hash, media_ok) = r.take_interval(verify)?;
+                    if hash != expected.hash
+                        || p.out != expected.out
+                        || p.free_below != expected.free_below
+                    {
+                        return Err(Error::Integrity(format!(
+                            "decoded content differs from the verified scan before checkpoint {seq}; \
                          nothing past the previous checkpoint was released"
-                    )));
-                }
-                if !media_ok {
-                    return Err(media_mismatch());
-                }
-                journal
-                    .write(
-                        &Record {
-                            seq,
-                            free_below: p.free_below,
-                            out: p.out,
-                            cursor: p.cursor.to_vec(),
-                        }
-                        .encode(pre.v1),
-                    )
-                    .map_err(journal_err)?;
-                trunc_prof::time("stream.free", || {
-                    held.free(fs, freed_to, p.free_below, granularity)
-                })?;
-                freed_to = p.free_below;
-                progress(Progress::Batch {
-                    blocks_done: seq as usize,
-                    blocks_total: total,
-                    bytes_written: r.written,
-                    archive_len: layout.file_len - p.free_below,
-                });
-                Ok(())
-            },
-        )?;
-        let mut r = router.into_inner();
-        r.flush()?;
-        let (hash, media_ok) = r.take_interval(verify)?;
-        if hash != layout.tail_hash {
-            return Err(Error::Integrity(
-                "decoded content differs from the verified scan after the last checkpoint".into(),
-            ));
-        }
-        if !media_ok {
-            return Err(media_mismatch());
-        }
-        summary.bytes_written = r.written;
-        summary.batches = total;
-        drop(r);
+                        )));
+                    }
+                    if !media_ok {
+                        return Err(media_mismatch());
+                    }
+                    journal
+                        .write(
+                            &Record {
+                                seq,
+                                free_below: p.free_below,
+                                out: p.out,
+                                cursor: p.cursor.to_vec(),
+                            }
+                            .encode(pre.v1),
+                        )
+                        .map_err(journal_err)?;
+                    trunc_prof::time("stream.free", || {
+                        held.free(fs, freed_to, p.free_below, granularity)
+                    })?;
+                    freed_to = p.free_below;
+                    progress(Progress::Batch {
+                        blocks_done: seq as usize,
+                        blocks_total: total,
+                        bytes_written: r.written,
+                        archive_len: layout.file_len - p.free_below,
+                    });
+                    Ok(())
+                },
+            )?;
+            let mut r = router.into_inner();
+            r.flush()?;
+            let (hash, media_ok) = r.take_interval(verify)?;
+            if hash != layout.tail_hash {
+                return Err(Error::Integrity(
+                    "decoded content differs from the verified scan after the last checkpoint"
+                        .into(),
+                ));
+            }
+            if !media_ok {
+                return Err(media_mismatch());
+            }
+            summary.bytes_written = r.written;
+            summary.batches = total;
+            drop(r);
+            Ok(())
+        })?;
         match &held {
             Held::One(h) => {
                 truncate_with_retry(h.as_ref(), 0, opts.retry)?;
@@ -1582,37 +1780,48 @@ pub fn extract_stream(
         let f = fs.open(&p, mode, Share::Exclusive)?;
         f.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
     }
-    let router = RefCell::new(Router::new(
-        fs,
-        Target::Dest {
-            root: dest,
-            overwrite,
-        },
-        &layout.entries,
-        0,
-        None,
-        0,
-    ));
-    run(
-        layout.codec,
-        Input {
-            src: h.as_ref(),
-            len: layout.file_len,
-        },
-        None,
-        &mut NoHistory,
-        limits(&layout, opts),
-        0,
-        &mut |b| router.borrow_mut().write(b),
-        &mut |_| Ok(()),
-    )?;
-    let mut r = router.into_inner();
-    r.flush()?;
-    if r.take_interval(false)?.0 != layout.tail_hash {
-        return Err(Error::Integrity(
-            "decoded content changed between the scan and extraction".into(),
-        ));
-    }
+    let open_target = Target::Dest {
+        root: dest,
+        overwrite,
+    };
+    let open_one = |i: usize| open_output(fs, &open_target, &layout.entries[i].name);
+    let written = with_io_ahead(fs.parallel_io(), &open_one, |ahead| -> Result<u64> {
+        let router = RefCell::new(
+            Router::new(
+                fs,
+                Target::Dest {
+                    root: dest,
+                    overwrite,
+                },
+                &layout.entries,
+                0,
+                None,
+                0,
+            )
+            .with_ahead(ahead),
+        );
+        run(
+            layout.codec,
+            Input {
+                src: h.as_ref(),
+                len: layout.file_len,
+            },
+            None,
+            &mut NoHistory,
+            limits(&layout, opts),
+            0,
+            &mut |b| router.borrow_mut().write(b),
+            &mut |_| Ok(()),
+        )?;
+        let mut r = router.into_inner();
+        r.flush()?;
+        if r.take_interval(false)?.0 != layout.tail_hash {
+            return Err(Error::Integrity(
+                "decoded content changed between the scan and extraction".into(),
+            ));
+        }
+        Ok(r.written)
+    })?;
     for e in &layout.entries {
         match e.kind {
             Kind::File => {
@@ -1626,7 +1835,7 @@ pub fn extract_stream(
             Kind::Dir => {}
         }
     }
-    summary.bytes_written = r.written;
+    summary.bytes_written = written;
     Ok(summary)
 }
 

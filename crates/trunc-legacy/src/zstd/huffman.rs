@@ -201,7 +201,26 @@ impl Huffman {
             bs.skip(u32::from(k));
             s
         };
-        for k in 0..last {
+        // Codes are at most 11 bits, so one refill covers five symbols of a stream.
+        let fast = |bs: &mut Backward<'_>| {
+            let (s, k) = t[bs.peek_filled(mb) as usize];
+            bs.skip(u32::from(k));
+            s
+        };
+        let mut k = 0;
+        while k + 5 <= last {
+            for s in [&mut s0, &mut s1, &mut s2, &mut s3] {
+                s.ensure(5 * mb);
+            }
+            for j in k..k + 5 {
+                o0[j] = fast(&mut s0);
+                o1[j] = fast(&mut s1);
+                o2[j] = fast(&mut s2);
+                o3[j] = fast(&mut s3);
+            }
+            k += 5;
+        }
+        for k in k..last {
             o0[k] = sym(&mut s0);
             o1[k] = sym(&mut s1);
             o2[k] = sym(&mut s2);

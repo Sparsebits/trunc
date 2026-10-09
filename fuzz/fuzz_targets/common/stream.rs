@@ -52,6 +52,7 @@ fn decode(
         Limits {
             max_out: MAX_OUT,
             max_window: 16 << 20,
+            threads: 0,
         },
         2048,
         &mut |b| {

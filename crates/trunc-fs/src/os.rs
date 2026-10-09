@@ -375,6 +375,10 @@ impl FsBackend for OsFs {
         }
     }
 
+    fn parallel_io(&self) -> bool {
+        true
+    }
+
     fn flush_all(&self, files: &[&dyn FileHandle], dirs: &[PathBuf]) -> Result<()> {
         let _prof = trunc_prof::span("fs.flush_all");
         in_parallel(files.len(), &|i| files[i].flush_data())?;

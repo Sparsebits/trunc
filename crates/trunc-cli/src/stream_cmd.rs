@@ -32,6 +32,7 @@ impl StreamArgs {
         StreamOptions {
             raw: self.raw,
             max_window: self.max_window.max(1),
+            threads: 0,
         }
     }
 }

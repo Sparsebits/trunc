@@ -8,6 +8,11 @@
 //!
 //! Everything a safe point needs is small except the LZMA2 dictionary, which is read back
 //! through [`History`] on resume and checked against a CRC-32 in the cursor.
+//!
+//! Blocks are independent, and a stream's index (at its end) gives every block's sizes, so
+//! streams with several blocks (what `xz -T` writes) are decoded a block per thread. Safe points
+//! in such streams are at block boundaries only (no window to restore), whatever the thread
+//! count: the choice depends on the file alone, so the scan, the consume pass and a resume agree.
 
 use trunc_fs::FileHandle;
 
@@ -21,6 +26,10 @@ const MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0];
 const FOOTER_MAGIC: [u8; 2] = *b"YZ";
 const FILTER_LZMA2: u64 = 0x21;
 const READ_CHUNK: usize = 256 * 1024;
+/// Streams with a block producing more than this are decoded one chunk at a time instead.
+const MAX_WHOLE_BLOCK: u64 = 256 << 20;
+/// Output of blocks decoded ahead but not yet taken, at most (but always two blocks).
+const AHEAD_BYTES: u64 = 512 << 20;
 
 fn corrupt(at: u64, why: &str) -> StreamError {
     StreamError::Corrupt(format!("corrupt xz data near byte {at}: {why}"))
@@ -237,13 +246,22 @@ enum Phase {
     InBlock(Box<Block>),
 }
 
-/// Cursor bytes: `phase u8 | position u64 | output u64`, then for phases 1 and 2 `check type u8
+/// Cursor bytes: `phase u8 | position u64 | output u64`, then for phases 1 to 3 `check type u8
 /// | records (count, unpadded, uncompressed u64; crc u32)`, then for phase 2 `block start u64 |
 /// header size u64 | declared compressed u64 | declared uncompressed u64 (u64::MAX: absent) |
-/// block output u64 | check state | LZMA2 state | window length u64 | window CRC u32`.
-fn encode(phase: &Phase, pos: u64, out: u64, check_kind: u8, rec: &Records) -> Vec<u8> {
+/// block output u64 | check state | LZMA2 state | window length u64 | window CRC u32`. Phase 3 is
+/// phase 1 in a stream decoded whole blocks at a time.
+fn encode(
+    phase: &Phase,
+    pos: u64,
+    out: u64,
+    check_kind: u8,
+    rec: &Records,
+    whole: bool,
+) -> Vec<u8> {
     let tag = match phase {
         Phase::Stream => 0u8,
+        Phase::Blocks if whole => 3,
         Phase::Blocks => 1,
         Phase::InBlock(_) => 2,
     };
@@ -283,6 +301,8 @@ struct Restored {
     out: u64,
     check_kind: u8,
     rec: Records,
+    /// The current stream is decoded whole blocks at a time (safe points between blocks only).
+    whole: bool,
 }
 
 fn decode_cursor(c: &[u8], history: &mut dyn History, max_window: u64) -> stream::Result<Restored> {
@@ -299,6 +319,7 @@ fn decode_cursor(c: &[u8], history: &mut dyn History, max_window: u64) -> stream
                 out,
                 check_kind: 0,
                 rec: Records::new(),
+                whole: false,
             })
         } else {
             Err(bad())
@@ -318,7 +339,7 @@ fn decode_cursor(c: &[u8], history: &mut dyn History, max_window: u64) -> stream
         crc: crc32fast::Hasher::new_with_initial(crc),
     };
     let phase = match tag {
-        1 => Phase::Blocks,
+        1 | 3 => Phase::Blocks,
         2 => {
             let mut v = [0u64; 5];
             for x in &mut v {
@@ -354,6 +375,7 @@ fn decode_cursor(c: &[u8], history: &mut dyn History, max_window: u64) -> stream
         out,
         check_kind,
         rec,
+        whole: tag == 3,
     })
 }
 
@@ -451,9 +473,245 @@ fn emit(blk: &mut Block, sink: &mut Sink<'_>) -> stream::Result<()> {
     Ok(())
 }
 
-/// Decode an xz file (one or more streams). Safe points are LZMA2 chunk boundaries, block
-/// boundaries and stream boundaries once `every` bytes have been produced since the last one.
-#[allow(clippy::too_many_lines)]
+/// What one step inside a block did.
+enum Step {
+    /// Decoded an LZMA2 chunk of this many bytes.
+    Chunk(u64),
+    /// Reached the block's end and checked it; its unpadded size.
+    End(u64),
+}
+
+/// Decode the block's next LZMA2 chunk (allowing `room` more bytes of output), or finish it:
+/// sizes, padding and check.
+fn block_step(
+    rd: &mut Reader<'_>,
+    blk: &mut Block,
+    chunk: &mut Vec<u8>,
+    room: u64,
+    check_kind: u8,
+    sink: &mut Sink<'_>,
+) -> stream::Result<Step> {
+    let at = rd.pos;
+    let c = rd.u8()?;
+    let Some(more) = blk.lz.control(c).map_err(|e| at_err(e, at))? else {
+        // End of the block's LZMA2 data.
+        emit(blk, sink)?;
+        let compressed = rd.pos - blk.start - blk.header_size;
+        if blk.declared_compressed.is_some_and(|d| d != compressed)
+            || blk.declared_uncompressed.is_some_and(|d| d != blk.out)
+        {
+            return Err(corrupt(blk.start, "block sizes differ from its header"));
+        }
+        while (rd.pos - blk.start) % 4 != 0 {
+            if rd.u8()? != 0 {
+                return Err(corrupt(rd.pos, "bad block padding"));
+            }
+        }
+        let mut stored = vec![0u8; Check::size(check_kind)];
+        rd.take(&mut stored)?;
+        if stored != blk.check.finish() {
+            return Err(corrupt(blk.start, "block check mismatch"));
+        }
+        return Ok(Step::End(
+            blk.header_size + compressed + stored.len() as u64,
+        ));
+    };
+    let mut head = vec![c; 1 + more];
+    rd.take(&mut head[1..])?;
+    let packed = if c >= 0x80 {
+        usize::from(u16::from_be_bytes([head[3], head[4]])) + 1
+    } else {
+        usize::from(u16::from_be_bytes([head[1], head[2]])) + 1
+    };
+    chunk.resize(packed, 0);
+    rd.take(chunk)?;
+    let mut prof = trunc_prof::span("xz.chunk");
+    let n = blk
+        .lz
+        .chunk(&head, chunk, room)
+        .map_err(|e| at_err(e, at))? as u64;
+    prof.add_bytes(n);
+    drop(prof);
+    blk.out += n;
+    if blk.declared_uncompressed.is_some_and(|d| blk.out > d) {
+        return Err(corrupt(blk.start, "block larger than its header says"));
+    }
+    if blk.lz.win.len() - blk.lz.flushed >= crate::lzma::FLUSH_AT {
+        emit(blk, sink)?;
+    }
+    Ok(Step::Chunk(n))
+}
+
+/// A block listed in a stream's index, to be decoded on its own.
+#[derive(Clone, Copy, Debug)]
+struct Job {
+    start: u64,
+    check_kind: u8,
+    uncompressed: u64,
+}
+
+/// A block decoded on a worker thread.
+struct Decoded {
+    out: Vec<u8>,
+    unpadded: u64,
+    /// Position just past the block.
+    end: u64,
+}
+
+fn decode_block(
+    src: &dyn FileHandle,
+    len: u64,
+    job: Job,
+    max_window: u64,
+) -> stream::Result<Decoded> {
+    let mut rd = Reader::new(src, len, job.start);
+    let b = rd.u8()?;
+    if b == 0 {
+        return Err(corrupt(job.start, "expected a block"));
+    }
+    let mut blk = block_header(&mut rd, job.start, b, job.check_kind, max_window)?;
+    let mut v = Vec::with_capacity(usize::try_from(job.uncompressed).unwrap_or(0));
+    let mut sink = |d: &[u8]| -> stream::Result<()> {
+        v.extend_from_slice(d);
+        Ok(())
+    };
+    let mut chunk = Vec::new();
+    let unpadded = loop {
+        if let Step::End(u) = block_step(
+            &mut rd,
+            &mut blk,
+            &mut chunk,
+            u64::MAX,
+            job.check_kind,
+            &mut sink,
+        )? {
+            break u;
+        }
+    };
+    let end = rd.pos;
+    Ok(Decoded {
+        out: v,
+        unpadded,
+        end,
+    })
+}
+
+/// The streams of the file whose blocks can be decoded whole: read from the end (footer, then
+/// index) back to the stream holding `from`. Returns the start of each stream found (whether it
+/// qualifies or not) and the blocks of those that do, in file order. Stops quietly at anything
+/// unexpected; decoding then checks everything as usual.
+fn whole_block_streams(
+    src: &dyn FileHandle,
+    len: u64,
+    from: u64,
+) -> (std::collections::HashMap<u64, bool>, Vec<Job>) {
+    let _prof = trunc_prof::span("xz.index_scan");
+    let mut starts = std::collections::HashMap::new();
+    let mut streams: Vec<Vec<Job>> = Vec::new();
+    let mut end = len;
+    let read = |at: u64, n: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        src.read_exact_at(&mut b, at).ok()?;
+        Some(b)
+    };
+    'walk: loop {
+        // Stream padding: zeros in multiples of four.
+        let mut pad = 0u64;
+        while end >= 4 && end > from {
+            let w = match read(end - 4, 4) {
+                Some(w) => w,
+                None => break 'walk,
+            };
+            if w != [0; 4] {
+                break;
+            }
+            end -= 4;
+            pad += 4;
+            if pad > 1 << 20 {
+                break 'walk;
+            }
+        }
+        if end < 24 || end <= from {
+            break;
+        }
+        let Some(f) = read(end - 12, 12) else { break };
+        let check_kind = f[9];
+        if f[10..] != FOOTER_MAGIC
+            || f[8] != 0
+            || !matches!(check_kind, 0 | 1 | 4 | 10)
+            || crc32fast::hash(&f[4..10]) != u32::from_le_bytes(f[..4].try_into().expect("4"))
+        {
+            break;
+        }
+        let index_size = (u64::from(u32::from_le_bytes(f[4..8].try_into().expect("4"))) + 1) * 4;
+        if index_size > 64 << 20 || index_size + 24 > end {
+            break;
+        }
+        let index_start = end - 12 - index_size;
+        let Some(ix) = read(index_start, usize::try_from(index_size).expect("<= 64 MiB")) else {
+            break;
+        };
+        let body = &ix[..ix.len() - 4];
+        if ix[0] != 0
+            || crc32fast::hash(body)
+                != u32::from_le_bytes(ix[ix.len() - 4..].try_into().expect("4"))
+        {
+            break;
+        }
+        let mut p = 1usize;
+        let Some(count) = vli(body, &mut p) else {
+            break;
+        };
+        let mut blocks = Vec::new();
+        let mut total = 0u64;
+        for _ in 0..count {
+            let (Some(unpadded), Some(uncompressed)) = (vli(body, &mut p), vli(body, &mut p))
+            else {
+                break 'walk;
+            };
+            if unpadded < 5 {
+                break 'walk;
+            }
+            let Some(t) = unpadded
+                .checked_add(3)
+                .map(|u| u & !3)
+                .and_then(|u| total.checked_add(u))
+            else {
+                break 'walk;
+            };
+            blocks.push((total, uncompressed));
+            total = t;
+        }
+        if body[p..].iter().any(|&c| c != 0) || total + 12 > index_start {
+            break;
+        }
+        let start = index_start - total - 12;
+        let whole = blocks.len() >= 2 && blocks.iter().all(|&(_, u)| u <= MAX_WHOLE_BLOCK);
+        starts.insert(start, whole);
+        if whole {
+            streams.push(
+                blocks
+                    .iter()
+                    .map(|&(off, uncompressed)| Job {
+                        start: start + 12 + off,
+                        check_kind,
+                        uncompressed,
+                    })
+                    .collect(),
+            );
+        }
+        if start <= from {
+            break;
+        }
+        end = start;
+    }
+    streams.reverse();
+    (starts, streams.into_iter().flatten().collect())
+}
+
+/// Decode an xz file (one or more streams). Safe points are LZMA2 chunk boundaries (in
+/// single-block streams), block boundaries and stream boundaries once `every` bytes have been
+/// produced since the last one.
 pub fn decode(
     input: Input<'_>,
     start: Option<&[u8]>,
@@ -464,7 +722,7 @@ pub fn decode(
     on_point: &mut OnPoint<'_>,
 ) -> stream::Result<StreamEnd> {
     let Input { src, len } = input;
-    let mut st = match start {
+    let st = match start {
         Some(c) => decode_cursor(c, history, limits.max_window)?,
         None => Restored {
             phase: Phase::Stream,
@@ -472,22 +730,67 @@ pub fn decode(
             out: 0,
             check_kind: 0,
             rec: Records::new(),
+            whole: false,
         },
     };
+    let (starts, jobs) = whole_block_streams(src, len, st.pos);
+    let threads = limits.workers().min(jobs.len());
+    let biggest = jobs
+        .iter()
+        .map(|j| j.uncompressed)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let ahead = usize::try_from(AHEAD_BYTES / biggest)
+        .unwrap_or(usize::MAX)
+        .clamp(2, threads + 2);
+    let work = |k: usize| decode_block(src, len, jobs[k], limits.max_window);
+    stream::with_ahead(jobs.len(), threads.min(ahead), ahead, &work, |pre| {
+        drive(
+            src,
+            len,
+            st,
+            start.is_none(),
+            &starts,
+            &jobs,
+            pre,
+            limits,
+            every,
+            sink,
+            on_point,
+        )
+    })
+}
+
+/// The decoding loop. Blocks of whole-block streams come from `pre` where it has them.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn drive(
+    src: &dyn FileHandle,
+    len: u64,
+    mut st: Restored,
+    mut first: bool,
+    starts: &std::collections::HashMap<u64, bool>,
+    jobs: &[Job],
+    pre: Option<&stream::Ahead<'_, stream::Result<Decoded>>>,
+    limits: Limits,
+    every: u64,
+    sink: &mut Sink<'_>,
+    on_point: &mut OnPoint<'_>,
+) -> stream::Result<StreamEnd> {
     let mut rd = Reader::new(src, len, st.pos);
-    let mut first = start.is_none();
     let mut since = 0u64;
     let mut units = 0u32;
     let mut out = st.out;
     let mut chunk = Vec::new();
     loop {
         // A safe point here is wherever the loop is between steps.
-        if every > 0 && since >= every {
+        let inside_whole = st.whole && matches!(st.phase, Phase::InBlock(_));
+        if every > 0 && since >= every && !inside_whole {
             if let Phase::InBlock(blk) = &mut st.phase {
                 emit(blk, sink)?;
             }
             since = 0;
-            let cursor = encode(&st.phase, rd.pos, out, st.check_kind, &st.rec);
+            let cursor = encode(&st.phase, rd.pos, out, st.check_kind, &st.rec, st.whole);
             on_point(SafePoint {
                 cursor: &cursor,
                 out,
@@ -531,10 +834,28 @@ pub fn decode(
                 }
                 st.check_kind = kind;
                 st.rec = Records::new();
+                st.whole = starts.get(&at).copied().unwrap_or(false);
                 st.phase = Phase::Blocks;
             }
             Phase::Blocks => {
                 let at = rd.pos;
+                if st.whole {
+                    if let Some(d) = pre_decoded(
+                        pre,
+                        jobs,
+                        at,
+                        st.check_kind,
+                        limits.max_out.saturating_sub(out),
+                    ) {
+                        sink(&d.out)?;
+                        let n = d.out.len() as u64;
+                        out += n;
+                        since += n;
+                        st.rec.add(d.unpadded, n);
+                        rd = Reader::new(src, len, d.end);
+                        continue;
+                    }
+                }
                 let b = rd.u8()?;
                 if b != 0 {
                     let blk = block_header(&mut rd, at, b, st.check_kind, limits.max_window)?;
@@ -595,61 +916,39 @@ pub fn decode(
                 st.phase = Phase::Stream;
             }
             Phase::InBlock(blk) => {
-                let at = rd.pos;
-                let c = rd.u8()?;
-                let Some(more) = blk.lz.control(c).map_err(|e| at_err(e, at))? else {
-                    // End of the block's LZMA2 data.
-                    emit(blk, sink)?;
-                    let compressed = rd.pos - blk.start - blk.header_size;
-                    if blk.declared_compressed.is_some_and(|d| d != compressed)
-                        || blk.declared_uncompressed.is_some_and(|d| d != blk.out)
-                    {
-                        return Err(corrupt(blk.start, "block sizes differ from its header"));
-                    }
-                    while (rd.pos - blk.start) % 4 != 0 {
-                        if rd.u8()? != 0 {
-                            return Err(corrupt(rd.pos, "bad block padding"));
-                        }
-                    }
-                    let mut stored = vec![0u8; Check::size(st.check_kind)];
-                    rd.take(&mut stored)?;
-                    if stored != blk.check.finish() {
-                        return Err(corrupt(blk.start, "block check mismatch"));
-                    }
-                    let unpadded = blk.header_size + compressed + stored.len() as u64;
-                    st.rec.add(unpadded, blk.out);
-                    st.phase = Phase::Blocks;
-                    continue;
-                };
-                let mut head = vec![c; 1 + more];
-                rd.take(&mut head[1..])?;
-                let packed = if c >= 0x80 {
-                    usize::from(u16::from_be_bytes([head[3], head[4]])) + 1
-                } else {
-                    usize::from(u16::from_be_bytes([head[1], head[2]])) + 1
-                };
-                chunk.resize(packed, 0);
-                rd.take(&mut chunk)?;
-                let mut prof = trunc_prof::span("xz.chunk");
                 let room = limits.max_out.saturating_sub(out);
-                let n = blk
-                    .lz
-                    .chunk(&head, &chunk, room)
-                    .map_err(|e| at_err(e, at))? as u64;
-                prof.add_bytes(n);
-                drop(prof);
-                out += n;
-                blk.out += n;
-                since += n;
-                if blk.declared_uncompressed.is_some_and(|d| blk.out > d) {
-                    return Err(corrupt(blk.start, "block larger than its header says"));
-                }
-                if blk.lz.win.len() - blk.lz.flushed >= crate::lzma::FLUSH_AT {
-                    emit(blk, sink)?;
+                match block_step(&mut rd, blk, &mut chunk, room, st.check_kind, sink)? {
+                    Step::Chunk(n) => {
+                        out += n;
+                        since += n;
+                    }
+                    Step::End(unpadded) => {
+                        st.rec.add(unpadded, blk.out);
+                        st.phase = Phase::Blocks;
+                    }
                 }
             }
         }
     }
+}
+
+/// The block starting at `at`, if a worker decoded it (and it fits in `room`). Anything else,
+/// including a failure, leaves the block to the decoding loop, which then reports any error the
+/// same way as without threads.
+fn pre_decoded(
+    pre: Option<&stream::Ahead<'_, stream::Result<Decoded>>>,
+    jobs: &[Job],
+    at: u64,
+    check_kind: u8,
+    room: u64,
+) -> Option<Decoded> {
+    let pre = pre?;
+    let k = jobs.binary_search_by_key(&at, |j| j.start).ok()?;
+    if jobs[k].check_kind != check_kind {
+        return None;
+    }
+    let d = pre.get(k).ok()?;
+    (d.out.len() as u64 <= room).then_some(d)
 }
 
 fn at_err(e: StreamError, at: u64) -> StreamError {

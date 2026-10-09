@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rayon::prelude::*;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, IoContext, Result, at};
@@ -37,6 +38,23 @@ pub(crate) fn walk_inputs(inputs: &[PathBuf]) -> Result<Vec<Item>> {
         walk(input, name, &mut out)?;
     }
     Ok(out)
+}
+
+/// Walk the children of a directory on several threads (listing and statting files is mostly
+/// waiting), keeping their sorted order so archives come out the same.
+fn walk_children(children: Vec<(String, PathBuf)>, rel: &str, out: &mut Vec<Item>) -> Result<()> {
+    let parts: Vec<Result<Vec<Item>>> = children
+        .into_par_iter()
+        .map(|(name, p)| {
+            let mut sub = Vec::new();
+            walk(&p, format!("{rel}/{name}"), &mut sub)?;
+            Ok(sub)
+        })
+        .collect();
+    for part in parts {
+        out.extend(part?);
+    }
+    Ok(())
 }
 
 fn component_name(p: &Path) -> Result<String> {
@@ -91,9 +109,7 @@ fn walk(abs: &Path, rel: String, out: &mut Vec<Item>) -> Result<()> {
             children.push((component_name(&p)?, p));
         }
         children.sort();
-        for (name, p) in children {
-            walk(&p, format!("{rel}/{name}"), out)?;
-        }
+        walk_children(children, &rel, out)?;
     }
     Ok(())
 }

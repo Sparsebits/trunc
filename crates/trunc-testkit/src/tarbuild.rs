@@ -277,13 +277,21 @@ pub fn zstd_with(data: &[u8], level: i32, checksum: bool, window_log: Option<u32
     e.finish().unwrap()
 }
 
-/// zstd-compress `data` as several frames of `chunk` input bytes each (like `pzstd`).
+/// zstd-compress `data` as several frames of `chunk` input bytes each, each declaring its size
+/// (like `pzstd`).
 pub fn zstd_frames(data: &[u8], chunk: usize, level: i32) -> Vec<u8> {
     if data.is_empty() {
         return zstd(data, level);
     }
     data.chunks(chunk.max(1))
-        .flat_map(|c| zstd(c, level))
+        .flat_map(|c| {
+            let mut e = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+            e.include_checksum(true).unwrap();
+            e.include_contentsize(true).unwrap();
+            e.set_pledged_src_size(Some(c.len() as u64)).unwrap();
+            e.write_all(c).unwrap();
+            e.finish().unwrap()
+        })
         .collect()
 }
 

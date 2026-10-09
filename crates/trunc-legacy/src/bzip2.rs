@@ -111,10 +111,23 @@ struct Bits<'a> {
     n: u32,
     /// Bits handed out so far (absolute position in the file).
     pos: u64,
+    /// Bytes read from the file at a time.
+    chunk: usize,
 }
 
 impl<'a> Bits<'a> {
     fn new(src: &'a dyn FileHandle, len: u64, start_bit: u64) -> stream::Result<Self> {
+        Self::with_chunk(src, len, start_bit, READ_CHUNK)
+    }
+
+    /// A reader that loads `chunk` bytes at a time (small for a reader that only looks at
+    /// headers between blocks decoded elsewhere).
+    fn with_chunk(
+        src: &'a dyn FileHandle,
+        len: u64,
+        start_bit: u64,
+        chunk: usize,
+    ) -> stream::Result<Self> {
         let mut b = Self {
             src,
             len,
@@ -124,6 +137,7 @@ impl<'a> Bits<'a> {
             acc: 0,
             n: 0,
             pos: start_bit / 8 * 8,
+            chunk,
         };
         if start_bit / 8 > len {
             return Err(corrupt(start_bit, "position past the end of the file"));
@@ -142,7 +156,7 @@ impl<'a> Bits<'a> {
                 if self.next_load >= self.len {
                     return Ok(());
                 }
-                let n = usize::try_from((self.len - self.next_load).min(READ_CHUNK as u64))
+                let n = usize::try_from((self.len - self.next_load).min(self.chunk as u64))
                     .expect("<= chunk");
                 self.buf.resize(n, 0);
                 self.src.read_exact_at(&mut self.buf, self.next_load)?;
@@ -385,13 +399,14 @@ struct Scratch {
     crc: Crc,
 }
 
-/// Decode one block (after its magic) and emit its output. Returns the block's CRC.
+/// Decode one block (after its magic) and emit its output. Returns the block's CRC and its
+/// size before the final run-length pass (at most `level` hundred kB).
 fn block(
     bits: &mut Bits<'_>,
     level: u8,
     s: &mut Scratch,
     out: &mut Out<'_, '_>,
-) -> stream::Result<u32> {
+) -> stream::Result<(u32, usize)> {
     let mut prof = trunc_prof::span("bzip2.block");
     let start_out = out.total;
     let at = bits.pos;
@@ -596,7 +611,103 @@ fn block(
         return Err(corrupt(at, "block CRC mismatch"));
     }
     prof.add_bytes(out.total - start_out);
-    Ok(crc)
+    Ok((crc, n))
+}
+
+/// A block decoded on a worker thread, from where its magic starts.
+struct Decoded {
+    out: Vec<u8>,
+    crc: u32,
+    /// Size before the final run-length pass (checked against the stream's block size).
+    n: usize,
+    /// Bit position just past the block.
+    end_bit: u64,
+}
+
+/// Decode the block whose magic starts at bit `at`. The block size is not known here (it
+/// belongs to the stream), so the largest is allowed and the caller checks.
+fn decode_at(src: &dyn FileHandle, len: u64, at: u64) -> stream::Result<Decoded> {
+    let mut bits = Bits::new(src, len, at)?;
+    if bits.get64(48)? != BLOCK_MAGIC {
+        return Err(corrupt(at, "bad block magic"));
+    }
+    thread_local! {
+        // Reused by each worker thread: fresh multi-megabyte buffers per block would be zeroed
+        // and page-faulted in every time, and threads doing that at once contend in the kernel.
+        static SCRATCH: std::cell::RefCell<Option<Scratch>> = const { std::cell::RefCell::new(None) };
+    }
+    let mut v = Vec::with_capacity(4 << 20);
+    let mut sink = |b: &[u8]| -> stream::Result<()> {
+        v.extend_from_slice(b);
+        Ok(())
+    };
+    let mut out = Out {
+        sink: &mut sink,
+        buf: Vec::with_capacity(FLUSH_AT + 64 * 1024),
+        total: 0,
+        max_out: u64::MAX,
+    };
+    let (crc, n) = SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let scratch = slot.get_or_insert_with(|| Scratch {
+            block: Vec::new(),
+            next: Vec::new(),
+            crc: Crc::new(),
+        });
+        block(&mut bits, 9, scratch, &mut out)
+    })?;
+    out.flush()?;
+    let end_bit = bits.pos;
+    drop(out);
+    Ok(Decoded {
+        out: v,
+        crc,
+        n,
+        end_bit,
+    })
+}
+
+/// Bit positions at or after `from_bit` where the block magic appears. Some may be inside
+/// compressed data rather than real block starts; the decoder only uses the one at the position
+/// it expects.
+fn find_blocks(
+    src: &dyn FileHandle,
+    len: u64,
+    from_bit: u64,
+    threads: usize,
+) -> stream::Result<Vec<u64>> {
+    let _prof = trunc_prof::span("bzip2.find_blocks");
+    const CHUNK: u64 = 8 << 20;
+    const MASK: u64 = (1 << 48) - 1;
+    let first = from_bit / 8;
+    let chunks = usize::try_from(len.saturating_sub(first).div_ceil(CHUNK)).unwrap_or(0);
+    let mut found = Vec::new();
+    let scan = |c: usize| -> stream::Result<Vec<u64>> {
+        let start = first + c as u64 * CHUNK;
+        let own = (len - start).min(CHUNK);
+        // Read a little past the chunk so a magic straddling the edge is seen.
+        let n = usize::try_from((len - start).min(CHUNK + 8)).expect("<= chunk");
+        let mut buf = vec![0u8; n + 8];
+        src.read_exact_at(&mut buf[..n], start)?;
+        let mut hits = Vec::new();
+        for i in 0..usize::try_from(own).expect("<= chunk") {
+            let w = u64::from_be_bytes(buf[i..i + 8].try_into().expect("8"));
+            for shift in 0..8u64 {
+                if (w >> (16 - shift)) & MASK == BLOCK_MAGIC {
+                    let bit = (start + i as u64) * 8 + shift;
+                    if bit >= from_bit {
+                        hits.push(bit);
+                    }
+                }
+            }
+        }
+        Ok(hits)
+    };
+    stream::ordered_parallel(chunks, threads, threads * 2, &scan, &mut |_, hits| {
+        found.extend(hits);
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 /// True if `[from, len)` of the file is empty or all zeros.
@@ -646,9 +757,61 @@ pub fn decode(
         total: st.out,
         max_out: limits.max_out,
     };
+    // Decode blocks ahead on worker threads: every block is independent. Files smaller than a
+    // couple of blocks are not worth the threads.
+    let threads = if len >= 2 << 20 { limits.workers() } else { 1 };
+    let cands = {
+        #[allow(unused_mut)]
+        let mut c = if threads > 1 {
+            find_blocks(src, len, st.bit, threads)?
+        } else {
+            Vec::new()
+        };
+        #[cfg(test)]
+        BOGUS.with(|b| {
+            // Tests plant false magic positions to check they are ignored.
+            c.extend(b.borrow().iter().copied());
+            c.sort_unstable();
+            c.dedup();
+        });
+        c
+    };
+    let work = |k: usize| decode_at(src, len, cands[k]);
+    stream::with_ahead(cands.len(), threads, threads + 2, &work, |ahead| {
+        drive(
+            src,
+            len,
+            &mut bits,
+            &mut st,
+            &mut scratch,
+            &mut out,
+            &cands,
+            ahead,
+            start.is_none(),
+            every,
+            on_point,
+        )
+    })
+}
+
+/// The decoding loop: stream headers, blocks (pre-decoded by `ahead` where it has them) and
+/// end-of-stream markers.
+#[allow(clippy::too_many_arguments)]
+fn drive<'f>(
+    src: &'f dyn FileHandle,
+    len: u64,
+    bits: &mut Bits<'f>,
+    st: &mut State,
+    scratch: &mut Scratch,
+    out: &mut Out<'_, '_>,
+    cands: &[u64],
+    ahead: Option<&stream::Ahead<'_, stream::Result<Decoded>>>,
+    mut first: bool,
+    every: u64,
+    on_point: &mut OnPoint<'_>,
+) -> stream::Result<StreamEnd> {
     let mut since = 0u64;
     let mut units = 0u32;
-    let mut first = start.is_none();
     loop {
         if st.level == 0 {
             // A stream header, byte-aligned.
@@ -673,7 +836,19 @@ pub fn decode(
         let magic = bits.get64(48)?;
         if magic == BLOCK_MAGIC {
             let before = out.total;
-            let crc = block(&mut bits, st.level, &mut scratch, &mut out)?;
+            let k = ahead.and_then(|_| cands.binary_search(&at).ok());
+            let crc = match (ahead, k) {
+                (Some(a), Some(k)) => {
+                    let d = a.get(k)?;
+                    if d.n > usize::from(st.level) * 100_000 {
+                        return Err(corrupt(at, "block larger than its declared size"));
+                    }
+                    out.push(&d.out)?;
+                    *bits = Bits::with_chunk(src, len, d.end_bit, 4096)?;
+                    d.crc
+                }
+                _ => block(bits, st.level, scratch, out)?.0,
+            };
             st.combined = st.combined.rotate_left(1) ^ crc;
             since += out.total - before;
             if every > 0 && since >= every {
@@ -723,8 +898,59 @@ pub fn decode(
 }
 
 #[cfg(test)]
+thread_local! {
+    static BOGUS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn false_magic_positions_are_ignored() {
+        use std::path::Path;
+        use trunc_fs::{FsBackend, OpenMode, Share};
+        let mut rng = trunc_testkit::Rng::new(5);
+        let data = trunc_testkit::fixtures::noise_bytes(&mut rng, 3 << 20);
+        let bytes = trunc_testkit::tarbuild::bzip2(&data, 1);
+        let fs = trunc_testkit::FaultFs::new(trunc_testkit::CrashModel::WriteThrough);
+        fs.put_file(Path::new("/b"), &bytes);
+        let h = fs
+            .open(Path::new("/b"), OpenMode::Read, Share::Shared)
+            .unwrap();
+        let len = bytes.len() as u64;
+        let real = find_blocks(h.as_ref(), len, 0, 4).unwrap();
+        assert!(real.len() > 10, "{} blocks", real.len());
+        // Positions inside blocks, one bit off a real start, and near the end.
+        let bogus: Vec<u64> = real
+            .iter()
+            .flat_map(|&b| [b + 1, b + 777, b.saturating_sub(3)])
+            .chain([len * 8 - 60])
+            .collect();
+        BOGUS.with(|b| *b.borrow_mut() = bogus);
+        let mut out = Vec::new();
+        let limits = Limits {
+            threads: 4,
+            ..Limits::new(u64::MAX)
+        };
+        let r = decode(
+            Input {
+                src: h.as_ref(),
+                len,
+            },
+            None,
+            limits,
+            0,
+            &mut |b| {
+                out.extend_from_slice(b);
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        );
+        BOGUS.with(|b| b.borrow_mut().clear());
+        r.unwrap();
+        assert!(out == data);
+    }
 
     #[test]
     fn crc_matches_the_reference_check_value() {
