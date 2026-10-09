@@ -92,8 +92,10 @@ impl Frame {
             sink(data)?;
             self.flushed = self.win.len();
         }
+        // Drop history beyond the window, but only once it is as large again, so each byte is
+        // moved about once.
         let keep = usize::try_from(self.window).unwrap_or(usize::MAX).max(1);
-        if self.win.len() > keep.saturating_add(FLUSH_AT) {
+        if self.win.len() > keep.saturating_add(keep.max(FLUSH_AT)) {
             let drop = self.win.len() - keep;
             self.win.drain(..drop);
             self.flushed = self.win.len();

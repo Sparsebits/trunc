@@ -200,8 +200,11 @@ impl Lzma2 {
 
     /// Drop window bytes that are no longer needed (all handed on).
     pub(crate) fn trim(&mut self) {
+        // Only once the excess is as large as the dictionary, so each byte is moved about once.
         let keep = (self.dict_size as usize).max(1);
-        if self.flushed == self.win.len() && self.win.len() > keep + FLUSH_AT {
+        if self.flushed == self.win.len()
+            && self.win.len() > keep.saturating_add(keep.max(FLUSH_AT))
+        {
             let drop = self.win.len() - keep;
             self.win.drain(..drop);
             self.flushed = self.win.len();
@@ -377,9 +380,12 @@ impl Lzma2 {
         if d >= n {
             self.win.extend_from_within(start..start + n);
         } else {
-            for i in 0..n {
-                let b = self.win[start + i];
-                self.win.push(b);
+            // Overlapping: copy whole periods of `d` bytes, doubling.
+            let mut left = n;
+            while left > 0 {
+                let k = left.min(self.win.len() - start);
+                self.win.extend_from_within(start..start + k);
+                left -= k;
             }
         }
         self.pos += n as u64;

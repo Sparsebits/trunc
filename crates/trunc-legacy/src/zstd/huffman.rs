@@ -152,7 +152,8 @@ impl Huffman {
         Ok(())
     }
 
-    /// Decode `n` literals from `b` (one stream, or four with a jump table).
+    /// Decode `n` literals from `b` (one stream, or four with a jump table). The four streams
+    /// are decoded in step, which lets the processor overlap their work.
     pub(super) fn decode(&self, b: &[u8], n: usize, four: bool) -> stream::Result<Vec<u8>> {
         let mut out = vec![0u8; n];
         if !four {
@@ -171,10 +172,11 @@ impl Huffman {
         if 3 * seg > n {
             return Err(corrupt("too few literals for four streams"));
         }
+        let mut streams = Vec::with_capacity(4);
         let mut at = 6usize;
-        for i in 0..4 {
+        for (i, &size) in sizes.iter().chain(std::iter::once(&0)).enumerate() {
             let len = if i < 3 {
-                sizes[i]
+                size
             } else {
                 b.len()
                     .checked_sub(at)
@@ -183,9 +185,35 @@ impl Huffman {
             let data = b
                 .get(at..at + len)
                 .ok_or_else(|| corrupt("bad jump table"))?;
-            let end = if i < 3 { (i + 1) * seg } else { n };
-            self.stream(data, &mut out[i * seg..end])?;
+            streams.push(Backward::new(data)?);
             at += len;
+        }
+        let [mut s0, mut s1, mut s2, mut s3]: [Backward<'_>; 4] =
+            streams.try_into().map_err(|_| corrupt("bad jump table"))?;
+        let last = n - 3 * seg;
+        let (o0, rest) = out.split_at_mut(seg);
+        let (o1, rest) = rest.split_at_mut(seg);
+        let (o2, o3) = rest.split_at_mut(seg);
+        let mb = self.max_bits;
+        let t = &self.table;
+        let sym = |bs: &mut Backward<'_>| {
+            let (s, k) = t[bs.peek(mb) as usize];
+            bs.skip(u32::from(k));
+            s
+        };
+        for k in 0..last {
+            o0[k] = sym(&mut s0);
+            o1[k] = sym(&mut s1);
+            o2[k] = sym(&mut s2);
+            o3[k] = sym(&mut s3);
+        }
+        for k in last..seg {
+            o0[k] = sym(&mut s0);
+            o1[k] = sym(&mut s1);
+            o2[k] = sym(&mut s2);
+        }
+        if !(s0.finished() && s1.finished() && s2.finished() && s3.finished()) {
+            return Err(corrupt("Huffman stream not consumed exactly"));
         }
         Ok(out)
     }

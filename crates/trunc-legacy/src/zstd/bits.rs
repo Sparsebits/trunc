@@ -54,10 +54,17 @@ impl<'a> Forward<'a> {
 /// Reads a bitstream backward: it starts at the highest set bit of the last byte (a marker)
 /// and each read takes the next bits below. Reading past the start yields zeros and is
 /// detected with [`Backward::overflowed`].
+///
+/// The bits just below the read position are kept left-aligned in a 64-bit accumulator, so a
+/// read is two shifts; the accumulator is refilled from memory once fewer than 57 bits remain.
 pub(super) struct Backward<'a> {
     b: &'a [u8],
     /// Bits not yet read: they are `[0, pos)`.
     pos: i64,
+    /// The bits just below `pos`, most significant first.
+    acc: u64,
+    /// How many of `acc`'s top bits are valid (below the start of the stream they read as zeros).
+    avail: u32,
 }
 
 impl<'a> Backward<'a> {
@@ -67,7 +74,37 @@ impl<'a> Backward<'a> {
             return Err(corrupt("bitstream has no end marker"));
         }
         let pos = (b.len() as i64 - 1) * 8 + i64::from(7 - last.leading_zeros());
-        Ok(Self { b, pos })
+        let mut s = Self {
+            b,
+            pos,
+            acc: 0,
+            avail: 0,
+        };
+        s.refill();
+        Ok(s)
+    }
+
+    #[inline]
+    fn refill(&mut self) {
+        if self.pos <= 0 {
+            self.acc = 0;
+            self.avail = 64;
+            return;
+        }
+        let pos = self.pos as usize;
+        let end = pos.div_ceil(8);
+        let start = end.saturating_sub(8);
+        let w = if end - start == 8 {
+            u64::from_le_bytes(self.b[start..end].try_into().expect("8"))
+        } else {
+            let mut w = [0u8; 8];
+            w[..end - start].copy_from_slice(&self.b[start..end]);
+            u64::from_le_bytes(w)
+        };
+        // Bits [8 * start, pos) of the stream, with bit pos - 1 moved to the top.
+        let have = pos - 8 * start;
+        self.acc = if have == 64 { w } else { w << (64 - have) };
+        self.avail = if start == 0 { 64 } else { have as u32 };
     }
 
     /// The next `n` bits (n <= 56), most significant first.
@@ -76,45 +113,49 @@ impl<'a> Backward<'a> {
         if n == 0 {
             return 0;
         }
+        if self.avail < n {
+            self.refill();
+        }
+        let v = self.acc >> (64 - n);
+        self.acc <<= n;
+        self.avail -= n;
         self.pos -= i64::from(n);
-        if self.pos < 0 {
-            // Reading below bit 0: what exists, shifted up over zeros.
-            let have = i64::from(n) + self.pos;
-            if have <= 0 {
-                return 0;
-            }
-            return (self.word(0) & ((1u64 << have) - 1)) << (-self.pos);
-        }
-        let start = usize::try_from(self.pos / 8).expect("non-negative");
-        let shift = (self.pos % 8) as u32;
-        (self.word(start) >> shift) & ((1u64 << n) - 1)
+        v
     }
 
-    /// Eight bytes from `start`, little-endian, zero past the end.
+    /// Make sure at least `n` (<= 57) bits are buffered for [`Backward::take`].
     #[inline]
-    fn word(&self, start: usize) -> u64 {
-        if start + 8 <= self.b.len() {
-            u64::from_le_bytes(self.b[start..start + 8].try_into().expect("8"))
-        } else {
-            let mut w = [0u8; 8];
-            let n = self.b.len().saturating_sub(start).min(8);
-            w[..n].copy_from_slice(&self.b[start..start + n]);
-            u64::from_le_bytes(w)
+    pub(super) fn ensure(&mut self, n: u32) {
+        if self.avail < n {
+            self.refill();
         }
     }
 
-    /// The next `n` bits without consuming them.
+    /// The next `n` bits (0 <= n, and no more than [`Backward::ensure`] made sure of), without
+    /// branching on `n`.
     #[inline]
-    pub(super) fn peek(&self, n: u32) -> u64 {
-        let mut c = Backward {
-            b: self.b,
-            pos: self.pos,
-        };
-        c.read(n)
+    pub(super) fn take(&mut self, n: u32) -> u64 {
+        let v = (self.acc >> (63 - n)) >> 1;
+        self.acc <<= n;
+        self.avail -= n;
+        self.pos -= i64::from(n);
+        v
     }
 
+    /// The next `n` bits (1 <= n <= 56) without consuming them.
+    #[inline]
+    pub(super) fn peek(&mut self, n: u32) -> u64 {
+        if self.avail < n {
+            self.refill();
+        }
+        self.acc >> (64 - n)
+    }
+
+    /// Consume `n` bits after a [`Backward::peek`] of at least `n`.
     #[inline]
     pub(super) fn skip(&mut self, n: u32) {
+        self.acc <<= n;
+        self.avail -= n;
         self.pos -= i64::from(n);
     }
 

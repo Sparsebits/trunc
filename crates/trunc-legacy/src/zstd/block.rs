@@ -72,10 +72,21 @@ impl Kind {
     }
 }
 
+/// One state of a sequence table, with what its symbol means already looked up: the value's
+/// base and extra bits, and the next state's base and bits.
+#[derive(Debug, Clone, Copy, Default)]
+struct SeqEntry {
+    base: u32,
+    add: u8,
+    bits: u8,
+    next: u16,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SeqTable {
     pub(super) desc: Desc,
-    table: Table,
+    log: u32,
+    entries: Vec<SeqEntry>,
 }
 
 impl SeqTable {
@@ -99,7 +110,30 @@ impl SeqTable {
                 Table::build(norm, *log)?
             }
         };
-        Ok(Self { desc, table })
+        // Symbols are below the kind's limit by construction, so these lookups cannot fail.
+        let entries = table
+            .entries
+            .iter()
+            .map(|e| {
+                let s = usize::from(e.symbol);
+                let (base, add) = match kind {
+                    Kind::Ll => (LL_BASE[s], LL_BITS[s]),
+                    Kind::Ml => (ML_BASE[s], ML_BITS[s]),
+                    Kind::Of => (1u32 << s, e.symbol),
+                };
+                SeqEntry {
+                    base,
+                    add,
+                    bits: e.bits,
+                    next: e.base,
+                }
+            })
+            .collect();
+        Ok(Self {
+            desc,
+            log: table.log,
+            entries,
+        })
     }
 }
 
@@ -123,15 +157,21 @@ pub(super) fn decompress(
     window: u64,
     max_block: usize,
 ) -> stream::Result<()> {
-    let (lits, used) = literals(b, ent, max_block)?;
+    let (mut lits, used) = literals(b, ent, max_block)?;
     let rest = &b[used..];
     let start = win.len();
-    sequences(rest, ent, &lits, win, produced, window)?;
+    // Slack after the literals lets them be copied in fixed 16-byte chunks.
+    let n_lits = lits.len();
+    lits.resize(n_lits + WILD, 0);
+    sequences(rest, ent, &lits, n_lits, win, produced, window, max_block)?;
     if win.len() - start > max_block {
         return Err(corrupt("block output larger than allowed"));
     }
     Ok(())
 }
+
+/// Slack for copies made in fixed 16-byte chunks that may run past their end.
+const WILD: usize = 32;
 
 fn literals(b: &[u8], ent: &mut Entropy, max_block: usize) -> stream::Result<(Vec<u8>, usize)> {
     let &h0 = b.first().ok_or_else(|| corrupt("empty block"))?;
@@ -242,15 +282,19 @@ fn table_for(
     Ok(())
 }
 
+/// Decode the sequences section and execute it: `lits[..n_lits]` are the block's literals
+/// (followed by `WILD` bytes of slack), and the output is appended to `win`.
+#[allow(clippy::too_many_arguments)]
 fn sequences(
     b: &[u8],
     ent: &mut Entropy,
     lits: &[u8],
+    n_lits: usize,
     win: &mut Vec<u8>,
     produced: u64,
     window: u64,
+    max_block: usize,
 ) -> stream::Result<()> {
-    let block_start = win.len();
     let n = match b.first() {
         None => return Err(corrupt("missing sequences section")),
         Some(&0) => 0,
@@ -271,7 +315,7 @@ fn sequences(
         if b.len() > 1 {
             return Err(corrupt("data after an empty sequences section"));
         }
-        win.extend_from_slice(lits);
+        win.extend_from_slice(&lits[..n_lits]);
         return Ok(());
     }
     let mut at = match b[0] {
@@ -287,29 +331,30 @@ fn sequences(
     table_for(Kind::Ll, modes >> 6, b, &mut at, &mut ent.ll)?;
     table_for(Kind::Of, (modes >> 4) & 3, b, &mut at, &mut ent.of)?;
     table_for(Kind::Ml, (modes >> 2) & 3, b, &mut at, &mut ent.ml)?;
-    let ll = &ent.ll.as_ref().expect("set above").table;
-    let of = &ent.of.as_ref().expect("set above").table;
-    let ml = &ent.ml.as_ref().expect("set above").table;
+    let ll = ent.ll.as_ref().expect("set above");
+    let of = ent.of.as_ref().expect("set above");
+    let ml = ent.ml.as_ref().expect("set above");
     let mut bs = Backward::new(b.get(at..).ok_or_else(|| corrupt("missing sequences"))?)?;
     let mut sl = bs.read(ll.log) as usize;
     let mut so = bs.read(of.log) as usize;
     let mut sm = bs.read(ml.log) as usize;
     let mut lit_at = 0usize;
     let reps = &mut ent.reps;
+    // Write into a buffer sized for the largest block plus slack, then cut it to length: copies
+    // can then go in fixed 16-byte chunks that may overshoot into the slack.
+    let base = win.len();
+    let limit = base + max_block;
+    win.resize(limit + WILD, 0);
+    let buf = win.as_mut_slice();
+    let mut op = base;
     for i in 0..n {
         let (le, oe, me) = (ll.entries[sl], of.entries[so], ml.entries[sm]);
-        let of_code = u32::from(oe.symbol);
-        if of_code > 31 {
-            return Err(corrupt("offset code too large"));
-        }
-        let ov = (1u64 << of_code) + bs.read(of_code);
-        let ml_code = usize::from(me.symbol);
-        let ll_code = usize::from(le.symbol);
-        if ml_code >= ML_BASE.len() || ll_code >= LL_BASE.len() {
-            return Err(corrupt("length code out of range"));
-        }
-        let mlen = ML_BASE[ml_code] as usize + bs.read(u32::from(ML_BITS[ml_code])) as usize;
-        let llen = LL_BASE[ll_code] as usize + bs.read(u32::from(LL_BITS[ll_code])) as usize;
+        // Offset extra bits are at most 31, match and literal length bits 16 each.
+        bs.ensure(31);
+        let ov = u64::from(oe.base) + bs.take(u32::from(oe.add));
+        bs.ensure(32);
+        let mlen = me.base as usize + bs.take(u32::from(me.add)) as usize;
+        let llen = le.base as usize + bs.take(u32::from(le.add)) as usize;
         let offset = if ov > 3 {
             let o = u32::try_from(ov - 3).map_err(|_| corrupt("offset too large"))?;
             *reps = [o, reps[0], reps[1]];
@@ -341,39 +386,62 @@ fn sequences(
                 }
             }
         };
-        // Literals, then the match.
-        let lend = lit_at + llen;
-        if lend > lits.len() {
+        if lit_at + llen > n_lits {
             return Err(corrupt("sequence uses more literals than the block has"));
         }
-        win.extend_from_slice(&lits[lit_at..lend]);
-        lit_at = lend;
-        let made = produced + (win.len() - block_start) as u64;
+        if op + llen + mlen > limit {
+            return Err(corrupt("block output larger than allowed"));
+        }
+        // Literals, in 16-byte chunks (the literals and the buffer both have slack).
+        let mut k = 0;
+        while k < llen {
+            let t: [u8; 16] = lits[lit_at + k..lit_at + k + 16].try_into().expect("16");
+            buf[op + k..op + k + 16].copy_from_slice(&t);
+            k += 16;
+        }
+        op += llen;
+        lit_at += llen;
+        // Then the match.
+        let made = produced + (op - base) as u64;
         let d = offset as usize;
-        if u64::from(offset) > made || u64::from(offset) > window || d > win.len() {
+        if u64::from(offset) > made || u64::from(offset) > window || d > op {
             return Err(corrupt("offset too far back"));
         }
-        let from = win.len() - d;
-        if d >= mlen {
-            win.extend_from_within(from..from + mlen);
+        let src = op - d;
+        if d >= 16 {
+            // Each chunk reads only bytes already written.
+            let mut k = 0;
+            while k < mlen {
+                let t: [u8; 16] = buf[src + k..src + k + 16].try_into().expect("16");
+                buf[op + k..op + k + 16].copy_from_slice(&t);
+                k += 16;
+            }
         } else {
-            for k in 0..mlen {
-                let c = win[from + k];
-                win.push(c);
+            // A short period: copy whole periods from the start of the match, doubling.
+            let mut done = 0;
+            while done < mlen {
+                let n = (mlen - done).min(d + done);
+                buf.copy_within(src..src + n, op + done);
+                done += n;
             }
         }
+        op += mlen;
         if i + 1 < n {
-            sl = usize::from(le.base) + bs.read(u32::from(le.bits)) as usize;
-            sm = usize::from(me.base) + bs.read(u32::from(me.bits)) as usize;
-            so = usize::from(oe.base) + bs.read(u32::from(oe.bits)) as usize;
-        }
-        if win.len() - block_start > 128 * 1024 + lits.len() {
-            return Err(corrupt("block output larger than allowed"));
+            // State bits are at most 9 + 9 + 8.
+            bs.ensure(26);
+            sl = usize::from(le.next) + bs.take(u32::from(le.bits)) as usize;
+            sm = usize::from(me.next) + bs.take(u32::from(me.bits)) as usize;
+            so = usize::from(oe.next) + bs.take(u32::from(oe.bits)) as usize;
         }
     }
     if !bs.finished() {
         return Err(corrupt("sequence bitstream not consumed exactly"));
     }
-    win.extend_from_slice(&lits[lit_at..]);
+    let rest = n_lits - lit_at;
+    if op + rest > limit {
+        return Err(corrupt("block output larger than allowed"));
+    }
+    buf[op..op + rest].copy_from_slice(&lits[lit_at..n_lits]);
+    win.truncate(op + rest);
     Ok(())
 }

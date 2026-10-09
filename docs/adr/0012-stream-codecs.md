@@ -53,7 +53,8 @@ consuming them would free nothing until the end.
   differentially (anything trunc accepts, the reference decoder must accept with the same
   output).
 - Decoding speed on one core: gzip and bzip2 match or beat `gzip -t` and `bzip2 -t`, xz is
-  about 25% slower than liblzma, and zstd reaches about 300 MB/s, slower than libzstd.
+  about 25% slower than liblzma, and zstd decodes at about 600-680 MB/s, roughly 60% of libzstd
+  (`cargo run --release -p trunc-legacy --example decode -- <file>` times a decoder alone).
 - A tarball consume of an xz or zstd archive writes the tar metadata twice: once into the gap
   log, which is removed at the end. The space planner counts it.
 - BCJ and delta xz filters, zstd dictionaries and the obsolete randomized bzip2 blocks are
