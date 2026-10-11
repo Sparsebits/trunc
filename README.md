@@ -12,45 +12,69 @@
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-ff5b35"></a>
   <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-121212">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-121212">
-  <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-c93a17">
 </p>
 
 <p align="center">
   <a href="#installation">Installation</a> ·
-  <a href="#quick-start">Quick start</a> ·
+  <a href="#usage">Usage</a> ·
   <a href="#supported-formats">Formats</a> ·
+  <a href="#faq">FAQ</a> ·
   <a href="#how-it-works">How it works</a> ·
-  <a href="#performance">Performance</a> ·
   <a href="docs/guide.md">User guide</a>
 </p>
 
 ---
 
-trunc extracts an archive while giving its disk space back. It deletes each part of the archive
-as soon as the files from that part are safely on disk, so unpacking a 50 GB archive takes about
-as much disk as its contents, not the archive and its contents together.
+You downloaded a 60 GB dataset as a ZIP, and your laptop has 40 GB free. Every extractor you
+have will stop partway: it writes the 60 GB of contents next to the 60 GB archive, which stays
+until you delete it. trunc deletes the archive while it extracts. Each piece goes as
+soon as the files it held are verified and flushed to disk, so the job needs room for what the
+contents add over the archive, not for both. If the power goes out halfway, run the same
+command again and it carries on.
 
-An ordinary extractor keeps the whole archive until it finishes: turning a 6 GB archive into
-10 GB of files needs 10 GB free. With trunc, the same job needs a little over 4 GB. If the power
-goes out halfway, nothing is lost: run `trunc resume` and it carries on where it stopped.
+<p align="center">
+  <img alt="Disk space over time while extracting a 2.76 GiB ZIP into 4.25 GiB of files: tar -xf peaks at 7.00 GiB, trunc x --consume at 4.50 GiB" src="docs/assets/disk-usage.svg" width="100%">
+</p>
+
+<p align="center"><sub>
+Extracting a 2.76 GiB ZIP (702 files, 4.25 GiB: a 1 GiB video, photos, a 1 GiB CSV and logs).
+Grey: Windows' built-in <code>tar -xf</code>. Orange: <code>trunc x --consume</code>. The line is the
+space allocated to the archive and the extracted files, read every 100 ms with
+<code>GetCompressedFileSizeW</code> (freed parts of the archive count as free). One run each,
+NTFS on a Samsung NVMe SSD, AMD Ryzen 7 5800H. Reading 700 files every 100 ms slowed both
+runs, so the time axis is longer than an unobserved run.
+</sub></p>
+
+```console
+$ trunc x dataset.zip -C dataset --consume --yes
+all entries consumed; moving files into place
+extracted 702 files, 5 directories, 4.25 GiB into dataset
+archive   consumed and removed
+time      65.54s (12 steps)
+```
+
+Leave off `--yes` and trunc asks before it starts. Leave off `--consume` and it is an ordinary
+extractor that keeps the archive.
 
 ## Highlights
 
+- **Works on the archives you have.** ZIP (including Zip64), `.tar.gz`, `.tar.bz2`, `.tar.xz`,
+  `.tar.zst`, single compressed files such as `disk.img.xz`, ISO disc images and split archives
+  all give space back while they extract. No repacking, no special format.
 - **Less space.** You need about *output size minus archive size* free, not the full output size.
+  Inside big files too: a single 50 GB entry gives its space back every 64 MiB.
 - **Safe to interrupt.** A part of the archive is released only after the files it produced are
   verified and flushed to disk. `trunc resume` continues after a crash, a kill or a full disk.
 - **Plans first.** `trunc plan` tells you how much space each mode needs, and warns about
   cloud-sync folders, snapshots and filesystems where consuming an archive is unsafe.
-- **Works on the archives you have.** ZIP, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`, single
-  compressed files and split tarballs all give space back while they decompress, not just when
-  each file finishes. Container images (`docker save`, OCI) extract to their merged root
-  filesystem.
-- **Checks everything.** Every block is hashed and archives can be signed. Nothing is deleted
-  until the output that replaces it has been verified.
-- **Fast.** `.trnc` blocks decompress in parallel at over 1 GiB/s, and bzip2, multi-block xz and
-  multi-frame zstd files decode on all cores too.
+- **Checks everything.** Every piece is checked against its hash, CRC or codec checksum before
+  the archive bytes it came from are freed.
 - **Windows and Linux.** Every feature on NTFS, ext4, XFS, btrfs and ZFS. The Linux builds are
   static and run on any distribution.
+- **Container images too.** `docker save` and OCI archives extract to their merged root
+  filesystem, without a container runtime.
+- **Its own format, if you make the archive.** `.trnc` archives decompress in parallel at over
+  1 GiB/s and can be signed.
 
 ## Installation
 
@@ -67,7 +91,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Spa
 ```
 
 Both scripts download the latest release, check its SHA-256, and install `trunc` to `~/.local/bin`
-or `%LOCALAPPDATA%\Programs\trunc`. Set `TRUNC_VERSION=v0.1.0` to pin a version, or
+or `%LOCALAPPDATA%\Programs	runc`. Set `TRUNC_VERSION=v0.1.0` to pin a version, or
 `TRUNC_INSTALL_DIR` to install somewhere else. If the [GitHub CLI](https://cli.github.com) is
 installed, they also check the release's signed build provenance (see
 [Verifying downloads](docs/security.md#verifying-downloads)).
@@ -80,63 +104,43 @@ newer:
 cargo install --git https://github.com/Sparsebits/trunc trunc-cli
 ```
 
-## Quick start
+## Usage
 
-Pack a folder:
-
-```console
-$ trunc create data.trnc ./data
-created   data.trnc
-entries   12
-blocks    96
-size      768.00 MiB -> 256.08 MiB (33.3% of original)
-time      2.67s (288.09 MiB/s)
-```
-
-Before extracting, ask what it will cost:
+Ask first what it will cost. `trunc plan` changes nothing:
 
 ```console
-$ trunc plan data.trnc -C ./out
-destination   C:\ NTFS (journaled, cluster 4.00 KiB), 6.54 GiB free
-archive now   256.08 MiB
-content       768.00 MiB to write
+$ trunc plan dataset.zip -C dataset
+archive       dataset.zip (ZIP, 2.76 GiB)
+content       4.25 GiB to write
+destination   dataset (NTFS), 50.25 GiB free
 
 free space needed at the destination:
-  extract (keeps archive)     787.89 MiB   fits
-  consume (--consume)         531.85 MiB   fits   (peak occupancy 787.93 MiB, 3 batches)
-  consume saves 256.03 MiB (32.5%)
+  extract (keeps archive)       4.29 GiB   fits
+  consume (--consume)           1.78 GiB   fits
+  (punch mode frees space inside large entries; without it consuming needs up to 2.53 GiB)
 ```
 
-Then extract it. `--consume` is the destructive part: the archive shrinks as the files appear,
-and only a small receipt holding the archive's manifest is left at the end.
-
-```console
-$ trunc x data.trnc -C ./out --consume
-all blocks consumed; moving files into place
-extracted 9 files, 3 directories, 768.00 MiB into ./out
-archive   consumed; receipt kept at data.trnc.receipt
-time      1.52s (3 batches)
-```
-
-The same command works on ZIP files, compressed tarballs and single compressed files. Without
-`--consume`, `trunc x` is an ordinary extractor and leaves the archive alone. If a consume is
-interrupted, continue it with:
+Then extract, giving the archive's space back as you go:
 
 ```sh
-trunc resume data.trnc
+trunc x dataset.zip -C dataset --consume       # a ZIP
+trunc x big.tar.zst -C ./out --consume         # a compressed tarball
+trunc x disk.img.xz --consume                  # a single compressed file: leaves disk.img
+trunc x disc.iso -C ./disc --consume           # an ISO image
+trunc x big.tar.zst.001 -C ./out --consume     # a split archive: each part goes once it is done
+trunc resume dataset.zip                       # continue after a crash, a kill or a full disk
 ```
 
-<details>
-<summary><b>More commands</b></summary>
+Other things it does:
 
 ```sh
-trunc create data.trnc ./data --codec lz4 --block-size 4M   # faster, larger archive
-trunc inspect data.trnc --entries --blocks                  # what's inside
-trunc verify data.trnc                                      # check every hash, write nothing
-trunc x data.trnc -C ./out --consume --verify-media         # re-read files from disk before deleting
-trunc x big.tar.zst -C ./out --consume                      # free a compressed tarball as it unpacks
 trunc x image.tar -C ./rootfs                               # a docker save image's root filesystem
+trunc inspect big.zip --entries                             # what's inside
+trunc verify big.tar.zst                                    # check every checksum, write nothing
+trunc x big.zip -C ./out --consume --verify-media           # re-read files from disk before deleting
 
+trunc create data.trnc ./data                               # pack a folder as .trnc
+trunc create data.trnc ./data --codec lz4 --block-size 4M   # faster, larger archive
 trunc key gen me.key                                        # sign archives
 trunc create data.trnc ./data --sign me.key
 trunc x data.trnc -C ./out --require-signed --trust-key <public key>
@@ -145,19 +149,18 @@ trunc x data.trnc -C ./out --require-signed --trust-key <public key>
 Run `trunc <command> --help` for every flag, or see the
 [commands and options](docs/guide.md#commands-and-options) in the user guide.
 
-</details>
-
 ## Supported formats
 
 | Format | Extract | `--consume` | Space comes back |
 |---|---|---|---|
-| `.trnc` | yes | yes | from the end, after each batch of blocks |
 | ZIP (Stored, Deflate, Zip64) | yes | yes | from the end, after each group of entries, and every 64 MiB inside entries of 256 MiB or more |
 | `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` | yes | yes | from the front, every 64 MiB of output, or after each block or frame decoded in parallel |
 | Single files: `.gz`, `.bz2`, `.xz`, `.zst` | yes | yes | the same as tarballs |
+| ISO 9660 images (`.iso`) | yes | yes | as for ZIP |
 | Compressed tarballs and files split into `.001` or `.aa` parts | yes | yes | as above, and each part is deleted once its data is safe |
-| ZIP and `.trnc` split into parts | yes | not yet | — |
+| ZIP, ISO and `.trnc` split into parts | yes | not yet | — |
 | Container images (`docker save`, OCI archives) | yes | no | — |
+| `.trnc` | yes | yes | from the end, after each batch of blocks |
 
 Every format that can be consumed resumes after a crash with `trunc resume`. The
 [user guide](docs/guide.md#supported-formats) has the details for each format.
@@ -189,12 +192,12 @@ The archive's length is the progress marker. After a crash, `trunc resume` looks
 archive is, works out which blocks are gone, and continues with the next one. There is no
 separate state file to lose.
 
-ZIP files and compressed tarballs weren't designed to be taken apart like this, so trunc does
+ZIP files, ISO images and compressed tarballs weren't designed to be taken apart like this, so trunc does
 more work for them. It checks the whole archive before deleting anything, records its progress in
 a small journal next to the archive, and uses its own resumable decoders so that it can free
 space every 64 MiB inside large files. The user guide explains how this
-works for [ZIP files](docs/guide.md#zip-files), [compressed tarballs](docs/guide.md#compressed-tarballs-and-files)
-and [split archives](docs/guide.md#split-archives).
+works for [ZIP files](docs/guide.md#zip-files), [compressed tarballs](docs/guide.md#compressed-tarballs-and-files),
+[ISO images](docs/guide.md#iso-images) and [split archives](docs/guide.md#split-archives).
 
 ## Safety
 
@@ -228,14 +231,43 @@ and [what it doesn't](docs/guide.md#what-it-does-not-promise).
 - **The drive is FAT32 or exFAT.** These filesystems can lose their own records in a crash.
   trunc refuses unless you pass `--allow-unjournaled`.
 
-## Performance
+## FAQ
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/chart-dark.png">
-    <img alt="Free disk space needed: trunc --consume 4.32 GiB, any extractor 10.00 GiB" src="docs/assets/chart-light.png" width="100%">
-  </picture>
-</p>
+### How much free space do I need?
+
+Run `trunc plan <archive> -C <destination>`. It prints the free space a normal extraction and a
+consume need, from the archive's own sizes and your filesystem, and errs on the high side.
+
+### Can I keep the archive?
+
+Yes: leave off `--consume`, and `trunc x` is an ordinary extractor. With `--consume`, the archive
+is gone at the end, and other tools can no longer open a ZIP, ISO or compressed tarball once the
+first step has run. trunc says so before it starts.
+
+### What happens if my computer crashes halfway?
+
+Run `trunc resume <archive>`, or the same command again. The files it had finished were flushed to
+disk before their part of the archive was deleted, and everything else is still in the archive.
+
+### What if the disk fills up anyway?
+
+trunc reserves space for each batch of files before it writes them. If the reservation fails,
+it stops cleanly with exit code 75, leaving a valid, shorter archive. Free some space and run
+`trunc resume`.
+
+### Why not delete each file from the archive once it's extracted?
+
+That frees nothing until a whole file is done, and does nothing for an archive that holds one
+huge file. A `.trnc` archive is made of 8 MiB blocks by default, and trunc frees space after each
+batch of blocks, including from the middle of a single large file.
+
+### Why can't I consume a container image?
+
+A later layer can delete or replace anything an earlier layer added, so no layer can be freed
+until every layer after it has been applied. Consuming would save no space, so trunc extracts the
+image's root filesystem and leaves the archive for you to delete.
+
+## Performance
 
 A 10 GiB folder was packed with `trunc create --codec lz4` into a 5.81 GiB archive, then
 extracted twice on the same NTFS volume: once normally and once with `--consume`. Peak use is the
@@ -264,9 +296,10 @@ than underestimate.
 
 Compressed tarballs are decompressed twice: once to check everything, and once to write. Parts of
 a file that need nothing from the parts before them decode on all cores, in both passes: bzip2
-blocks, the blocks of an xz file made with `xz -T0`, and zstd frames that declare their size, as
-`pzstd` writes them. A 437 MiB `.tar.xz` from `xz -T0` verifies in 0.65 s instead of 4.1 s. gzip
-files, and xz and zstd files written as one block or frame, decode on one core. The user guide
+blocks, the blocks of an xz file made with `xz -T0`, zstd frames that declare their size, as
+`pzstd` writes them, and BGZF gzip files from `bgzip`. A 437 MiB `.tar.xz` from `xz -T0` verifies
+in 0.65 s instead of 4.1 s. Other gzip files, and xz and zstd files written as one block or frame,
+decode on one core. The user guide
 explains [what this means for space and memory](docs/guide.md#parallel-decoding).
 
 To see where a run spends its time, add `--profile run.json` to any command. It prints a summary
@@ -275,9 +308,9 @@ and writes a trace for <https://ui.perfetto.dev>; the user guide explains
 
 ## Documentation
 
-- [User guide](docs/guide.md): commands and options, supported formats, what `--consume`
-  promises, ZIP files, compressed tarballs, split archives, container images, parallel decoding,
-  profiling and exit codes
+- [User guide](docs/guide.md): what `--consume` does and promises, supported formats, ZIP files,
+  compressed tarballs, ISO images, split archives, container images, parallel decoding,
+  profiling, and the full list of commands, options and exit codes
 - [Security checklist](docs/security.md): how hostile archives are handled, known gaps, and how to
   verify downloads
 - [Format spec](docs/spec/trnc-format-v1.md): the `.trnc` v1 file format
@@ -295,43 +328,6 @@ builds are static and run on any distribution.
 FAT32 and exFAT drives work with `--allow-unjournaled`. On filesystems that can't free space inside
 a file, compressed tarballs still consume safely but give their space back only at the end, and a
 large ZIP entry only once it is finished. macOS is untested.
-
-## FAQ
-
-<details>
-<summary><b>What happens if my computer crashes halfway?</b></summary>
-
-Run `trunc resume <archive>`, or the same command again. The files it had finished were flushed to
-disk before their part of the archive was deleted, and everything else is still in the archive.
-
-</details>
-
-<details>
-<summary><b>What if the disk fills up anyway?</b></summary>
-
-trunc reserves space for each batch of files before it writes them. If the reservation fails,
-it stops cleanly with exit code 75, leaving a valid, shorter archive. Free some space and run
-`trunc resume`.
-
-</details>
-
-<details>
-<summary><b>Why not delete each file from the archive once it's extracted?</b></summary>
-
-That frees nothing until a whole file is done, and does nothing for an archive that holds one
-huge file. A `.trnc` archive is made of 8 MiB blocks by default, and trunc frees space after each
-batch of blocks, including from the middle of a single large file.
-
-</details>
-
-<details>
-<summary><b>Why can't I consume a container image?</b></summary>
-
-A later layer can delete or replace anything an earlier layer added, so no layer can be freed
-until every layer after it has been applied. Consuming would save no space, so trunc extracts the
-image's root filesystem and leaves the archive for you to delete.
-
-</details>
 
 ## Contributing
 
