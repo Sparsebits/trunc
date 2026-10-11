@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img alt="trunc" src="docs/assets/logo-light.svg" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
+    <img alt="trunc: extract huge archives without the free space" src="docs/assets/banner-light.png" width="100%">
   </picture>
 </p>
 

@@ -1,0 +1,133 @@
+<!doctype html>
+<!--
+  Source for the README banner. Rendered to docs/assets/banner-{dark,light}.png by render.ps1.
+  Palette and type: the block logo (docs/assets/logo-*.svg), Space Grotesk headline, IBM Plex
+  Mono captions, vermilion #ff5b35 accent. Open with ?theme=light for the light variant.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=block" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080808; --ink: #f3f1ee; --muted: #7d7b78; --faint: #4a4a4a;
+    --line: #161616; --accent: #ff5b35; --accent-text: #ff7959;
+  }
+  :root.light {
+    --bg: #faf9f7; --ink: #121212; --muted: #8a8784; --faint: #b9b5af;
+    --line: #ece9e4; --accent: #ff5b35; --accent-text: #c93a17;
+  }
+  html, body { margin: 0; padding: 0; }
+  body {
+    width: 1280px; height: 400px; overflow: hidden; position: relative;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 40px 40px;
+    background-position: -1px -1px;
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .frame { position: absolute; inset: 18px; border: 1px solid var(--line); }
+
+  .left { position: absolute; left: 60px; top: 50px; }
+  .brand { display: flex; align-items: center; gap: 22px; }
+  .brand svg { height: 50px; width: auto; display: block; color: var(--ink); }
+  .tag {
+    padding: 6px 10px; border: 1px solid var(--faint);
+    font: 500 14px/1 'IBM Plex Mono', monospace; letter-spacing: 1.6px; color: var(--muted);
+  }
+  h1 {
+    margin: 38px 0 0; font-weight: 600; font-size: 70px; line-height: 1.02;
+    letter-spacing: -2.8px; color: var(--ink);
+  }
+  h1 .dim { color: var(--muted); }
+  h1 .dot { color: var(--accent); }
+  .meta {
+    margin-top: 34px; display: flex; gap: 34px;
+    font: 500 20px/1 'IBM Plex Mono', monospace; letter-spacing: 0.2px;
+  }
+  .meta .cmd { color: var(--muted); }
+  .meta .cmd b { color: var(--ink); font-weight: 500; }
+  .meta .url { color: var(--ink); letter-spacing: 1.2px; }
+  .meta .url span { color: var(--accent); }
+
+  /* The archive being consumed: solid blocks are still in the archive, dashed ones are space
+     already handed back to the disk; the cut marks where truncation has reached. Below, the
+     files appear as their blocks are released. */
+  .viz { position: absolute; right: 64px; top: 76px; width: 306px; height: 264px; }
+  .row { position: absolute; left: 0; display: flex; gap: 10px; transform: skewY(-9deg); }
+  .row.archive { top: 36px; }
+  .row.output { top: 164px; }
+  .blk { width: 68px; height: 60px; box-sizing: border-box; }
+  .solid { background: var(--accent); }
+  .ghost { border: 2px dashed var(--accent); opacity: 0.55; }
+  .out { background: var(--ink); opacity: 0.92; }
+  .pending { border: 1.5px solid var(--faint); }
+  .label {
+    position: absolute; font: 500 14px/1 'IBM Plex Mono', monospace; letter-spacing: 1.8px;
+    color: var(--muted); text-transform: uppercase;
+  }
+  .label.a { left: 0; top: -4px; }
+  .label.o { left: 0; top: 130px; }
+  .cut {
+    position: absolute; left: 152px; top: 4px; width: 3px; height: 256px; background: var(--accent);
+    transform: skewX(-9deg);
+  }
+  .cut::after {
+    content: 'EOF'; position: absolute; top: -26px; left: -44px;
+    font: 500 14px/1 'IBM Plex Mono', monospace; letter-spacing: 1.8px; color: var(--accent-text);
+  }
+</style>
+</head>
+<body>
+  <div class="frame"></div>
+  <div class="left">
+    <div class="brand">
+      <svg viewBox="0 0 362 72" aria-label="trunc">
+        <g fill="#ff5b35">
+          <rect x="0" y="12" width="92" height="24"/>
+          <rect x="0" y="48" width="20" height="24"/>
+          <rect x="24" y="48" width="20" height="24"/>
+          <rect x="48" y="48" width="20" height="24"/>
+          <rect x="72" y="48" width="20" height="24"/>
+        </g>
+        <g fill="currentColor" transform="translate(124 0)">
+          <rect x="10" y="4" width="14" height="68"/><rect x="0" y="24" width="34" height="14"/>
+          <rect x="44" y="24" width="14" height="48"/><rect x="44" y="24" width="36" height="14"/>
+          <rect x="90" y="24" width="14" height="48"/><rect x="120" y="24" width="14" height="48"/><rect x="90" y="58" width="44" height="14"/>
+          <rect x="144" y="24" width="14" height="48"/><rect x="174" y="24" width="14" height="48"/><rect x="144" y="24" width="44" height="14"/>
+          <rect x="198" y="24" width="14" height="48"/><rect x="198" y="24" width="40" height="14"/><rect x="198" y="58" width="40" height="14"/>
+        </g>
+      </svg>
+      <div class="tag">BY SPARSEBITS</div>
+    </div>
+    <h1>Extract huge archives<br><span class="dim">without the free space</span><span class="dot">.</span></h1>
+    <div class="meta">
+      <div class="cmd">$ <b>trunc x</b> big.zip <b>--consume</b></div>
+      <div class="url">GITHUB.COM/SPARSEBITS/TRUNC <span>↗</span></div>
+    </div>
+  </div>
+
+  <div class="viz">
+    <div class="label a">archive</div>
+    <div class="row archive">
+      <div class="blk solid"></div><div class="blk solid"></div>
+      <div class="blk ghost"></div><div class="blk ghost"></div>
+    </div>
+    <div class="label o">output</div>
+    <div class="row output">
+      <div class="blk pending"></div><div class="blk pending"></div>
+      <div class="blk out"></div><div class="blk out"></div>
+    </div>
+    <div class="cut"></div>
+  </div>
+  <script>
+    if (new URLSearchParams(location.search).get('theme') === 'light') {
+      document.documentElement.classList.add('light');
+    }
+  </script>
+</body>
+</html>
