@@ -248,6 +248,12 @@ pub(crate) fn lock(f: &File, exclusive: bool) -> io::Result<bool> {
     }
 }
 
+/// Release a lock taken with `lock`. Failure leaves nothing to do: the lock ends with the
+/// open file description anyway.
+pub(crate) fn unlock(f: &File) {
+    let _ = rustix::fs::flock(f, FlockOperation::Unlock);
+}
+
 /// Ask the kernel to drop cached pages of `[off, off + len)` so the next read comes from the
 /// device. Only clean (already flushed) pages are dropped.
 pub(crate) fn drop_cache(f: &File, off: u64, len: u64) -> io::Result<()> {

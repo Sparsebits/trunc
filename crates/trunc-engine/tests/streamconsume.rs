@@ -493,7 +493,10 @@ fn verify_and_extract_without_consuming() {
         streamconsume::extract_stream(&fs, &arc, &out, false, &StreamOptions::default()).is_err(),
         "refuses to overwrite"
     );
-    streamconsume::extract_stream(&fs, &arc, &out, true, &StreamOptions::default()).unwrap();
+    if let Err(e) = streamconsume::extract_stream(&fs, &arc, &out, true, &StreamOptions::default())
+    {
+        panic!("--overwrite re-extraction failed: {e}");
+    }
     assert_eq!(
         std::fs::read(&arc).unwrap(),
         bytes,

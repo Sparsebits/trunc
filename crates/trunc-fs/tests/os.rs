@@ -399,6 +399,62 @@ fn exclusive_open_stops_a_second_exclusive_open() {
     drop((r1, r2));
 }
 
+/// The `flock` behind `Share::Exclusive` belongs to the open file description, which a child
+/// process shares from fork until exec closes its copies of the descriptors. A handle dropped
+/// while another thread is starting a process must still release the lock at once: otherwise
+/// the next exclusive open of the file fails as busy until the child gets to exec (seen as a
+/// rare failure of an `--overwrite` re-extraction while other tests spawned `tar`).
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(unsafe_code)] // `pre_exec`, to hold the child between fork and exec
+fn exclusive_lock_ends_with_the_handle_while_a_child_is_starting() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    /// Whether this process has a child right now.
+    fn has_child() -> bool {
+        std::fs::read_dir("/proc/self/task").is_ok_and(|tasks| {
+            tasks.flatten().any(|t| {
+                std::fs::read_to_string(t.path().join("children"))
+                    .is_ok_and(|c| !c.trim().is_empty())
+            })
+        })
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("x");
+    write_file(&p, b"x");
+    let held = fs()
+        .open(&p, OpenMode::ReadWrite, Share::Exclusive)
+        .unwrap();
+    let starter = std::thread::spawn(|| {
+        let mut cmd = std::process::Command::new("true");
+        // SAFETY: the closure runs in the forked child and only sleeps (nanosleep), which is
+        // async-signal-safe; it neither allocates nor takes locks.
+        unsafe {
+            cmd.pre_exec(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            });
+        }
+        cmd.status()
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !has_child() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(has_child(), "the child was forked");
+    drop(held);
+    let again = fs().open(&p, OpenMode::ReadWrite, Share::Exclusive);
+    assert!(
+        again.is_ok(),
+        "the lock went with the handle: {:?}",
+        again.err()
+    );
+    drop(again);
+    assert!(starter.join().unwrap().unwrap().success());
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinks_are_never_followed() {

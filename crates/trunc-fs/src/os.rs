@@ -27,6 +27,9 @@ impl OsFs {
     pub fn open_file(&self, path: &Path, mode: OpenMode, share: Share) -> Result<File> {
         let _prof = trunc_prof::span("fs.open");
         let file = self.open_unchecked(path, mode, share)?;
+        // With `Share::Exclusive` on Linux the caller owns the lock with the file. Closing the
+        // file alone may not release it while a child process is being started (see
+        // [`OsFile`]'s `Drop`); no caller asks for that here.
         check_opened(&file, path, mode, share)?;
         Ok(file)
     }
@@ -61,6 +64,23 @@ struct OsFile {
     /// Lazily opened cache-bypassing handle for `read_back`.
     #[cfg(any(windows, target_os = "linux"))]
     uncached: std::sync::Mutex<Uncached>,
+    /// Holds the `flock` standing in for `Share::Exclusive`, released explicitly when dropped.
+    #[cfg(target_os = "linux")]
+    locked: bool,
+}
+
+/// Unlock before closing. The lock belongs to the open file description, and closing this
+/// descriptor releases it only if it is the last reference. A process being started on another
+/// thread holds a copy of every descriptor from fork until exec (`O_CLOEXEC` takes effect only
+/// at exec), and keeps the lock for that long: the next exclusive open of the file, by this
+/// process, would fail as busy. `LOCK_UN` releases it whatever else refers to the description.
+#[cfg(target_os = "linux")]
+impl Drop for OsFile {
+    fn drop(&mut self) {
+        if self.locked {
+            crate::linux::unlock(&self.file);
+        }
+    }
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -132,7 +152,9 @@ fn finish_open(
     mode: OpenMode,
     share: Share,
 ) -> Result<Box<dyn FileHandle>> {
-    check_opened(&file, path, mode, share)?;
+    let locked = check_opened(&file, path, mode, share)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = locked;
     Ok(Box::new(OsFile {
         file,
         path: path.to_path_buf(),
@@ -140,10 +162,13 @@ fn finish_open(
         sparse: std::sync::atomic::AtomicBool::new(false),
         #[cfg(any(windows, target_os = "linux"))]
         uncached: std::sync::Mutex::new(Uncached::Untried),
+        #[cfg(target_os = "linux")]
+        locked,
     }))
 }
 
-fn check_opened(file: &File, path: &Path, mode: OpenMode, share: Share) -> Result<()> {
+/// Returns whether the open took the advisory lock (Linux, `Share::Exclusive`).
+fn check_opened(file: &File, path: &Path, mode: OpenMode, share: Share) -> Result<bool> {
     let md = file.metadata().map_err(err("reading metadata of", path))?;
     #[cfg(windows)]
     {
@@ -171,7 +196,7 @@ fn check_opened(file: &File, path: &Path, mode: OpenMode, share: Share) -> Resul
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (mode, share);
-    Ok(())
+    Ok(cfg!(target_os = "linux") && share == Share::Exclusive)
 }
 
 /// Errors from the confined Linux calls: EXDEV means the path tried to leave the root.
