@@ -1285,6 +1285,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                     mode: None,
                     mtime_unix: 0,
                     mtime_nanos: 0,
+                    sparse: None,
                 },
             },
         })
@@ -1477,6 +1478,7 @@ pub fn extract_image(
                     path: e.name.clone(),
                     kind,
                     size: e.size,
+                    len: e.size,
                     mode: e.mode,
                     mtime_unix: e.mtime_unix,
                     mtime_nanos: e.mtime_nanos,
@@ -1600,6 +1602,7 @@ mod tests {
             mode: None,
             mtime_unix: 0,
             mtime_nanos: 0,
+            sparse: None,
         }
     }
 

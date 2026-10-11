@@ -1,13 +1,16 @@
 //! Streaming tar reader for extraction: POSIX ustar, GNU (long names and links, base-256
-//! numbers) and PAX extended headers.
+//! numbers, sparse files) and PAX extended headers (including GNU sparse formats 0.0, 0.1 and
+//! 1.0).
 //!
 //! [`Reader`] is fed the decompressed stream in pieces and records each entry with the offset of
 //! its data in that stream, so a second pass can route bytes to files without parsing again.
 //! Names are validated like ZIP names: relative, NFC, no `..`, valid on this computer (see
-//! [`trunc_core::path::validate_host`]), no duplicates and nothing nested under a file. Hard links, GNU sparse files and
-//! multi-volume archives are refused.
+//! [`trunc_core::path::validate_host`]), no duplicates and nothing nested under a file. A hard
+//! link must name an earlier regular file of the same archive, validated the same way. A sparse
+//! file's map must be sorted, non-overlapping, inside the file and cover exactly the bytes
+//! stored. Multi-volume archives are refused.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -22,6 +25,9 @@ pub const MAX_ENTRIES: usize = 10_000_000;
 /// check), and up to 4 KiB each, so without this a small compressed tar of many long names
 /// could need tens of gigabytes.
 pub const MAX_NAME_BYTES: usize = 1 << 30;
+/// Largest number of sparse-map segments accepted in one archive (bounds memory: each costs
+/// 24 bytes, here and in the consume journal).
+pub const MAX_SPARSE_SEGMENTS: usize = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TarError {
@@ -45,34 +51,236 @@ pub enum Kind {
     Symlink,
     /// Character or block device, or FIFO: no data, never created.
     Special,
+    /// Another name for the regular file at this index of the entry list (always earlier).
+    HardLink(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
     pub kind: Kind,
-    /// Bytes of content (0 for everything but files).
+    /// Bytes of content in the stream (0 for everything but files). For a sparse file, only
+    /// its data segments are stored.
     pub size: u64,
     /// Offset of the content in the (decompressed) tar stream.
     pub data_offset: u64,
     pub mode: Option<u32>,
     pub mtime_unix: i64,
     pub mtime_nanos: u32,
+    /// Where a sparse file's stored content goes.
+    pub sparse: Option<Box<SparseMap>>,
+}
+
+impl Entry {
+    /// Length of the file once extracted: a sparse file's real size, else `size`.
+    pub fn file_size(&self) -> u64 {
+        self.sparse.as_ref().map_or(self.size, |s| s.real_size())
+    }
+}
+
+/// A sparse file: its stored content is a series of data segments, each at its own offset in
+/// the file; everything else is a hole (reads as zeros).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseMap {
+    real_size: u64,
+    /// `(offset in the file, length)`: sorted, disjoint, non-empty, not touching.
+    segments: Vec<(u64, u64)>,
+    /// Offset of each segment in the stored content.
+    stored: Vec<u64>,
+}
+
+impl SparseMap {
+    /// Validate a map as an archive gives it: segments sorted and disjoint, inside `real_size`,
+    /// their lengths adding up to the `stored` bytes. Empty segments (GNU tar ends every map
+    /// with one at the real size) are dropped and touching ones merged.
+    pub fn new(
+        real_size: u64,
+        map: &[(u64, u64)],
+        stored: u64,
+    ) -> std::result::Result<Self, String> {
+        let mut segments: Vec<(u64, u64)> = Vec::with_capacity(map.len());
+        let mut starts = Vec::with_capacity(map.len());
+        let (mut end, mut total) = (0u64, 0u64);
+        for &(off, len) in map {
+            let e = off
+                .checked_add(len)
+                .filter(|&e| e <= real_size)
+                .ok_or_else(|| format!("segment at {off} of {len} bytes lies past the end"))?;
+            if off < end {
+                return Err(format!(
+                    "segment at {off} overlaps or precedes the one before"
+                ));
+            }
+            end = e;
+            if len == 0 {
+                continue;
+            }
+            match segments.last_mut() {
+                Some((o, l)) if *o + *l == off => *l += len,
+                _ => {
+                    segments.push((off, len));
+                    starts.push(total);
+                }
+            }
+            total = total.checked_add(len).ok_or("map overflows")?;
+        }
+        if total != stored {
+            return Err(format!(
+                "map covers {total} bytes but the entry stores {stored}"
+            ));
+        }
+        Ok(Self {
+            real_size,
+            segments,
+            stored: starts,
+        })
+    }
+
+    /// Size of the file with its holes.
+    pub fn real_size(&self) -> u64 {
+        self.real_size
+    }
+
+    /// `(offset in the file, length)` of each data segment, in order.
+    pub fn segments(&self) -> &[(u64, u64)] {
+        &self.segments
+    }
+
+    /// Where stored bytes `[at, at + len)` go: `(offset in the file, length)` pieces in order.
+    pub fn pieces(&self, at: u64, len: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let mut k = self.stored.partition_point(|&s| s <= at).saturating_sub(1);
+        let (mut at, mut left) = (at, len);
+        std::iter::from_fn(move || {
+            if left == 0 {
+                return None;
+            }
+            let (off, seg_len) = *self.segments.get(k)?;
+            let within = at - self.stored[k];
+            let n = seg_len.saturating_sub(within).min(left);
+            if n == 0 {
+                return None;
+            }
+            at += n;
+            left -= n;
+            k += 1;
+            Some((off + within, n))
+        })
+    }
+
+    /// Length of the file once the first `at` stored bytes are in place (holes after them not
+    /// yet extended).
+    pub fn file_len_at(&self, at: u64) -> u64 {
+        if at == 0 {
+            return 0;
+        }
+        self.pieces(at - 1, 1).next().map_or(0, |(off, _)| off + 1)
+    }
+
+    /// Where the last data segment ends (the real size may extend past it as a hole).
+    pub fn data_end(&self) -> u64 {
+        self.segments.last().map_or(0, |&(o, l)| o + l)
+    }
+}
+
+/// Sparse-file records of a PAX header (GNU formats 0.0, 0.1 and 1.0).
+#[derive(Debug, Default)]
+struct PaxSparse {
+    major: Option<u64>,
+    minor: Option<u64>,
+    name: Option<String>,
+    real_size: Option<u64>,
+    numblocks: Option<u64>,
+    map: Vec<(u64, u64)>,
+    /// Format 0.0: a `GNU.sparse.offset` waiting for its `GNU.sparse.numbytes`.
+    offset: Option<u64>,
 }
 
 /// Metadata that applies to the next real header.
 #[derive(Debug, Default)]
 struct Pending {
     long_name: Option<Vec<u8>>,
+    long_link: Option<Vec<u8>>,
     pax_path: Option<String>,
+    pax_linkpath: Option<String>,
     pax_size: Option<u64>,
     pax_mtime: Option<(i64, u32)>,
+    sparse: Option<Box<PaxSparse>>,
+}
+
+/// A sparse file entry waiting for the rest of its map: old GNU extension headers, or the
+/// PAX 1.0 map at the start of its data.
+#[derive(Debug)]
+struct Deferred {
+    entry: Entry,
+    real_size: u64,
+    map: Vec<(u64, u64)>,
+    text: MapText,
+}
+
+/// Incremental parser for the PAX 1.0 sparse map: decimal numbers, each ending in a newline;
+/// the segment count, then an offset and a length per segment.
+#[derive(Debug, Default)]
+struct MapText {
+    count: Option<u64>,
+    offset: Option<u64>,
+    cur: Option<u64>,
+    digits: u32,
+}
+
+impl MapText {
+    /// Parse the next block; true once the map is complete (the rest of the block is padding).
+    fn feed(
+        &mut self,
+        block: &[u8],
+        map: &mut Vec<(u64, u64)>,
+        budget: usize,
+    ) -> std::result::Result<bool, String> {
+        for &c in block {
+            match c {
+                b'0'..=b'9' => {
+                    self.digits += 1;
+                    let v = self.cur.unwrap_or(0);
+                    self.cur = Some(
+                        v.checked_mul(10)
+                            .and_then(|v| v.checked_add(u64::from(c - b'0')))
+                            .filter(|_| self.digits <= 20)
+                            .ok_or("number too large")?,
+                    );
+                }
+                b'\n' => {
+                    let v = self.cur.take().ok_or("empty line")?;
+                    self.digits = 0;
+                    match (self.count, self.offset.take()) {
+                        (None, _) => {
+                            if v > budget as u64 {
+                                return Err(format!("{v} segments"));
+                            }
+                            self.count = Some(v);
+                        }
+                        (Some(_), None) => self.offset = Some(v),
+                        (Some(_), Some(off)) => map.push((off, v)),
+                    }
+                    if self.count.is_some_and(|c| map.len() as u64 == c) && self.offset.is_none() {
+                        return Ok(true);
+                    }
+                }
+                _ => return Err(format!("unexpected byte {c:#04x}")),
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum State {
     /// Collecting a 512-byte header.
     Header,
+    /// Collecting old GNU sparse extension headers for the deferred entry, which stores
+    /// `size` bytes after them.
+    SparseExt { size: u64 },
+    /// Collecting the PAX 1.0 sparse map, block by block, at the start of the deferred entry's
+    /// `remaining` bytes.
+    SparseMap { remaining: u64 },
     /// Skipping (or, for metadata, collecting) `remaining` bytes, then `pad` bytes of padding.
     /// `data`: the bytes are a file's content.
     Body {
@@ -101,7 +309,11 @@ pub struct Reader {
     zero_blocks: u32,
     pending: Pending,
     entries: Vec<Entry>,
-    seen: HashSet<String>,
+    /// Entry index by name, as this computer compares names.
+    seen: HashMap<String, usize>,
+    deferred: Option<Box<Deferred>>,
+    /// Sparse-map segments still accepted.
+    sparse_left: usize,
     name_bytes: usize,
 }
 
@@ -120,7 +332,9 @@ impl Reader {
             zero_blocks: 0,
             pending: Pending::default(),
             entries: Vec::new(),
-            seen: HashSet::new(),
+            seen: HashMap::new(),
+            deferred: None,
+            sparse_left: MAX_SPARSE_SEGMENTS,
             name_bytes: 0,
         }
     }
@@ -144,14 +358,18 @@ impl Reader {
     pub fn feed_data(&mut self, mut b: &[u8], on_data: &mut dyn FnMut(&[u8])) -> Result<()> {
         while !b.is_empty() {
             match self.state {
-                State::Header => {
+                State::Header | State::SparseExt { .. } | State::SparseMap { .. } => {
                     let take = (BLOCK_BYTES - self.buf.len()).min(b.len());
                     self.buf.extend_from_slice(&b[..take]);
                     b = &b[take..];
                     self.pos += take as u64;
                     if self.buf.len() == BLOCK_BYTES {
                         let block = std::mem::take(&mut self.buf);
-                        self.header(&block)?;
+                        match self.state {
+                            State::SparseExt { size } => self.sparse_ext(&block, size)?,
+                            State::SparseMap { remaining } => self.sparse_map(&block, remaining)?,
+                            _ => self.header(&block)?,
+                        }
                     }
                 }
                 State::Body {
@@ -215,7 +433,7 @@ impl Reader {
             // Some writers omit the end-of-archive marker; accept a stream that stops between
             // entries, but not one that stops inside a header or an entry.
             State::Header => self.buf.is_empty() && self.pending_is_empty(),
-            State::Body { .. } => false,
+            State::Body { .. } | State::SparseExt { .. } | State::SparseMap { .. } => false,
         };
         if !clean {
             return Err(TarError::Corrupt(
@@ -233,9 +451,12 @@ impl Reader {
     fn pending_is_empty(&self) -> bool {
         let p = &self.pending;
         p.long_name.is_none()
+            && p.long_link.is_none()
             && p.pax_path.is_none()
+            && p.pax_linkpath.is_none()
             && p.pax_size.is_none()
             && p.pax_mtime.is_none()
+            && p.sparse.is_none()
     }
 
     fn header(&mut self, h: &[u8]) -> Result<()> {
@@ -264,19 +485,6 @@ impl Reader {
         let unsupported = |why: String| TarError::Unsupported(at, why);
         let header_size = number(&h[124..136]).ok_or_else(|| corrupt("bad size field"))?;
         let typeflag = h[156];
-        let body = |meta: Option<Meta>, data: bool, size: u64| {
-            if size == 0 {
-                State::Header
-            } else {
-                State::Body {
-                    meta,
-                    data,
-                    remaining: size,
-                    // Not `next_multiple_of`: a hostile size near 2^64 must not overflow.
-                    pad: (BLOCK - size % BLOCK) % BLOCK,
-                }
-            }
-        };
         let meta = match typeflag {
             b'L' => Some(Meta::LongName),
             b'K' => Some(Meta::LongLink),
@@ -298,7 +506,11 @@ impl Reader {
         let pending = std::mem::take(&mut self.pending);
         let size = pending.pax_size.unwrap_or(header_size);
         let ustar = &h[257..263] == b"ustar\0";
-        let raw_name: Vec<u8> = if let Some(p) = pending.pax_path {
+        let sparse = pending.sparse;
+        let raw_name: Vec<u8> = if let Some(n) = sparse.as_ref().and_then(|s| s.name.clone()) {
+            // PAX sparse files keep their real name here; the header holds a made-up one.
+            n.into_bytes()
+        } else if let Some(p) = pending.pax_path {
             p.into_bytes()
         } else if let Some(n) = pending.long_name {
             n
@@ -312,17 +524,20 @@ impl Reader {
             }
         };
         let mut kind = match typeflag {
-            b'0' | 0 | b'7' => Kind::File,
+            b'0' | 0 | b'7' | b'S' => Kind::File,
             b'5' => Kind::Dir,
             b'2' => Kind::Symlink,
             b'3' | b'4' | b'6' => Kind::Special,
             b'1' => {
-                return Err(unsupported(format!(
-                    "hard link {:?}; hard links are not supported yet",
-                    String::from_utf8_lossy(&raw_name)
-                )));
+                let target = if let Some(p) = pending.pax_linkpath {
+                    p.into_bytes()
+                } else if let Some(l) = pending.long_link {
+                    l
+                } else {
+                    cstr(&h[157..257]).to_vec()
+                };
+                Kind::HardLink(self.link_target(&target, at)?)
             }
-            b'S' => return Err(unsupported("GNU sparse file".into())),
             b'M' => return Err(unsupported("multi-volume archive".into())),
             b'V' => {
                 // A volume label carries no file.
@@ -333,8 +548,18 @@ impl Reader {
                 return Err(unsupported(format!("entry type {:?}", char::from(other))));
             }
         };
+        if sparse.is_some() && (kind != Kind::File || typeflag == b'S') {
+            return Err(corrupt(
+                "PAX sparse records on an entry that is not a plain file",
+            ));
+        }
         // Old (V7) archives mark directories with a trailing slash on a regular entry.
-        if kind == Kind::File && raw_name.ends_with(b"/") && size == 0 {
+        if kind == Kind::File
+            && typeflag != b'S'
+            && sparse.is_none()
+            && raw_name.ends_with(b"/")
+            && size == 0
+        {
             kind = Kind::Dir;
         }
         let name = normalize_name(&raw_name, at)?;
@@ -361,8 +586,8 @@ impl Reader {
             self.state = body(None, false, size);
             return Ok(());
         };
-        self.state = body(None, kind == Kind::File, size);
-        if !self.seen.insert(trunc_core::path::host_key(&name)) {
+        let key = trunc_core::path::host_key(&name);
+        if self.seen.contains_key(&key) {
             return Err(TarError::Name {
                 name,
                 reason: DUPLICATE.into(),
@@ -377,7 +602,8 @@ impl Reader {
                 "entry names total more than {MAX_NAME_BYTES} bytes"
             )));
         }
-        self.entries.push(Entry {
+        self.seen.insert(key, self.entries.len());
+        let entry = Entry {
             name,
             kind,
             size: if kind == Kind::File { size } else { 0 },
@@ -385,7 +611,173 @@ impl Reader {
             mode,
             mtime_unix,
             mtime_nanos,
-        });
+            sparse: None,
+        };
+        if typeflag == b'S' {
+            // Old GNU sparse: four map entries here, more in extension headers if flagged.
+            let real_size = number(&h[483..495]).ok_or_else(|| corrupt("bad sparse size"))?;
+            let mut map = Vec::new();
+            gnu_sparse_entries(&h[386..482], &mut map).ok_or_else(|| corrupt("bad sparse map"))?;
+            let d = Deferred {
+                entry,
+                real_size,
+                map,
+                text: MapText::default(),
+            };
+            if h[482] != 0 {
+                self.deferred = Some(Box::new(d));
+                self.state = State::SparseExt { size };
+                return Ok(());
+            }
+            return self.finish_sparse(d, size, at);
+        }
+        if let Some(sp) = sparse {
+            let PaxSparse {
+                major,
+                minor,
+                real_size,
+                numblocks,
+                map,
+                offset,
+                ..
+            } = *sp;
+            if offset.is_some() {
+                return Err(corrupt("GNU.sparse.offset without GNU.sparse.numbytes"));
+            }
+            let real_size = real_size.ok_or_else(|| corrupt("sparse file without a real size"))?;
+            let d = Deferred {
+                entry,
+                real_size,
+                map,
+                text: MapText::default(),
+            };
+            return match (major, minor) {
+                // 0.0 and 0.1: the map was in the PAX header.
+                (None | Some(0), _) => {
+                    if numblocks.is_some_and(|n| n != d.map.len() as u64) {
+                        return Err(corrupt("GNU.sparse.numblocks does not match the map"));
+                    }
+                    self.finish_sparse(d, size, at)
+                }
+                // 1.0: the map is at the start of the data, padded to a block.
+                (Some(1), None | Some(0)) => {
+                    if !d.map.is_empty() || size < BLOCK {
+                        return Err(corrupt("bad PAX 1.0 sparse file"));
+                    }
+                    self.deferred = Some(Box::new(d));
+                    self.state = State::SparseMap { remaining: size };
+                    Ok(())
+                }
+                (Some(a), b) => Err(unsupported(format!(
+                    "GNU sparse format {a}.{}",
+                    b.unwrap_or(0)
+                ))),
+            };
+        }
+        self.state = body(None, kind == Kind::File, size);
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// The entry a hard link names: an earlier regular file (a link to a link leads to its
+    /// file). The name is validated like an entry name.
+    fn link_target(&self, raw: &[u8], at: u64) -> Result<usize> {
+        let refuse = |name: String, reason: &str| TarError::Name {
+            name,
+            reason: format!("hard link target: {reason}"),
+        };
+        let target = match normalize_name(raw, at) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return Err(refuse(
+                    String::from_utf8_lossy(raw).into_owned(),
+                    "the archive root",
+                ));
+            }
+            Err(TarError::Name { name, reason }) => return Err(refuse(name, &reason)),
+            Err(e) => return Err(e),
+        };
+        let Some(&i) = self.seen.get(&trunc_core::path::host_key(&target)) else {
+            return Err(refuse(target, "no earlier entry has this name"));
+        };
+        match self.entries[i].kind {
+            Kind::File => Ok(i),
+            Kind::HardLink(t) => Ok(t),
+            _ => Err(refuse(target, "not a regular file")),
+        }
+    }
+
+    /// An old GNU sparse extension header for the deferred entry.
+    fn sparse_ext(&mut self, block: &[u8], size: u64) -> Result<()> {
+        let at = self.pos - BLOCK;
+        let mut d = self
+            .deferred
+            .take()
+            .expect("an entry waits for its sparse map");
+        gnu_sparse_entries(&block[..504], &mut d.map)
+            .ok_or_else(|| TarError::Corrupt(at, "bad sparse extension header".into()))?;
+        if d.map.len() > self.sparse_left {
+            return Err(TarError::Unsupported(
+                at,
+                format!("more than {MAX_SPARSE_SEGMENTS} sparse segments"),
+            ));
+        }
+        if block[504] != 0 {
+            self.deferred = Some(d);
+            return Ok(());
+        }
+        self.finish_sparse(*d, size, at)
+    }
+
+    /// A block of the PAX 1.0 sparse map of the deferred entry.
+    fn sparse_map(&mut self, block: &[u8], remaining: u64) -> Result<()> {
+        let at = self.pos - BLOCK;
+        let mut d = self
+            .deferred
+            .take()
+            .expect("an entry waits for its sparse map");
+        let remaining = remaining - BLOCK;
+        let Deferred { map, text, .. } = &mut *d;
+        let done = text
+            .feed(block, map, self.sparse_left)
+            .map_err(|why| TarError::Corrupt(at, format!("sparse map: {why}")))?;
+        if done {
+            return self.finish_sparse(*d, remaining, at);
+        }
+        if remaining < BLOCK {
+            return Err(TarError::Corrupt(
+                at,
+                "sparse map runs past the end of its entry".into(),
+            ));
+        }
+        self.deferred = Some(d);
+        self.state = State::SparseMap { remaining };
+        Ok(())
+    }
+
+    /// Validate a sparse entry's map and record the entry; its `size` stored bytes follow.
+    fn finish_sparse(&mut self, d: Deferred, size: u64, at: u64) -> Result<()> {
+        let Deferred {
+            mut entry,
+            real_size,
+            map,
+            ..
+        } = d;
+        if map.len() > self.sparse_left {
+            return Err(TarError::Unsupported(
+                at,
+                format!("more than {MAX_SPARSE_SEGMENTS} sparse segments"),
+            ));
+        }
+        let m = SparseMap::new(real_size, &map, size).map_err(|why| {
+            TarError::Corrupt(at, format!("sparse map of {:?}: {why}", entry.name))
+        })?;
+        self.sparse_left -= map.len();
+        entry.size = size;
+        entry.data_offset = self.pos;
+        entry.sparse = Some(Box::new(m));
+        self.state = body(None, true, size);
+        self.entries.push(entry);
         Ok(())
     }
 
@@ -393,12 +785,14 @@ impl Reader {
         let at = self.pos;
         match m {
             Meta::LongName => self.pending.long_name = Some(cstr(data).to_vec()),
-            Meta::LongLink => {} // link targets are not used: links are never created
+            Meta::LongLink => self.pending.long_link = Some(cstr(data).to_vec()),
             Meta::PaxGlobal => {
                 // Global records (git archive writes a commit id here) apply to all entries;
                 // refuse the ones that would change what is extracted.
                 for (k, _) in pax_records(data, at)? {
-                    if matches!(k.as_str(), "path" | "size") || k.starts_with("GNU.sparse") {
+                    if matches!(k.as_str(), "path" | "size" | "linkpath")
+                        || k.starts_with("GNU.sparse")
+                    {
                         return Err(TarError::Unsupported(
                             at,
                             format!("global PAX record {k:?}"),
@@ -410,14 +804,19 @@ impl Reader {
                 for (k, v) in pax_records(data, at)? {
                     match k.as_str() {
                         "path" => self.pending.pax_path = Some(v),
+                        "linkpath" => self.pending.pax_linkpath = Some(v),
                         "size" => {
                             self.pending.pax_size = Some(v.parse().map_err(|_| {
                                 TarError::Corrupt(at, format!("bad PAX size {v:?}"))
                             })?);
                         }
                         "mtime" => self.pending.pax_mtime = parse_pax_time(&v),
-                        k if k.starts_with("GNU.sparse") => {
-                            return Err(TarError::Unsupported(at, "GNU sparse file".into()));
+                        k if k.starts_with("GNU.sparse.") => {
+                            let budget = self.sparse_left;
+                            let sp = self.pending.sparse.get_or_insert_with(Box::default);
+                            pax_sparse(sp, k, v, budget).map_err(|why| {
+                                TarError::Corrupt(at, format!("PAX record {k:?}: {why}"))
+                            })?;
                         }
                         _ => {}
                     }
@@ -426,6 +825,78 @@ impl Reader {
         }
         Ok(())
     }
+}
+
+/// The state that reads `size` bytes of body (metadata to collect, file content, or bytes to
+/// skip), then the padding to the next block.
+fn body(meta: Option<Meta>, data: bool, size: u64) -> State {
+    if size == 0 {
+        State::Header
+    } else {
+        State::Body {
+            meta,
+            data,
+            remaining: size,
+            // Not `next_multiple_of`: a hostile size near 2^64 must not overflow.
+            pad: (BLOCK - size % BLOCK) % BLOCK,
+        }
+    }
+}
+
+/// Old GNU sparse map entries (24 bytes each: offset and length, as header numbers), up to the
+/// first empty one. `None` if a number is malformed.
+fn gnu_sparse_entries(b: &[u8], map: &mut Vec<(u64, u64)>) -> Option<()> {
+    for e in b.chunks_exact(24) {
+        if e[0] == 0 {
+            break;
+        }
+        map.push((number(&e[..12])?, number(&e[12..])?));
+    }
+    Some(())
+}
+
+/// Apply one `GNU.sparse.*` PAX record.
+fn pax_sparse(
+    sp: &mut PaxSparse,
+    key: &str,
+    v: String,
+    budget: usize,
+) -> std::result::Result<(), String> {
+    let num = |s: &str| s.parse::<u64>().map_err(|_| format!("bad number {s:?}"));
+    let push = |map: &mut Vec<(u64, u64)>, seg| {
+        if map.len() >= budget {
+            return Err(format!("more than {MAX_SPARSE_SEGMENTS} sparse segments"));
+        }
+        map.push(seg);
+        Ok(())
+    };
+    match key {
+        "GNU.sparse.major" => sp.major = Some(num(&v)?),
+        "GNU.sparse.minor" => sp.minor = Some(num(&v)?),
+        "GNU.sparse.name" => sp.name = Some(v),
+        "GNU.sparse.size" | "GNU.sparse.realsize" => sp.real_size = Some(num(&v)?),
+        "GNU.sparse.numblocks" => sp.numblocks = Some(num(&v)?),
+        // Format 0.0 repeats these two, in pairs.
+        "GNU.sparse.offset" => {
+            if sp.offset.replace(num(&v)?).is_some() {
+                return Err("two offsets in a row".into());
+            }
+        }
+        "GNU.sparse.numbytes" => {
+            let off = sp.offset.take().ok_or("a length without an offset")?;
+            push(&mut sp.map, (off, num(&v)?))?;
+        }
+        // Format 0.1: "offset,length,offset,length,...".
+        "GNU.sparse.map" => {
+            let mut it = v.split(',').filter(|s| !s.is_empty());
+            while let Some(off) = it.next() {
+                let len = it.next().ok_or("odd number of values")?;
+                push(&mut sp.map, (num(off)?, num(len)?))?;
+            }
+        }
+        _ => return Err("unknown record".into()),
+    }
+    Ok(())
 }
 
 /// True if `block` (512 bytes) is a tar header with a valid checksum.
@@ -578,7 +1049,9 @@ fn check_nesting(entries: &[Entry]) -> Result<()> {
     Ok(())
 }
 
-/// Serialization of the entry list for the consume journal.
+/// Serialization of the entry list for the consume journal. Hard links and sparse files have
+/// kinds of their own (4 and 5) with extra fields after the common ones, so lists without them
+/// are encoded as before.
 pub fn entries_to_bytes(entries: &[Entry]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&(entries.len() as u64).to_le_bytes());
@@ -589,17 +1062,30 @@ pub fn entries_to_bytes(entries: &[Entry]) -> Vec<u8> {
                 .to_le_bytes(),
         );
         b.extend_from_slice(e.name.as_bytes());
-        b.push(match e.kind {
-            Kind::File => 0,
-            Kind::Dir => 1,
-            Kind::Symlink => 2,
-            Kind::Special => 3,
+        b.push(match (e.kind, &e.sparse) {
+            (Kind::File, None) => 0,
+            (Kind::Dir, _) => 1,
+            (Kind::Symlink, _) => 2,
+            (Kind::Special, _) => 3,
+            (Kind::HardLink(_), _) => 4,
+            (Kind::File, Some(_)) => 5,
         });
         b.extend_from_slice(&e.size.to_le_bytes());
         b.extend_from_slice(&e.data_offset.to_le_bytes());
         b.extend_from_slice(&e.mode.unwrap_or(u32::MAX).to_le_bytes());
         b.extend_from_slice(&e.mtime_unix.to_le_bytes());
         b.extend_from_slice(&e.mtime_nanos.to_le_bytes());
+        if let Kind::HardLink(t) = e.kind {
+            b.extend_from_slice(&(t as u64).to_le_bytes());
+        }
+        if let Some(s) = e.sparse.as_deref().filter(|_| e.kind == Kind::File) {
+            b.extend_from_slice(&s.real_size.to_le_bytes());
+            b.extend_from_slice(&(s.segments.len() as u64).to_le_bytes());
+            for &(off, len) in &s.segments {
+                b.extend_from_slice(&off.to_le_bytes());
+                b.extend_from_slice(&len.to_le_bytes());
+            }
+        }
     }
     b
 }
@@ -610,8 +1096,13 @@ pub fn entries_from_bytes(b: &[u8]) -> Option<(Vec<Entry>, usize)> {
     if n > MAX_ENTRIES {
         return None;
     }
+    let u64_at = |i: usize| {
+        Some(u64::from_le_bytes(
+            b.get(i..i.checked_add(8)?)?.try_into().ok()?,
+        ))
+    };
     let mut p = 8usize;
-    let mut out = Vec::with_capacity(n.min(1 << 16));
+    let mut out: Vec<Entry> = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
         let nl = u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
         p += 4;
@@ -619,20 +1110,43 @@ pub fn entries_from_bytes(b: &[u8]) -> Option<(Vec<Entry>, usize)> {
             .ok()?
             .to_owned();
         p += nl;
-        let kind = match *b.get(p)? {
-            0 => Kind::File,
-            1 => Kind::Dir,
-            2 => Kind::Symlink,
-            3 => Kind::Special,
-            _ => return None,
-        };
+        let code = *b.get(p)?;
         p += 1;
-        let u64_at = |i: usize| Some(u64::from_le_bytes(b.get(i..i + 8)?.try_into().ok()?));
         let (size, data_offset) = (u64_at(p)?, u64_at(p + 8)?);
         let mode = u32::from_le_bytes(b.get(p + 16..p + 20)?.try_into().ok()?);
         let mtime_unix = i64::from_le_bytes(b.get(p + 20..p + 28)?.try_into().ok()?);
         let mtime_nanos = u32::from_le_bytes(b.get(p + 28..p + 32)?.try_into().ok()?);
         p += 32;
+        let mut sparse = None;
+        let kind = match code {
+            0 => Kind::File,
+            1 => Kind::Dir,
+            2 => Kind::Symlink,
+            3 => Kind::Special,
+            4 => {
+                let t = usize::try_from(u64_at(p)?).ok()?;
+                p += 8;
+                // Only to an earlier file, as the reader guarantees.
+                if out.get(t)?.kind != Kind::File {
+                    return None;
+                }
+                Kind::HardLink(t)
+            }
+            5 => {
+                let (real_size, count) = (u64_at(p)?, usize::try_from(u64_at(p + 8)?).ok()?);
+                p += 16;
+                if count > b.len().saturating_sub(p) / 16 {
+                    return None;
+                }
+                let map: Vec<(u64, u64)> = (0..count)
+                    .map(|k| Some((u64_at(p + 16 * k)?, u64_at(p + 16 * k + 8)?)))
+                    .collect::<Option<_>>()?;
+                p += 16 * count;
+                sparse = Some(Box::new(SparseMap::new(real_size, &map, size).ok()?));
+                Kind::File
+            }
+            _ => return None,
+        };
         out.push(Entry {
             name,
             kind,
@@ -641,6 +1155,7 @@ pub fn entries_from_bytes(b: &[u8]) -> Option<(Vec<Entry>, usize)> {
             mode: (mode != u32::MAX).then_some(mode),
             mtime_unix,
             mtime_nanos,
+            sparse,
         });
     }
     Some((out, p))
@@ -698,28 +1213,72 @@ mod tests {
 
     #[test]
     fn entry_list_round_trips() {
-        let e = vec![
+        let plain = |name: &str, kind, size, data_offset| Entry {
+            name: name.into(),
+            kind,
+            size,
+            data_offset,
+            mode: None,
+            mtime_unix: 0,
+            mtime_nanos: 0,
+            sparse: None,
+        };
+        let mut e = vec![
             Entry {
-                name: "a/b.txt".into(),
-                kind: Kind::File,
-                size: 5,
-                data_offset: 1024,
                 mode: Some(0o644),
                 mtime_unix: -3,
                 mtime_nanos: 7,
+                ..plain("a/b.txt", Kind::File, 5, 1024)
             },
-            Entry {
-                name: "a".into(),
-                kind: Kind::Dir,
-                size: 0,
-                data_offset: 512,
-                mode: None,
-                mtime_unix: 0,
-                mtime_nanos: 0,
-            },
+            plain("a", Kind::Dir, 0, 512),
         ];
         let b = entries_to_bytes(&e);
-        assert_eq!(entries_from_bytes(&b), Some((e, b.len())));
+        assert_eq!(entries_from_bytes(&b), Some((e.clone(), b.len())));
         assert_eq!(entries_from_bytes(&b[..b.len() - 1]), None);
+
+        // Hard links and sparse files add fields of their own.
+        e.push(plain("a/link", Kind::HardLink(0), 0, 2048));
+        e.push(Entry {
+            sparse: Some(Box::new(
+                SparseMap::new(1 << 40, &[(4096, 10), (1 << 39, 20)], 30).unwrap(),
+            )),
+            ..plain("a/sparse", Kind::File, 30, 2560)
+        });
+        let b = entries_to_bytes(&e);
+        assert_eq!(entries_from_bytes(&b), Some((e.clone(), b.len())));
+        assert_eq!(entries_from_bytes(&b[..b.len() - 1]), None);
+        // A link may only lead to an earlier file.
+        e[2].kind = Kind::HardLink(1);
+        assert_eq!(entries_from_bytes(&entries_to_bytes(&e)), None);
+    }
+
+    #[test]
+    fn sparse_maps_validate_and_locate() {
+        let m = SparseMap::new(100, &[(10, 5), (15, 5), (40, 0), (50, 10), (100, 0)], 20).unwrap();
+        assert_eq!(
+            m.segments(),
+            &[(10, 10), (50, 10)],
+            "merged, empty ones dropped"
+        );
+        assert_eq!(
+            m.pieces(0, 20).collect::<Vec<_>>(),
+            vec![(10, 10), (50, 10)]
+        );
+        assert_eq!(m.pieces(8, 4).collect::<Vec<_>>(), vec![(18, 2), (50, 2)]);
+        assert_eq!(m.pieces(19, 1).collect::<Vec<_>>(), vec![(59, 1)]);
+        assert_eq!(m.file_len_at(0), 0);
+        assert_eq!(m.file_len_at(10), 20);
+        assert_eq!(m.file_len_at(11), 51);
+        assert_eq!(m.data_end(), 60);
+        // Refused: overlapping, unsorted, past the end, overflowing, not matching the data.
+        for (map, stored) in [
+            (vec![(0, 10), (5, 10)], 20),
+            (vec![(50, 10), (0, 10)], 20),
+            (vec![(95, 10)], 10),
+            (vec![(u64::MAX, 2)], 2),
+            (vec![(0, 10)], 11),
+        ] {
+            assert!(SparseMap::new(100, &map, stored).is_err(), "{map:?}");
+        }
     }
 }

@@ -81,6 +81,9 @@ impl<B: FsBackend> FsBackend for FakeVolume<B> {
     fn rename(&self, a: &Path, b: &Path) -> Result<()> {
         self.inner.rename(a, b)
     }
+    fn hard_link(&self, a: &Path, b: &Path) -> Result<()> {
+        self.inner.hard_link(a, b)
+    }
     fn remove_file(&self, p: &Path) -> Result<()> {
         self.inner.remove_file(p)
     }

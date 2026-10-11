@@ -13,7 +13,7 @@ use trunc_engine::zipconsume::ZipOptions;
 use trunc_engine::{Error, PauseReason};
 use trunc_fs::{FsBackend, FsError, OpenMode, OsFs, Share};
 use trunc_legacy::stream::Codec;
-use trunc_testkit::tarbuild::{self, NameVia, Spec};
+use trunc_testkit::tarbuild::{self, NameVia, SparseFormat, Spec};
 use trunc_testkit::{CrashModel, Fault, FaultFs, Rng, fixtures};
 
 const ARC: &str = "/a.tar.gz";
@@ -58,7 +58,19 @@ fn expected(specs: &[Spec]) -> BTreeMap<String, Option<Vec<u8>>> {
             want.insert(format!("out/{p}"), None);
             parent = p;
         }
-        let v = (s.typeflag != b'5').then(|| s.data.clone());
+        let v = match s.typeflag {
+            b'5' => None,
+            // A hard link holds what its target (through any links) holds.
+            b'1' => {
+                let mut t = s;
+                while t.typeflag == b'1' {
+                    let target = norm(std::str::from_utf8(&t.data).unwrap());
+                    t = specs.iter().find(|x| norm(&x.name) == target).unwrap();
+                }
+                Some(t.content())
+            }
+            _ => Some(s.content()),
+        };
         want.insert(format!("out/{name}"), v);
     }
     want
@@ -116,6 +128,11 @@ fn bound(bytes: &[u8], every: u64) -> u64 {
 }
 
 fn bound_at(arc: &str, bytes: &[u8], every: u64, o: &ConsumeOptions) -> u64 {
+    bound_with(arc, bytes, every, o, true)
+}
+
+/// [`bound_at`] for a destination with or without hard links.
+fn bound_with(arc: &str, bytes: &[u8], every: u64, o: &ConsumeOptions, hard_links: bool) -> u64 {
     let fs = fresh_at(CrashModel::WriteThrough, arc, bytes);
     let h = fs
         .open(Path::new(arc), OpenMode::Read, Share::Shared)
@@ -129,7 +146,7 @@ fn bound_at(arc: &str, bytes: &[u8], every: u64, o: &ConsumeOptions) -> u64 {
         margin_ppm: 0,
         batch_max_u: 1,
     };
-    streamconsume::stream_space(&layout, true, 4096, &[], &p).consume_peak
+    streamconsume::stream_space(&layout, true, 4096, &[], hard_links, &p).consume_peak
 }
 
 #[test]
@@ -187,13 +204,34 @@ fn hostile_and_unsupported_archives_are_refused_untouched() {
         vec![Spec::file("/etc/passwd", b"evil")],
         vec![Spec::file("a.txt", b"1"), Spec::file("a.txt", b"2")],
         vec![Spec::file("a", b"file"), Spec::file("a/b", b"under a file")],
+        // Hard links that leave the destination or name no earlier file.
         vec![
             Spec::file("t.txt", b"target"),
-            Spec {
-                typeflag: b'1',
-                ..Spec::file("hard", b"t.txt")
-            },
+            Spec::hardlink("hard", "../t.txt"),
         ],
+        vec![
+            Spec::file("t.txt", b"target"),
+            Spec::hardlink("hard", "/etc/passwd"),
+        ],
+        vec![
+            Spec::hardlink("hard", "t.txt"),
+            Spec::file("t.txt", b"target"),
+        ],
+        // A sparse map whose segments overlap.
+        vec![{
+            let mut s = Spec::sparse(
+                "s",
+                9000,
+                &[(0, b"aaaa"), (100, b"bbbb")],
+                SparseFormat::Pax10,
+            );
+            s.sparse.as_mut().unwrap().map[1].0 = 2;
+            s
+        }],
+        vec![Spec {
+            typeflag: b'M',
+            ..Spec::file("volume-2", b"")
+        }],
     ];
     for sp in cases {
         let bytes = tarbuild::gzip(&tarbuild::tar(&sp), 6);
@@ -292,8 +330,9 @@ fn refuses_to_resume_into_another_destination() {
     assert_complete(&fs, &expected(&sp));
 }
 
-fn op_total(arc: &str, bytes: &[u8], o: &ConsumeOptions) -> u64 {
+fn op_total(arc: &str, bytes: &[u8], o: &ConsumeOptions, hard_links: bool) -> u64 {
     let fs = fresh_at(CrashModel::WriteThrough, arc, bytes);
+    fs.set_hard_links_supported(hard_links);
     run_at(&fs, arc, o).unwrap();
     fs.op_count()
 }
@@ -318,12 +357,26 @@ fn sweep_at(
     o: &ConsumeOptions,
     torn: bool,
 ) -> u64 {
+    sweep_with(model, arc, bytes, want, o, torn, true)
+}
+
+/// [`sweep_at`] on a filesystem with or without hard links.
+fn sweep_with(
+    model: CrashModel,
+    arc: &str,
+    bytes: &[u8],
+    want: &BTreeMap<String, Option<Vec<u8>>>,
+    o: &ConsumeOptions,
+    torn: bool,
+    hard_links: bool,
+) -> u64 {
     let every = o.zip.checkpoint_every;
-    let total = op_total(arc, bytes, o);
-    let limit = bound_at(arc, bytes, every, o);
+    let total = op_total(arc, bytes, o, hard_links);
+    let limit = bound_with(arc, bytes, every, o, hard_links);
     let base = arc.trim_start_matches('/');
     for k in 1..=total {
         let fs = fresh_at(model, arc, bytes);
+        fs.set_hard_links_supported(hard_links);
         fs.inject(if torn {
             Fault::TornWrite { op: k, keep: 5 }
         } else {
@@ -718,8 +771,8 @@ fn crash_sweep_every_codec() {
     }
 }
 
-/// Multi-block xz, multi-frame zstd and BGZF decode their units on worker threads, with safe
-/// points between units only; consuming them survives a crash anywhere.
+/// Multi-block xz and multi-frame zstd decode their units on worker threads, with safe points
+/// between units only; consuming them survives a crash anywhere.
 #[test]
 fn crash_sweep_independent_units() {
     let mut rng = Rng::new(43);
@@ -737,7 +790,6 @@ fn crash_sweep_independent_units() {
             tarbuild::xz_with(&tar, 1, tarbuild::XzCheck::Crc64, Some(64 << 10)),
         ),
         ("zst", tarbuild::zstd_frames(&tar, 64 << 10, 3)),
-        ("gz", tarbuild::bgzf(&tar, 16 << 10, 6)),
     ];
     for (ext, bytes) in cases {
         let o = opts(48 << 10);
@@ -1063,6 +1115,283 @@ fn split_part_ids_are_reused_by_later_outputs() {
     let parts = put_parts(&fs, "/r.tar.zst", &bytes, 40_000);
     run_at(&fs, &parts[0], &opts(16 << 10)).unwrap();
     assert_complete(&fs, &expected(&sp));
+}
+
+/// Hard links (across directories, to the top level, to another link, with a long target, to
+/// an empty file, to a sparse file) and sparse files in every format: holes at the start, inside
+/// and at the end, a map long enough for old GNU extension headers, and a file that is all hole.
+fn links_and_holes(seed: u64) -> Vec<Spec> {
+    let mut rng = Rng::new(seed);
+    let mut noise = |n| fixtures::noise_bytes(&mut rng, n);
+    let long = format!("deep/{}/target.bin", "long-directory-name-".repeat(6));
+    let gnu: Vec<(u64, Vec<u8>)> = (0..7).map(|i| (i * 40_000, noise(9_000))).collect();
+    let gnu: Vec<(u64, &[u8])> = gnu.iter().map(|(o, d)| (*o, &d[..])).collect();
+    let (p0, p1, p2) = (noise(25_000), noise(3_000), noise(12_000));
+    vec![
+        Spec::file("data/a.bin", &noise(40_000)),
+        Spec::hardlink("data/a-link", "data/a.bin"),
+        Spec::hardlink("top-link", "./data/a.bin"),
+        Spec::hardlink("data/sub/link-to-link", "data/a-link"),
+        Spec::file(&long, &noise(5_000)).via(NameVia::Pax),
+        Spec::hardlink("data/long-link", &long).via(NameVia::GnuLong),
+        Spec::sparse("holes/old-gnu.img", 290_000, &gnu, SparseFormat::OldGnu),
+        Spec::sparse(
+            "holes/pax00.img",
+            400_000,
+            &[(50_000, &p0[..]), (90_000, &p1[..])],
+            SparseFormat::Pax00,
+        ),
+        Spec::sparse(
+            "holes/pax01.img",
+            100_000,
+            &[(0, &p1[..]), (60_000, &p2[..])],
+            SparseFormat::Pax01,
+        ),
+        Spec::sparse(
+            "holes/pax10.img",
+            200_000,
+            &[(4_096, &p2[..]), (200_000 - 3_000, &p1[..])],
+            SparseFormat::Pax10,
+        ),
+        Spec::sparse("holes/hollow.img", 1 << 20, &[], SparseFormat::Pax10),
+        Spec::hardlink("holes/link-to-sparse", "holes/pax00.img"),
+        Spec::file("empty", b""),
+        Spec::hardlink("empty-link", "empty"),
+    ]
+}
+
+/// Bytes the specs store (what the outputs take on disk when links are real and holes free).
+fn stored(specs: &[Spec]) -> u64 {
+    specs
+        .iter()
+        .filter(|s| s.typeflag == b'0')
+        .map(|s| s.data.len() as u64)
+        .sum()
+}
+
+fn file_id(fs: &dyn FsBackend, p: &str) -> trunc_fs::FileId {
+    fs.open(Path::new(p), OpenMode::Read, Share::Shared)
+        .unwrap()
+        .file_id()
+        .unwrap()
+}
+
+#[test]
+fn hard_links_and_sparse_files_with_every_codec() {
+    let sp = links_and_holes(71);
+    let tar = tarbuild::tar(&sp);
+    let want = expected(&sp);
+    for (codec, ext, enc) in codecs() {
+        let o = opts(48 << 10);
+        let arc = format!("/a.tar.{ext}");
+        let bytes = enc(&tar);
+        let fs = fresh_at(CrashModel::LoseUnflushed, &arc, &bytes);
+        let s = run_at(&fs, &arc, &o).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+        assert_eq!(s.files, sp.len(), "{codec:?}");
+        assert_complete(&fs, &want);
+        assert!(
+            fs.peak() <= bound_at(&arc, &bytes, 48 << 10, &o),
+            "{codec:?}"
+        );
+        // Links are the file itself, and holes take no space.
+        assert_eq!(fs.used(), stored(&sp), "{codec:?}");
+        let a = file_id(&fs, "/out/data/a.bin");
+        for l in [
+            "/out/data/a-link",
+            "/out/top-link",
+            "/out/data/sub/link-to-link",
+        ] {
+            assert_eq!(file_id(&fs, l), a, "{codec:?} {l}");
+        }
+    }
+}
+
+#[test]
+fn hard_links_become_copies_where_the_filesystem_has_none() {
+    let sp = links_and_holes(72);
+    let bytes = tarbuild::zstd(&tarbuild::tar(&sp), 3);
+    let want = expected(&sp);
+    let arc = "/a.tar.zst";
+    let mut o = opts(32 << 10);
+    let fs = fresh_at(CrashModel::LoseUnflushed, arc, &bytes);
+    fs.set_hard_links_supported(false);
+    run_at(&fs, arc, &o).unwrap();
+    assert_complete(&fs, &want);
+    assert!(fs.peak() <= bound_with(arc, &bytes, 32 << 10, &o, false));
+    // Each copy takes what its file stores (a sparse file's copy keeps the holes).
+    let copies = (40_000 * 3) + 5_000 + 28_000;
+    assert_eq!(fs.used(), stored(&sp) + copies);
+    assert_ne!(
+        file_id(&fs, "/out/data/a.bin"),
+        file_id(&fs, "/out/top-link")
+    );
+
+    // A full disk while copying pauses, and resuming finishes.
+    let needed = fs.peak();
+    o.skip_space_check = true;
+    let fs = fresh_at(CrashModel::LoseUnflushed, arc, &bytes);
+    fs.set_hard_links_supported(false);
+    fs.set_capacity(Some(needed - 1));
+    match run_at(&fs, arc, &o) {
+        Err(Error::Paused(PauseReason::NoSpace { .. })) => {}
+        other => panic!("expected pause, got {other:?}"),
+    }
+    fs.set_capacity(None);
+    assert!(run_at(&fs, arc, &o).unwrap().resumed);
+    assert_complete(&fs, &want);
+}
+
+#[test]
+fn crash_sweep_hard_links_and_sparse_files() {
+    let mut rng = Rng::new(73);
+    let mut noise = |n| fixtures::noise_bytes(&mut rng, n);
+    let (g0, g1, g2, p0) = (noise(30_000), noise(20_000), noise(2_000), noise(40_000));
+    let sp = vec![
+        Spec::file("a/one.bin", &noise(60_000)),
+        Spec::hardlink("a/one-link", "a/one.bin"),
+        Spec::hardlink("top", "a/one.bin"),
+        Spec::sparse(
+            "s/gnu.img",
+            200_000,
+            &[
+                (10_000, &g0[..]),
+                (120_000, &g1[..]),
+                (190_000, &g2[..]),
+                (195_000, &g2[..1000]),
+                (197_000, &g2[..500]),
+            ],
+            SparseFormat::OldGnu,
+        ),
+        Spec::sparse(
+            "s/pax.img",
+            150_000,
+            &[(40_000, &p0[..])],
+            SparseFormat::Pax10,
+        ),
+        Spec::sparse("s/hollow", 64_000, &[], SparseFormat::Pax00),
+        Spec::hardlink("s/pax-link", "s/pax.img"),
+        Spec::file("z.txt", b"z"),
+    ];
+    let tar = tarbuild::tar(&sp);
+    let want = expected(&sp);
+    let o = opts(32 << 10);
+    let arc = "/a.tar.gz";
+    let bytes = tarbuild::gzip(&tar, 6);
+    let n = sweep_at(CrashModel::LoseUnflushed, arc, &bytes, &want, &o, false);
+    assert!(n > 60, "{n} crash points");
+    sweep_at(CrashModel::WriteThrough, arc, &bytes, &want, &o, false);
+    sweep_at(
+        CrashModel::RandomSubset { seed: 7 },
+        arc,
+        &bytes,
+        &want,
+        &o,
+        false,
+    );
+    sweep_at(CrashModel::LoseUnflushed, arc, &bytes, &want, &o, true);
+    // Copies instead of links: an interrupted copy is found and redone.
+    for model in [CrashModel::LoseUnflushed, CrashModel::WriteThrough] {
+        sweep_with(model, arc, &bytes, &want, &o, false, false);
+    }
+    sweep_with(
+        CrashModel::LoseUnflushed,
+        arc,
+        &bytes,
+        &want,
+        &o,
+        true,
+        false,
+    );
+
+    // A codec that reads its window back from the staged sparse files when resuming.
+    let arc = "/a.tar.xz";
+    let bytes = tarbuild::xz(&tar, 6);
+    assert!(checkpoints(arc, &bytes, &o) >= 2, "too few checkpoints");
+    sweep_at(CrashModel::LoseUnflushed, arc, &bytes, &want, &o, false);
+    sweep_at(
+        CrashModel::RandomSubset { seed: 8 },
+        arc,
+        &bytes,
+        &want,
+        &o,
+        false,
+    );
+}
+
+#[test]
+fn hard_links_and_sparse_files_on_the_real_filesystem() {
+    let mut rng = Rng::new(74);
+    let (a, b) = (
+        fixtures::noise_bytes(&mut rng, 70_000),
+        fixtures::noise_bytes(&mut rng, 5_000),
+    );
+    let real = 64u64 << 20;
+    let sp = vec![
+        Spec::file("t/a.bin", &a),
+        Spec::hardlink("t/link", "t/a.bin"),
+        Spec::hardlink("top-link", "t/a.bin"),
+        Spec::sparse(
+            "t/disk.img",
+            real,
+            &[(1 << 20, &b[..]), (40 << 20, &b[..])],
+            SparseFormat::Pax10,
+        ),
+        Spec::sparse("t/hollow.img", real, &[], SparseFormat::OldGnu),
+        Spec::hardlink("t/disk-link", "t/disk.img"),
+    ];
+    let bytes = tarbuild::xz(&tarbuild::tar(&sp), 6);
+    let d = tempfile::tempdir().unwrap();
+    let arc = d.path().join("a.tar.xz");
+    std::fs::write(&arc, &bytes).unwrap();
+    let fs = OsFs::new();
+    let check = |out: &Path| {
+        assert_eq!(std::fs::read(out.join("top-link")).unwrap(), a);
+        let id = |p: &str| file_id(&fs, out.join(p).to_str().unwrap());
+        assert_eq!(id("t/a.bin"), id("t/link"));
+        assert_eq!(id("t/a.bin"), id("top-link"));
+        assert_eq!(id("t/disk.img"), id("t/disk-link"));
+        let sparse = fs.probe_volume(out).unwrap().supports_sparse;
+        for name in ["t/disk.img", "t/hollow.img"] {
+            let f = fs
+                .open(&out.join(name), OpenMode::Read, Share::Shared)
+                .unwrap();
+            assert_eq!(f.size().unwrap(), real, "{name}");
+            let allocated: u64 = f
+                .allocated_ranges()
+                .unwrap()
+                .iter()
+                .map(|r| r.end - r.start)
+                .sum();
+            assert!(!sparse || allocated <= 1 << 20, "{name}: {allocated}");
+        }
+        let f = fs
+            .open(&out.join("t/disk.img"), OpenMode::Read, Share::Shared)
+            .unwrap();
+        let mut buf = vec![1u8; b.len()];
+        for off in [1 << 20, 40 << 20] {
+            f.read_exact_at(&mut buf, off).unwrap();
+            assert_eq!(buf, b);
+        }
+        f.read_exact_at(&mut buf, 20 << 20).unwrap();
+        assert!(buf.iter().all(|&c| c == 0), "a hole reads as zeros");
+    };
+
+    let out = d.path().join("x");
+    let so = StreamOptions::default();
+    let s = streamconsume::extract_stream(&fs, &arc, &out, false, &so).unwrap();
+    assert_eq!(s.files, sp.len());
+    check(&out);
+    assert!(
+        streamconsume::extract_stream(&fs, &arc, &out, false, &so).is_err(),
+        "refuses to overwrite"
+    );
+    streamconsume::extract_stream(&fs, &arc, &out, true, &so).unwrap();
+    check(&out);
+
+    let out = d.path().join("c");
+    streamconsume::consume_stream(&fs, &arc, &out, &opts(256 << 10), &mut |_| {}).unwrap();
+    check(&out);
+    assert!(!arc.exists());
 }
 
 /// Names that only clash at the end of a consume (or only on NTFS) are refused before anything

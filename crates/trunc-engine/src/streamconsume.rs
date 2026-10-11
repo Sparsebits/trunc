@@ -25,6 +25,11 @@
 //! A split archive (`name.001`, `name.002`, …) is read as one file. Once a checkpoint passes
 //! the end of a part, the part is deleted; at the end an explicit record in the journal marks
 //! everything as decoded before the remaining parts are deleted.
+//!
+//! A sparse file's stored segments are written at their offsets and the rest is left as holes.
+//! Hard links are made once everything is decoded and durable, from the staged files they name
+//! (a copy where the filesystem has no hard links), and made durable before anything is renamed
+//! into place; a resumed run checks the links and copies an interrupted run made.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -46,9 +51,9 @@ use crate::error::{Error, Result};
 use crate::preflight::{self, Finding, Severity};
 use crate::source::{self, PartRecord, Parts};
 use crate::stage::{
-    Item, ItemKind, StageGuard, all_exist, build_structure, ensure_dir, first_existing,
-    ignore_not_found, join_rel, open_staged_output, parent_of, rename_into_place, top_level_names,
-    truncate_with_retry,
+    Item, ItemKind, StageGuard, all_exist, already_moved, build_structure, check_exact_name,
+    ensure_dir, extend_hollow, first_existing, ignore_not_found, join_rel, open_staged_output,
+    parent_of, rename_into_place, top_level_names, truncate_with_retry,
 };
 use crate::walk::system_time;
 use crate::zipconsume::{finish, journal_err, journal_path, nospace, same_dest, wrong_dest};
@@ -124,7 +129,7 @@ pub struct StreamLayout {
 }
 
 impl StreamLayout {
-    /// Total size of all files.
+    /// Bytes of file content in the stream (a sparse file's data only; hard links add nothing).
     pub fn content_bytes(&self) -> u64 {
         self.entries
             .iter()
@@ -491,9 +496,10 @@ impl History for StagedHistory<'_> {
                 Ok((k, within)) => {
                     let n =
                         usize::try_from((self.map.sizes[k] - within).min(left)).expect("<= buffer");
-                    let p = join_rel(self.root, &self.entries[self.map.idx[k]].name);
+                    let e = &self.entries[self.map.idx[k]];
+                    let p = join_rel(self.root, &e.name);
                     let f = self.fs.open(&p, OpenMode::Read, Share::Shared)?;
-                    f.read_exact_at(&mut buf[done..done + n], within)?;
+                    read_stored(f.as_ref(), e, &mut buf[done..done + n], within, false)?;
                     n
                 }
                 Err(next) => {
@@ -512,6 +518,34 @@ impl History for StagedHistory<'_> {
         }
         Ok(())
     }
+}
+
+/// Read stored content `[at, at + buf.len())` of entry `e` back from its output file (for a
+/// sparse file, from its segments), from the cache or, with `back`, from the device.
+fn read_stored(
+    f: &dyn FileHandle,
+    e: &tar::Entry,
+    buf: &mut [u8],
+    at: u64,
+    back: bool,
+) -> trunc_fs::Result<()> {
+    let read = |buf: &mut [u8], off| {
+        if back {
+            f.read_back(buf, off)
+        } else {
+            f.read_exact_at(buf, off)
+        }
+    };
+    let Some(sp) = &e.sparse else {
+        return read(buf, at);
+    };
+    let mut done = 0usize;
+    for (off, n) in sp.pieces(at, buf.len() as u64) {
+        let n = usize::try_from(n).expect("<= buffer");
+        read(&mut buf[done..done + n], off)?;
+        done += n;
+    }
+    Ok(())
 }
 
 fn tar_err(archive: &Path) -> impl Fn(tar::TarError) -> Error + '_ {
@@ -661,6 +695,7 @@ pub fn scan(
                 mode: None,
                 mtime_unix,
                 mtime_nanos,
+                sparse: None,
             }]
         }
     };
@@ -681,17 +716,20 @@ fn items_of(entries: &[tar::Entry]) -> Vec<Item> {
     entries
         .iter()
         .filter_map(|e| {
-            let kind = match e.kind {
-                Kind::File => ItemKind::File,
-                Kind::Dir => ItemKind::Dir,
-                Kind::Symlink => ItemKind::Symlink,
+            let (kind, mode) = match e.kind {
+                Kind::File => (ItemKind::File, e.mode),
+                Kind::Dir => (ItemKind::Dir, e.mode),
+                Kind::Symlink => (ItemKind::Symlink, e.mode),
+                // The same file as its target (or a copy of it), so the same mode.
+                Kind::HardLink(t) => (ItemKind::HardLink, entries[t].mode),
                 Kind::Special => return None,
             };
             Some(Item {
                 path: e.name.clone(),
                 kind,
                 size: e.size,
-                mode: e.mode,
+                len: e.file_size(),
+                mode,
                 mtime_unix: e.mtime_unix,
                 mtime_nanos: e.mtime_nanos,
             })
@@ -715,11 +753,14 @@ pub struct StreamSpace {
 /// on disk and the archive has been freed only up to the previous checkpoint.
 /// `parts` are the part sizes of a split archive (empty for one file): a part is freed whole
 /// once a checkpoint passes its end, even where nothing can be deallocated.
+/// Sparse files count only their data. Hard links cost nothing where the destination has them
+/// (`hard_links`); elsewhere each is a copy of its file, made once everything is decoded.
 pub fn stream_space(
     layout: &StreamLayout,
     can_dealloc: bool,
     granularity: u64,
     parts: &[u64],
+    hard_links: bool,
     params: &SpaceParams,
 ) -> StreamSpace {
     let gran = granularity.max(1);
@@ -728,8 +769,20 @@ pub fn stream_space(
     let slack: u64 = layout
         .entries
         .iter()
-        .map(|e| params.per_entry_overhead + (e.size.div_ceil(cluster) * cluster - e.size))
+        .map(|e| params.per_entry_overhead + (allocated(e, cluster) - e.size))
         .sum();
+    let copies: u64 = if hard_links {
+        0
+    } else {
+        layout
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                Kind::HardLink(t) => Some(allocated(&layout.entries[t], cluster)),
+                _ => None,
+            })
+            .sum()
+    };
     let map = ContentMap::new(&layout.entries);
     let gaps = layout.gap_log();
     let mut peak = layout.file_len;
@@ -749,6 +802,15 @@ pub fn stream_space(
         peak = peak
             .max(layout.file_len - freed.min(layout.file_len) + map.data_before(end) + gap_bytes);
     }
+    if copies > 0 {
+        // The copies are made after the archive is gone (truncated) but before the gap log is.
+        let gap_bytes = if gaps {
+            map.gaps_before(layout.out_len)
+        } else {
+            0
+        };
+        peak = peak.max(content + gap_bytes + copies);
+    }
     let margin = params.margin_fixed + content / 1_000_000 * params.margin_ppm;
     // At a checkpoint the file being written is allocated up to a whole cluster past its
     // written length, which rounding its final size (in `slack`) does not cover. The gap log is
@@ -761,9 +823,22 @@ pub fn stream_space(
     StreamSpace {
         archive_len: layout.file_len,
         content,
-        extract_extra: content + slack + margin,
+        extract_extra: content + copies + slack + margin,
         consume_peak,
         consume_extra: consume_peak.saturating_sub(layout.file_len),
+    }
+}
+
+/// Disk space a file's data takes in allocation units of `cluster`: for a sparse file, its
+/// segments only.
+fn allocated(e: &tar::Entry, cluster: u64) -> u64 {
+    match &e.sparse {
+        None => e.size.div_ceil(cluster) * cluster,
+        Some(sp) => sp
+            .segments()
+            .iter()
+            .map(|&(off, len)| ((off + len).div_ceil(cluster) - off / cluster) * cluster)
+            .sum(),
     }
 }
 
@@ -1082,8 +1157,21 @@ impl<'a> Router<'a> {
         if created {
             self.new_dirs.insert(parent_of(&p));
         }
-        if !created || at > 0 {
-            h.set_len(at)?;
+        match &self.entries[i].sparse {
+            None => {
+                if !created || at > 0 {
+                    h.set_len(at)?;
+                }
+            }
+            Some(sp) => {
+                let len = sp.file_len_at(at);
+                if !created || len > 0 {
+                    h.set_len(len)?;
+                }
+                // The rest is a hole until written. Deallocating it marks the file sparse where
+                // the filesystem needs that (NTFS), so writes past the end leave holes.
+                h.deallocate(len, sp.real_size())?;
+            }
         }
         Ok(h)
     }
@@ -1125,8 +1213,20 @@ impl<'a> Router<'a> {
             let h = self.current.as_ref().expect("opened above");
             // No reservation first: it would cover exactly what this write allocates anyway, and a
             // full disk fails the write the same way (and pauses).
-            h.write_all_at(&b[..n], at)
-                .map_err(|e| nospace(e, self.need_free))?;
+            match &self.entries[i].sparse {
+                None => h
+                    .write_all_at(&b[..n], at)
+                    .map_err(|e| nospace(e, self.need_free))?,
+                Some(sp) => {
+                    let mut done = 0usize;
+                    for (off, len) in sp.pieces(at, n as u64) {
+                        let len = usize::try_from(len).expect("<= n");
+                        h.write_all_at(&b[done..done + len], off)
+                            .map_err(|e| nospace(e, self.need_free))?;
+                        done += len;
+                    }
+                }
+            }
             trunc_prof::time("hash.blake3", || {
                 self.hasher.update(&b[..n]);
             });
@@ -1140,6 +1240,13 @@ impl<'a> Router<'a> {
             if at + n as u64 == size {
                 let h = self.current.take().expect("opened above");
                 let e = &self.entries[i];
+                if let Some(sp) = e
+                    .sparse
+                    .as_ref()
+                    .filter(|sp| sp.data_end() < sp.real_size())
+                {
+                    h.set_len(sp.real_size())?; // a hole at the end
+                }
                 h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
                 self.pending.push(h);
                 self.next += 1;
@@ -1198,12 +1305,13 @@ impl<'a> Router<'a> {
         let mut h = Blake3Hasher::new();
         let mut buf = vec![0u8; 4 << 20];
         for (i, from, to) in segments {
-            let p = join_rel(self.root(), &self.entries[i].name);
+            let e = &self.entries[i];
+            let p = join_rel(self.root(), &e.name);
             let f = self.fs.open(&p, OpenMode::Read, Share::Shared)?;
             let mut off = from;
             while off < to {
                 let n = usize::try_from((to - off).min(buf.len() as u64)).expect("<= 4 MiB");
-                match f.read_back(&mut buf[..n], off) {
+                match read_stored(f.as_ref(), e, &mut buf[..n], off, true) {
                     Ok(()) => {}
                     Err(e) if crate::stage::is_short_read(&e) => return Ok((hash, false)),
                     Err(e) => return Err(e.into()),
@@ -1214,6 +1322,188 @@ impl<'a> Router<'a> {
         }
         Ok((hash, *h.finalize().as_bytes() == hash))
     }
+}
+
+/// The file content of entry `e` (for a sparse file, its segments) as `(offset, length)`
+/// ranges.
+fn data_ranges(e: &tar::Entry) -> Vec<(u64, u64)> {
+    match &e.sparse {
+        Some(sp) => sp.segments().to_vec(),
+        None => vec![(0, e.size)],
+    }
+}
+
+/// Copy file entry `e` from `src` into the empty `dst`: a sparse file's segments only, the rest
+/// left as holes. Returns the bytes copied.
+fn copy_file(
+    src: &dyn FileHandle,
+    dst: &dyn FileHandle,
+    e: &tar::Entry,
+    need_free: u64,
+) -> Result<u64> {
+    if let Some(sp) = &e.sparse {
+        dst.deallocate(0, sp.real_size())?; // marks the copy sparse where that is needed
+    }
+    let mut buf = vec![0u8; 1 << 20];
+    let mut copied = 0u64;
+    for (start, len) in data_ranges(e) {
+        let mut off = start;
+        while off < start + len {
+            let n = usize::try_from((start + len - off).min(buf.len() as u64)).expect("<= 1 MiB");
+            src.read_exact_at(&mut buf[..n], off)?;
+            dst.write_all_at(&buf[..n], off)
+                .map_err(|x| nospace(x, need_free))?;
+            off += n as u64;
+        }
+        copied += len;
+    }
+    if e.sparse
+        .as_ref()
+        .is_some_and(|sp| sp.data_end() < sp.real_size())
+    {
+        dst.set_len(e.file_size())?;
+    }
+    Ok(copied)
+}
+
+/// Whether `dst` already is a complete copy of file entry `e` as `src` holds it.
+fn same_copy(src: &dyn FileHandle, dst: &dyn FileHandle, e: &tar::Entry) -> Result<bool> {
+    if dst.size()? != e.file_size() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    for (start, len) in data_ranges(e) {
+        let mut off = start;
+        while off < start + len {
+            let n = usize::try_from((start + len - off).min(a.len() as u64)).expect("<= 1 MiB");
+            src.read_exact_at(&mut a[..n], off)?;
+            dst.read_exact_at(&mut b[..n], off)?;
+            if a[..n] != b[..n] {
+                return Ok(false);
+            }
+            off += n as u64;
+        }
+    }
+    Ok(true)
+}
+
+/// Make every hard link of the archive under `target`, once every file is complete: a real link
+/// where the filesystem has them, else a copy, then flush them. Resuming in the staging
+/// directory, what an interrupted run made is checked: a real link is the very file and stays,
+/// a copy stays if complete and is redone otherwise. Returns the bytes copied.
+fn make_links(
+    fs: &dyn FsBackend,
+    target: &Target<'_>,
+    entries: &[tar::Entry],
+    need_free: u64,
+) -> Result<u64> {
+    let _prof = trunc_prof::span("stream.hard_links");
+    let unprotected = |_: &FileId| false;
+    let (root, protected): (&Path, &(dyn Fn(&FileId) -> bool + Sync)) = match target {
+        Target::Stage(g) => (g.root, g.protected),
+        Target::Dest { root, .. } => (root, &unprotected),
+    };
+    let refuse = |p: &Path| {
+        Error::Refused(format!(
+            "{} is the archive (or its journal) under another name; refusing to write to it",
+            p.display()
+        ))
+    };
+    let mut copies: Vec<Box<dyn FileHandle>> = Vec::new();
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut copied = 0u64;
+    for e in entries {
+        let Kind::HardLink(t) = e.kind else {
+            continue;
+        };
+        let te = &entries[t];
+        let (src, dst) = (join_rel(root, &te.name), join_rel(root, &e.name));
+        let s = fs.open_beneath(root, &src, OpenMode::Read, Share::Shared)?;
+        let sid = s.file_id()?;
+        if protected(&sid) {
+            return Err(refuse(&src));
+        }
+        let mtime = system_time(e.mtime_unix, e.mtime_nanos);
+        match (fs.metadata(&dst)?.map(|m| m.kind), target) {
+            (None, _) => {}
+            (Some(NodeKind::File), Target::Stage(_)) => {
+                // Left by an interrupted run. It can be read-only only if modes were applied,
+                // which happens once every link is made and durable.
+                check_exact_name(fs, &dst)?;
+                let (d, writable) =
+                    match fs.open_beneath(root, &dst, OpenMode::ReadWrite, Share::Exclusive) {
+                        Ok(d) => (d, true),
+                        Err(_) => (
+                            fs.open_beneath(root, &dst, OpenMode::Read, Share::Shared)?,
+                            false,
+                        ),
+                    };
+                let did = d.file_id()?;
+                if did == sid {
+                    continue;
+                }
+                if protected(&did) {
+                    return Err(refuse(&dst));
+                }
+                if !same_copy(s.as_ref(), d.as_ref(), te)? {
+                    d.set_len(0)?;
+                    copied += copy_file(s.as_ref(), d.as_ref(), te, need_free)?;
+                    d.set_modified(mtime)?;
+                    copies.push(d);
+                } else if writable {
+                    copies.push(d); // complete, but maybe not yet durable
+                }
+                continue;
+            }
+            (
+                Some(NodeKind::File),
+                Target::Dest {
+                    overwrite: true, ..
+                },
+            ) => fs.remove_file(&dst)?,
+            _ => {
+                return Err(Error::Refused(format!("{} already exists", dst.display())));
+            }
+        }
+        match fs.hard_link_beneath(root, &src, &dst) {
+            Ok(()) => {
+                // Check where the new name leads: a junction on the way, or a source swapped
+                // since it was opened, would show here.
+                let id = fs
+                    .open_beneath(root, &dst, OpenMode::Read, Share::Shared)
+                    .and_then(|d| d.file_id());
+                if !matches!(id, Ok(id) if id == sid) {
+                    let _ = fs.remove_file(&dst);
+                    id?;
+                    return Err(Error::Refused(format!(
+                        "{} does not lead to {} after linking; refusing it",
+                        dst.display(),
+                        src.display()
+                    )));
+                }
+            }
+            Err(FsError::Unsupported { .. }) => {
+                let d = fs.open_beneath(root, &dst, OpenMode::CreateNew, Share::Exclusive)?;
+                if protected(&d.file_id()?) {
+                    return Err(refuse(&dst));
+                }
+                copied += copy_file(s.as_ref(), d.as_ref(), te, need_free)?;
+                d.set_modified(mtime)?;
+                copies.push(d);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        dirs.insert(parent_of(&dst));
+        if copies.len() >= MAX_PENDING {
+            let files: Vec<&dyn FileHandle> = copies.iter().map(AsRef::as_ref).collect();
+            fs.flush_all(&files, &[])?;
+            trunc_fs::close_all(std::mem::take(&mut copies));
+        }
+    }
+    let files: Vec<&dyn FileHandle> = copies.iter().map(AsRef::as_ref).collect();
+    let dirs: Vec<PathBuf> = dirs.into_iter().collect();
+    fs.flush_all(&files, &dirs)?;
+    Ok(copied)
 }
 
 fn media_mismatch() -> Error {
@@ -1445,8 +1735,8 @@ pub fn consume_stream(
     let largest = layout
         .entries
         .iter()
-        .max_by_key(|e| e.size)
-        .map(|e| (e.name.as_str(), e.size));
+        .max_by_key(|e| e.file_size())
+        .map(|e| (e.name.as_str(), e.file_size()));
     let vc = preflight::check_volumes(fs, archive_path, &dest, largest)?;
     for f in vc
         .findings
@@ -1476,7 +1766,14 @@ pub fn consume_stream(
         cluster_size: u64::from(vc.destination.cluster_size.max(1)),
         ..opts.space
     };
-    let space = stream_space(layout, can_dealloc, granularity, &held.sizes(), &params);
+    let space = stream_space(
+        layout,
+        can_dealloc,
+        granularity,
+        &held.sizes(),
+        vc.destination.fs.hard_links(),
+        &params,
+    );
     let need_free = if vc.same_volume {
         space.consume_extra
     } else {
@@ -1545,6 +1842,12 @@ pub fn consume_stream(
         held.free(fs, 0, r.free_below, granularity)?;
     }
 
+    // Outputs must never turn out to be the journal or the archive.
+    let journal_id = journal.file_id().map_err(journal_err)?;
+    let archive_ids = |id: &FileId| match &held {
+        Held::One(h) => h.file_id().is_ok_and(|a| a == *id),
+        Held::Parts(p) => p.ids().contains(id),
+    };
     // Once decoded (a zero-length archive, or the end record of a split one) every byte was
     // made durable before the archive was released.
     if !decoded {
@@ -1577,14 +1880,10 @@ pub fn consume_stream(
             None
         };
         // The journal, the gap log, and whatever is left of the archive.
-        let mut sidecars = vec![journal.file_id().map_err(journal_err)?];
+        let mut sidecars = vec![journal_id];
         if let Some(g) = &gaps {
             sidecars.push(g.h.file_id()?);
         }
-        let archive_ids = |id: &FileId| match &held {
-            Held::One(h) => h.file_id().is_ok_and(|a| a == *id),
-            Held::Parts(p) => p.ids().contains(id),
-        };
         let guard = StageGuard {
             root: &stage,
             protected: &|id| sidecars.contains(id) || archive_ids(id),
@@ -1710,6 +2009,21 @@ pub fn consume_stream(
         p.remove_all(fs)?;
     }
 
+    // Renaming starts only once every link is made and durable: if it began, they were.
+    if items.iter().any(|i| i.kind == ItemKind::HardLink)
+        && !tops.iter().try_fold(false, |moved, t| -> Result<bool> {
+            Ok(moved || already_moved(fs, &dest, &stage, t)?)
+        })?
+    {
+        let protected = |id: &FileId| *id == journal_id || archive_ids(id);
+        let guard = StageGuard {
+            root: &stage,
+            protected: &protected,
+        };
+        summary.bytes_written +=
+            make_links(fs, &Target::Stage(&guard), &layout.entries, need_free)?;
+    }
+
     progress(Progress::Renaming);
     trunc_prof::time("stage.rename", || {
         rename_into_place(fs, &items, &dest, &stage)
@@ -1769,7 +2083,7 @@ pub fn extract_stream(
         }
         summary.dirs += 1;
     }
-    // Empty files carry no data for the router to write.
+    // Empty files (and sparse files that are all hole) carry no data for the router to write.
     for e in layout
         .entries
         .iter()
@@ -1785,6 +2099,9 @@ pub fn extract_stream(
             OpenMode::CreateNew
         };
         let f = fs.open(&p, mode, Share::Exclusive)?;
+        if e.file_size() > 0 {
+            extend_hollow(f.as_ref(), e.file_size())?;
+        }
         f.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
     }
     let open_target = Target::Dest {
@@ -1832,6 +2149,7 @@ pub fn extract_stream(
         }
         Ok(r.written)
     })?;
+    let copied = make_links(fs, &open_target, &layout.entries, 0)?;
     for e in &layout.entries {
         match e.kind {
             Kind::File => {
@@ -1840,12 +2158,18 @@ pub fn extract_stream(
                     fs.set_mode(&join_rel(dest, &e.name), m)?;
                 }
             }
+            Kind::HardLink(t) => {
+                summary.files += 1;
+                if let Some(m) = layout.entries[t].mode {
+                    fs.set_mode(&join_rel(dest, &e.name), m)?;
+                }
+            }
             Kind::Symlink => summary.symlinks_skipped += 1,
             Kind::Special => summary.specials_skipped += 1,
             Kind::Dir => {}
         }
     }
-    summary.bytes_written = written;
+    summary.bytes_written = written + copied;
     Ok(summary)
 }
 
@@ -1877,6 +2201,7 @@ mod tests {
             mode: None,
             mtime_unix: 0,
             mtime_nanos: 0,
+            sparse: None,
         }
     }
 
@@ -2279,7 +2604,7 @@ mod tests {
     fn run_stream_case(seed: u64) {
         let mut rng = Rng::new(seed);
         let c = random_stream_case(&mut rng);
-        let sp = stream_space(&c.layout, c.can_dealloc, c.gran, &c.parts, &c.params);
+        let sp = stream_space(&c.layout, c.can_dealloc, c.gran, &c.parts, true, &c.params);
         assert_eq!(sp.consume_extra, sp.consume_peak - c.layout.file_len);
         let peak = simulate_stream(&c);
         assert!(
@@ -2348,7 +2673,7 @@ mod tests {
         // and metadata for "a" and the gap log.
         let peak = simulate_stream(&c);
         assert_eq!(peak, len + 4096 + 4096 + 200);
-        let sp = stream_space(&c.layout, true, 4096, &[], &params);
+        let sp = stream_space(&c.layout, true, 4096, &[], true, &params);
         assert!(
             peak <= sp.consume_peak,
             "planned {} is short by {}",

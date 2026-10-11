@@ -30,7 +30,7 @@ decoded.
 - **Refuse what cannot be represented safely.** Hard links (they would need copies or links
   created outside the staging protocol), GNU sparse files, multi-volume archives, data after the
   end-of-archive marker, and unknown entry types are refused. Symlinks and device entries are
-  skipped, as for ZIP.
+  skipped, as for ZIP. (Hard links and sparse files are extracted since ADR-0015.)
 
 ## Consequences
 - A `.tar.gz` is decoded twice when consumed, and `plan`, `inspect` and `verify` each decode it

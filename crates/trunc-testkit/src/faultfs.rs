@@ -5,6 +5,10 @@
 //! A crash makes every later call fail with [`FsError::Crashed`] until [`FaultFs::recover`]
 //! applies the crash model and returns the filesystem to service, as a reboot would.
 //!
+//! Files may have several names (hard links). Holes follow NTFS: a file becomes sparse once
+//! anything in it is deallocated; extending a sparse file (with `set_len` or by writing past its
+//! end) leaves a hole, extending any other file allocates zeros, and `preallocate` allocates.
+//!
 //! Durability follows POSIX rules, which are stricter than NTFS:
 //! - file contents and size are durable only after `flush_data` on that file;
 //! - a directory entry (create, rename, remove) is durable only after `flush_dir` on every
@@ -61,13 +65,24 @@ struct Content {
     data: Vec<u8>,
     /// Deallocated ranges: sorted, disjoint, inside `data`.
     holes: Vec<Range<u64>>,
+    /// Marked sparse by a deallocation: growing leaves holes.
+    sparse: bool,
 }
 
 #[derive(Debug, Clone)]
 enum DataOp {
-    Write { off: u64, bytes: Vec<u8> },
+    Write {
+        off: u64,
+        bytes: Vec<u8>,
+    },
+    /// Truncate, or extend with a hole.
     SetLen(u64),
-    Dealloc { range: Range<u64>, granularity: u64 },
+    /// Extend with allocated zeros.
+    Reserve(u64),
+    Dealloc {
+        range: Range<u64>,
+        granularity: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +140,7 @@ struct State {
     next_inode: u64,
     /// A drive that acknowledges flushes without persisting anything.
     flush_lies: bool,
+    hard_links: bool,
 }
 
 /// In-memory, fault-injecting [`FsBackend`]. Cloning shares the same filesystem.
@@ -179,20 +195,31 @@ impl Content {
             DataOp::Write { off, bytes } => {
                 let (s, e) = (*off, *off + bytes.len() as u64);
                 if e as usize > self.data.len() {
+                    self.extend(s);
                     self.data.resize(e as usize, 0);
                 }
                 self.data[s as usize..e as usize].copy_from_slice(bytes);
                 self.cut_holes(s, e);
             }
             DataOp::SetLen(len) => {
-                self.data.resize(*len as usize, 0);
                 let len = *len;
+                if len as usize > self.data.len() {
+                    self.extend(len);
+                    return;
+                }
+                self.data.truncate(len as usize);
                 self.holes.retain(|h| h.start < len);
                 if let Some(h) = self.holes.last_mut() {
                     h.end = h.end.min(len);
                 }
             }
+            DataOp::Reserve(len) => {
+                if *len as usize > self.data.len() {
+                    self.data.resize(*len as usize, 0);
+                }
+            }
             DataOp::Dealloc { range, granularity } => {
+                self.sparse = true;
                 let end = range.end.min(self.data.len() as u64);
                 if range.start >= end {
                     return;
@@ -206,6 +233,22 @@ impl Content {
                     self.holes.sort_by_key(|h| h.start);
                 }
             }
+        }
+    }
+
+    /// Grow to `len` (if longer) with zeros: a hole if the file is sparse, else allocated.
+    fn extend(&mut self, len: u64) {
+        let old = self.data.len() as u64;
+        if len <= old {
+            return;
+        }
+        self.data.resize(len as usize, 0);
+        if !self.sparse {
+            return;
+        }
+        match self.holes.last_mut() {
+            Some(h) if h.end == old => h.end = len,
+            _ => self.holes.push(old..len),
         }
     }
 
@@ -448,6 +491,7 @@ impl FaultFs {
                 free_inodes: Vec::new(),
                 next_inode: 1,
                 flush_lies: false,
+                hard_links: true,
             })),
         }
     }
@@ -495,6 +539,11 @@ impl FaultFs {
     /// Make `deallocate` report `Unsupported` (as on FAT/exFAT).
     pub fn set_dealloc_supported(&self, yes: bool) {
         self.st().dealloc_supported = yes;
+    }
+
+    /// Make `hard_link` report `Unsupported` (as on FAT/exFAT).
+    pub fn set_hard_links_supported(&self, yes: bool) {
+        self.st().hard_links = yes;
     }
 
     /// Reuse file ids like Linux reuses inode numbers: once a file is unlinked and its last
@@ -580,6 +629,7 @@ impl FaultFs {
         let c = Content {
             data: data.to_vec(),
             holes: vec![],
+            sparse: false,
         };
         s.files.insert(
             id,
@@ -745,6 +795,34 @@ impl FsBackend for FaultFs {
         }
         s.begin(Kind::Other, from)?;
         s.tree_change(TreeChange::Rename(a, b));
+        Ok(())
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> Result<()> {
+        let (a, b) = (key(src)?, key(dst)?);
+        let mut s = self.st();
+        s.alive()?;
+        let id = match s.node(&a) {
+            Some(Node::File(id)) => id,
+            Some(Node::Dir) => return Err(other("linking", src, "is a directory")),
+            None => return Err(not_found(src)),
+        };
+        if s.node(&b).is_some() {
+            return Err(FsError::AlreadyExists {
+                path: dst.to_path_buf(),
+            });
+        }
+        if s.node(parent(&b)) != Some(Node::Dir) {
+            return Err(not_found(dst));
+        }
+        if !s.hard_links {
+            return Err(FsError::Unsupported {
+                op: "hard link",
+                path: dst.to_path_buf(),
+            });
+        }
+        s.begin(Kind::Other, dst)?;
+        s.tree_change(TreeChange::Insert(b, Node::File(id)));
         Ok(())
     }
 
@@ -973,7 +1051,7 @@ impl FileHandle for MemHandle {
         let mut s = self.st()?;
         s.begin(Kind::Other, &self.path)?;
         if len > s.files[&self.id].cur.data.len() as u64 {
-            s.data_op(self.id, &self.path, DataOp::SetLen(len))?;
+            s.data_op(self.id, &self.path, DataOp::Reserve(len))?;
         }
         Ok(())
     }

@@ -89,7 +89,14 @@ pub fn extract(
             cluster_size: u64::from(vc.destination.cluster_size.max(1)),
             ..SpaceParams::default()
         };
-        let sp = streamconsume::stream_space(&layout, false, 1, &[], &params);
+        let sp = streamconsume::stream_space(
+            &layout,
+            false,
+            1,
+            &[],
+            vc.destination.fs.hard_links(),
+            &params,
+        );
         if let Some(free) = vc.destination.free_bytes.filter(|f| *f < sp.extract_extra) {
             anyhow::bail!(
                 "not enough free space at {}: extracting needs about {}, {} are free (--ignore-space to try anyway)",
@@ -162,7 +169,11 @@ pub fn inspect(archive: &Path, list: bool, opts: &StreamOptions) -> Result<ExitC
     );
     match l.mode {
         Mode::Tar => {
-            let files = l.entries.iter().filter(|e| e.kind == Kind::File).count();
+            let files = l
+                .entries
+                .iter()
+                .filter(|e| matches!(e.kind, Kind::File | Kind::HardLink(_)))
+                .count();
             println!(
                 "entries    {files} files, {} directories/links",
                 l.entries.len() - files
@@ -178,7 +189,8 @@ pub fn inspect(archive: &Path, list: bool, opts: &StreamOptions) -> Result<ExitC
         println!();
         for e in &l.entries {
             let size = match e.kind {
-                Kind::File => format!("{:>12}", e.size),
+                Kind::File => format!("{:>12}", e.file_size()),
+                Kind::HardLink(_) => format!("{:>12}", "<hard link>"),
                 Kind::Dir => format!("{:>12}", "<dir>"),
                 Kind::Symlink => format!("{:>12}", "<link>"),
                 Kind::Special => format!("{:>12}", "<device>"),
@@ -196,8 +208,8 @@ pub fn plan(archive: &Path, dest: &Path, opts: &StreamOptions) -> Result<ExitCod
     let largest = layout
         .entries
         .iter()
-        .max_by_key(|e| e.size)
-        .map(|e| (e.name.as_str(), e.size));
+        .max_by_key(|e| e.file_size())
+        .map(|e| (e.name.as_str(), e.file_size()));
     let vc = preflight::check_volumes(&fs, archive, dest, largest)?;
     let can_dealloc = vc.archive_volume.supports_sparse && vc.archive_volume.sparse_granularity > 0;
     let params = SpaceParams {
@@ -209,6 +221,7 @@ pub fn plan(archive: &Path, dest: &Path, opts: &StreamOptions) -> Result<ExitCod
         can_dealloc,
         u64::from(vc.archive_volume.sparse_granularity.max(1)),
         &trunc_engine::source::part_sizes(&fs, archive)?,
+        vc.destination.fs.hard_links(),
         &params,
     );
     let consume_needs = if vc.same_volume {

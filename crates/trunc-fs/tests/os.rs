@@ -578,3 +578,103 @@ fn confined_opens_refuse_junctions_on_the_way() {
         .unwrap();
     assert_eq!(f.size().unwrap(), 2);
 }
+
+#[test]
+fn hard_links_name_the_same_file() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let (a, b, c) = (root.join("a"), root.join("sub").join("b"), root.join("c"));
+    write_file(&a, b"shared");
+    fs().hard_link(&a, &b).unwrap();
+    fs().hard_link_beneath(&root, &a, &c).unwrap();
+    let id = |p: &Path| {
+        fs().open(p, OpenMode::Read, Share::Shared)
+            .unwrap()
+            .file_id()
+            .unwrap()
+    };
+    assert_eq!(id(&a), id(&b));
+    assert_eq!(id(&a), id(&c));
+    assert_eq!(std::fs::read(&c).unwrap(), b"shared");
+    assert!(matches!(
+        fs().hard_link(&a, &b),
+        Err(FsError::AlreadyExists { .. })
+    ));
+    // Outside the root, or not a file.
+    assert!(
+        fs().hard_link_beneath(&root, &d.path().join("outside"), &root.join("x"))
+            .is_err()
+    );
+    assert!(
+        fs().hard_link_beneath(&root, &root.join("sub"), &root.join("x"))
+            .is_err()
+    );
+    assert!(!root.join("x").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn confined_hard_links_refuse_junctions_on_the_way() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    write_file(&root.join("f"), b"mine");
+    write_file(&outside.join("victim"), b"keep");
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("j"))
+        .arg(&outside)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "mklink /J needs no privileges");
+    let e = fs()
+        .hard_link_beneath(&root, &root.join("f"), &root.join("j").join("new"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!outside.join("new").exists());
+    let e = fs()
+        .hard_link_beneath(&root, &root.join("j").join("victim"), &root.join("g"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!root.join("g").exists());
+}
+
+/// What sparse-file extraction relies on: deallocating past the end of a new file marks it
+/// sparse where that is needed (NTFS), so writing far past the end and extending leave holes.
+#[test]
+fn writes_past_a_deallocated_end_leave_holes() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("holes");
+    let f = fs()
+        .open(&p, OpenMode::CreateNew, Share::Exclusive)
+        .unwrap();
+    let gib = 1u64 << 30;
+    let supported = matches!(f.deallocate(0, gib).unwrap(), Dealloc::Freed { .. });
+    assert_eq!(
+        f.size().unwrap(),
+        0,
+        "deallocating past the end does not extend"
+    );
+    f.write_all_at(&[7u8; 4096], gib / 2).unwrap();
+    f.set_len(gib).unwrap();
+    assert_eq!(f.size().unwrap(), gib);
+    let mut buf = [1u8; 4096];
+    f.read_exact_at(&mut buf, 1 << 20).unwrap();
+    assert!(buf.iter().all(|&b| b == 0));
+    f.read_exact_at(&mut buf, gib / 2).unwrap();
+    assert!(buf.iter().all(|&b| b == 7));
+    if supported && fs().probe_volume(&p).unwrap().supports_sparse {
+        let allocated: u64 = f
+            .allocated_ranges()
+            .unwrap()
+            .iter()
+            .map(|r| r.end - r.start)
+            .sum();
+        assert!(allocated <= 1 << 20, "{allocated} bytes allocated");
+    }
+}

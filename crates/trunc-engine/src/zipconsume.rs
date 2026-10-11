@@ -171,6 +171,7 @@ fn items_of(layout: &Layout) -> Vec<Item> {
                 Kind::Symlink => ItemKind::Symlink,
             },
             size: if e.kind == Kind::File { e.size } else { 0 },
+            len: if e.kind == Kind::File { e.size } else { 0 },
             mode: e.mode,
             mtime_unix: e.mtime_unix,
             mtime_nanos: 0,
