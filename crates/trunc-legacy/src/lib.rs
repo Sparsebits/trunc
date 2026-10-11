@@ -7,6 +7,8 @@
 //! - [`gzip`] and [`tar`]: gzip member framing and a streaming tar reader, for `.tar.gz`.
 //! - [`iso`]: ISO 9660 images (Rock Ridge, Joliet, multi-extent) as stored ZIP-style entries.
 //! - [`stream`]: one resumable interface over the gzip, bzip2, xz and zstd decoders.
+//! - [`sevenz`]: 7z parsing (header, folders, files) and folder decoding (Copy, LZMA, LZMA2,
+//!   BCJ x86, Delta).
 
 pub mod bzip2;
 pub mod checks;
@@ -15,6 +17,7 @@ pub mod gzip;
 pub mod inflate;
 pub mod iso;
 mod lzma;
+pub mod sevenz;
 pub mod split;
 pub mod stream;
 pub mod tar;

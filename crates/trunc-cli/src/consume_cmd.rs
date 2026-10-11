@@ -129,6 +129,9 @@ pub fn run(
     let fs = OsFs::new();
     let kind = Kind::detect(archive, stream.raw);
     crate::refuse_trust_flags(&trust, kind)?;
+    if kind == Kind::SevenZ {
+        bail!(crate::sevenz_cmd::NO_CONSUME);
+    }
     if stream.raw && !matches!(kind, Kind::Stream(..)) {
         bail!("--raw applies only to compressed tarballs");
     }
@@ -145,7 +148,7 @@ pub fn run(
     }
     let opts = flags.options(*stream, trust, threads);
     let unit = match kind {
-        Kind::Zip => "entries",
+        Kind::Zip | Kind::SevenZ => "entries",
         Kind::Iso => "files",
         Kind::Stream(..) => "checkpoints",
         Kind::Trnc => "blocks",
@@ -185,6 +188,7 @@ pub fn run(
     let result = match kind {
         Kind::Zip => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
         Kind::Iso => isoconsume::consume_iso(&fs, archive, dest, &opts, &mut progress),
+        Kind::SevenZ => unreachable!("refused above"),
         Kind::Stream(..) => streamconsume::consume_stream(&fs, archive, dest, &opts, &mut progress),
         Kind::Trnc => consume::consume(&fs, archive, dest, &opts, &mut progress),
     };

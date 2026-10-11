@@ -19,6 +19,7 @@ mod consume_cmd;
 mod fmt;
 mod image_cmd;
 mod iso_cmd;
+mod sevenz_cmd;
 mod stream_cmd;
 mod zip_cmd;
 use fmt::{bytes, parse_size};
@@ -402,6 +403,15 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
                 a.consume_flags.allow_overlap,
             );
         }
+        Kind::SevenZ => {
+            return sevenz_cmd::extract(
+                &a.archive,
+                &a.dest,
+                a.overwrite,
+                a.consume_flags.ignore_space,
+                a.stream.max_window.max(1),
+            );
+        }
         Kind::Trnc => {}
     }
     if a.stream.raw {
@@ -463,6 +473,7 @@ pub(crate) enum Kind {
     Trnc,
     Zip,
     Iso,
+    SevenZ,
     Stream(Codec, Mode),
 }
 
@@ -474,6 +485,8 @@ impl Kind {
         } else if iso_cmd::is_iso(archive) {
             // Before ZIP: a ZIP stored as an image's last file would also parse as a ZIP.
             Kind::Iso
+        } else if sevenz_cmd::is_7z(archive) {
+            Kind::SevenZ
         } else if zip_cmd::is_zip(archive) {
             Kind::Zip
         } else {
@@ -488,6 +501,7 @@ impl std::fmt::Display for Kind {
             Kind::Trnc => f.write_str(".trnc"),
             Kind::Zip => f.write_str("ZIP"),
             Kind::Iso => f.write_str("ISO"),
+            Kind::SevenZ => f.write_str("7z"),
             Kind::Stream(c, m) => f.write_str(&stream_cmd::label(*c, *m)),
         }
     }
@@ -522,6 +536,9 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
         }
         Kind::Zip => return zip_cmd::inspect(&a.archive, a.entries),
         Kind::Iso => return iso_cmd::inspect(&a.archive, a.entries),
+        Kind::SevenZ => {
+            return sevenz_cmd::inspect(&a.archive, a.entries, a.stream.max_window.max(1));
+        }
         Kind::Trnc => {}
     }
     let archive = Archive::open(&a.archive)?;
@@ -620,6 +637,9 @@ fn verify(a: VerifyArgs) -> Result<ExitCode> {
         Kind::Stream(..) => return stream_cmd::verify(&a.archive, &a.stream.options()),
         Kind::Zip => return zip_cmd::verify(&a.archive),
         Kind::Iso => return iso_cmd::verify(&a.archive),
+        Kind::SevenZ => {
+            return sevenz_cmd::verify(&a.archive, a.stream.max_window.max(1), a.threads);
+        }
         Kind::Trnc => {}
     }
     let archive = Archive::open(&a.archive)?;
@@ -680,6 +700,9 @@ fn plan(a: PlanArgs) -> Result<ExitCode> {
         }
         Kind::Zip => return zip_cmd::plan(&a.archive, &a.dest, true),
         Kind::Iso => return iso_cmd::plan(&a.archive, &a.dest),
+        Kind::SevenZ => {
+            return sevenz_cmd::plan(&a.archive, &a.dest, a.stream.max_window.max(1));
+        }
         Kind::Trnc => {}
     }
     use trunc_engine::preflight::{self, Severity};

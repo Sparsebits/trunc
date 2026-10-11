@@ -12,6 +12,7 @@
 //! - [`image`] extracts container image tarballs (`docker save`, OCI archives) to their merged
 //!   root filesystem.
 //! - [`isoconsume`] extracts, verifies and consumes ISO 9660 images through the ZIP machinery.
+//! - [`sevenz`] inspects, verifies and extracts 7z archives (not destructively yet).
 
 pub mod archive;
 pub mod consume;
@@ -24,6 +25,7 @@ mod json;
 pub mod keys;
 pub mod preflight;
 pub mod producer;
+pub mod sevenz;
 pub mod source;
 mod stage;
 pub mod streamconsume;

@@ -126,3 +126,10 @@ path = "fuzz_targets/image_manifest.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sevenz"
+path = "fuzz_targets/sevenz.rs"
+test = false
+doc = false
+bench = false
