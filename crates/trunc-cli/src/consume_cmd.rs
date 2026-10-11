@@ -11,6 +11,7 @@ use clap::Args;
 use trunc_core::space::SpaceParams;
 use trunc_engine::consume::{self, ConsumeOptions, Progress, RetryPolicy};
 use trunc_engine::extract::TrustPolicy;
+use trunc_engine::isoconsume;
 use trunc_engine::preflight::{Finding, Severity};
 use trunc_engine::streamconsume::{self, StreamOptions};
 use trunc_engine::zipconsume::{self, PunchPolicy, ZipOptions};
@@ -48,13 +49,14 @@ pub struct ConsumeFlags {
     /// .trnc: decoded bytes per batch (smaller means less extra space, more flushes).
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     pub batch: u64,
-    /// ZIP: process archives whose entries overlap (a zip-bomb technique).
+    /// ZIP and ISO: process archives whose entries overlap (a zip-bomb technique) or share
+    /// data (ISO hard links).
     #[arg(long)]
     pub allow_overlap: bool,
-    /// ZIP: never free space inside an entry while it decompresses.
+    /// ZIP and ISO: never free space inside an entry while it is extracted.
     #[arg(long)]
     pub no_punch: bool,
-    /// ZIP: compressed size from which entries are punched while decompressing.
+    /// ZIP and ISO: stored size from which entries are punched while extracted.
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     pub punch_min: u64,
     /// ZIP and compressed tarballs and files: output bytes between checkpoints that free
@@ -144,6 +146,7 @@ pub fn run(
     let opts = flags.options(*stream, trust, threads);
     let unit = match kind {
         Kind::Zip => "entries",
+        Kind::Iso => "files",
         Kind::Stream(..) => "checkpoints",
         Kind::Trnc => "blocks",
     };
@@ -181,6 +184,7 @@ pub fn run(
     };
     let result = match kind {
         Kind::Zip => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
+        Kind::Iso => isoconsume::consume_iso(&fs, archive, dest, &opts, &mut progress),
         Kind::Stream(..) => streamconsume::consume_stream(&fs, archive, dest, &opts, &mut progress),
         Kind::Trnc => consume::consume(&fs, archive, dest, &opts, &mut progress),
     };

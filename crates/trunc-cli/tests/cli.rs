@@ -302,6 +302,111 @@ fn killed_zip_consume_resumes() {
     }
 }
 
+fn write_iso(path: &Path, seed: u64) -> Vec<(String, Vec<u8>)> {
+    use trunc_testkit::isobuild::{IsoBuilder, Spec};
+    let mut rng = trunc_testkit::Rng::new(seed);
+    let files = vec![
+        (
+            "disc/readme.txt".to_string(),
+            fixtures::text_bytes(&mut rng, 20_000),
+        ),
+        (
+            "disc/data/big.bin".to_string(),
+            fixtures::noise_bytes(&mut rng, 3 << 20),
+        ),
+        ("Top Level.txt".to_string(), b"top level".to_vec()),
+    ];
+    let mut b = IsoBuilder::new().rock_ridge(true).joliet(true).pad(150);
+    for (n, d) in &files {
+        b.add(Spec::file(n, d));
+    }
+    b.add(Spec::symlink("disc/link", "readme.txt"));
+    std::fs::write(path, b.build().bytes).unwrap();
+    files
+}
+
+#[test]
+fn iso_inspect_verify_plan_extract_consume() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let files = write_iso(&w.join("a.iso"), 1);
+
+    let s = ok(&trunc(&["inspect", "a.iso", "--entries"], w));
+    assert!(
+        s.contains("(ISO 9660)") && s.contains("disc/data/big.bin"),
+        "{s}"
+    );
+    assert!(s.contains("Rock Ridge"), "{s}");
+    assert!(ok(&trunc(&["verify", "a.iso"], w)).starts_with("ok:"));
+    let s = ok(&trunc(&["plan", "a.iso", "-C", "out"], w));
+    assert!(s.contains("consume (--consume)"), "{s}");
+
+    let s = ok(&trunc(&["x", "a.iso", "-C", "copy"], w));
+    assert!(s.contains("symlinks  1 skipped"), "{s}");
+    assert_files(&w.join("copy"), &files);
+    assert!(w.join("a.iso").exists());
+
+    let s = ok(&trunc(
+        &["x", "a.iso", "-C", "out", "--consume", "--yes"],
+        w,
+    ));
+    assert!(s.contains("consumed and removed"), "{s}");
+    assert_files(&w.join("out"), &files);
+    assert!(!w.join("a.iso").exists() && !w.join("a.iso.trncj").exists());
+
+    // A UDF-only image gets a clear refusal.
+    std::fs::write(
+        w.join("u.iso"),
+        trunc_testkit::isobuild::IsoBuilder::new()
+            .udf_only()
+            .build()
+            .bytes,
+    )
+    .unwrap();
+    let out = trunc(&["x", "u.iso", "-C", "u"], w);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("UDF-only"), "{err}");
+}
+
+/// Kill a punch-mode ISO consume at arbitrary points; `trunc resume` must finish it.
+#[test]
+fn killed_iso_consume_resumes() {
+    for (round, delay_ms) in [10u64, 60, 150, 400].into_iter().enumerate() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        let files = write_iso(&w.join("a.iso"), 20 + round as u64);
+        let flags = ["--yes", "--punch-min", "1", "--checkpoint-every", "64K"];
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trunc"))
+            .args([&["x", "a.iso", "-C", "out", "--consume"][..], &flags].concat())
+            .current_dir(w)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+        if w.join("a.iso.trncj").exists() {
+            ok(&trunc(&[&["resume", "a.iso"][..], &flags].concat(), w));
+        } else if w.join("a.iso").exists() {
+            ok(&trunc(
+                &[&["x", "a.iso", "-C", "out", "--consume"][..], &flags].concat(),
+                w,
+            ));
+        }
+        assert_files(&w.join("out"), &files);
+        assert!(
+            !w.join("a.iso").exists(),
+            "round {round}: image left behind"
+        );
+        assert!(
+            !w.join("a.iso.trncj").exists(),
+            "round {round}: journal left behind"
+        );
+    }
+}
+
 /// A tiny ZIP whose directory claims 1 TiB of output is refused before anything is written.
 #[test]
 fn zip_bomb_is_refused_by_the_space_check() {

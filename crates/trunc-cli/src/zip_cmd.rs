@@ -10,7 +10,7 @@ use trunc_engine::consume::ConsumeOptions;
 use trunc_engine::preflight::{self, Severity};
 use trunc_engine::zipconsume::{self, PunchPolicy, ZipOptions};
 use trunc_fs::{FsBackend, OsFs};
-use trunc_legacy::zip::{Kind, Method};
+use trunc_legacy::zip::{Kind, Layout, Method};
 
 use crate::fmt::bytes;
 
@@ -129,8 +129,27 @@ pub fn inspect(archive: &Path, list: bool) -> Result<ExitCode> {
 }
 
 pub fn plan(archive: &Path, dest: &Path, punch: bool) -> Result<ExitCode> {
+    let layout = zipconsume::open_layout(&OsFs::new(), archive)?;
+    let overlap = (!layout.overlaps.is_empty()).then(|| {
+        format!(
+            "{} entries overlap; pass --allow-overlap to process them",
+            layout.overlaps.len()
+        )
+    });
+    plan_layout(archive, dest, punch, &layout, "ZIP", overlap.as_deref())
+}
+
+/// `plan` for any archive described by a ZIP layout (ZIP, ISO images). `overlap` is the
+/// blocker to report when entries overlap.
+pub fn plan_layout(
+    archive: &Path,
+    dest: &Path,
+    punch: bool,
+    layout: &Layout,
+    label: &str,
+    overlap: Option<&str>,
+) -> Result<ExitCode> {
     let fs = OsFs::new();
-    let layout = zipconsume::open_layout(&fs, archive)?;
     let largest = layout
         .entries
         .iter()
@@ -157,7 +176,7 @@ pub fn plan(archive: &Path, dest: &Path, punch: bool) -> Result<ExitCode> {
         .open(archive, trunc_fs::OpenMode::Read, trunc_fs::Share::Shared)?
         .size()?;
     let sp = zipconsume::zip_space(
-        &layout,
+        layout,
         len,
         &opts,
         can_dealloc,
@@ -174,7 +193,11 @@ pub fn plan(archive: &Path, dest: &Path, punch: bool) -> Result<ExitCode> {
         Some(_) => "DOES NOT FIT",
         None => "unknown",
     };
-    println!("archive       {} (ZIP, {})", archive.display(), bytes(len));
+    println!(
+        "archive       {} ({label}, {})",
+        archive.display(),
+        bytes(len)
+    );
     println!("content       {} to write", bytes(sp.remaining_u));
     if let Some(free) = vc.destination.free_bytes {
         println!(
@@ -210,11 +233,8 @@ pub fn plan(archive: &Path, dest: &Path, punch: bool) -> Result<ExitCode> {
         };
         println!("[{tag}] {f}");
     }
-    if !layout.overlaps.is_empty() {
-        println!(
-            "[blocks --consume] {} entries overlap; pass --allow-overlap to process them",
-            layout.overlaps.len()
-        );
+    if let Some(o) = overlap {
+        println!("[blocks --consume] {o}");
     }
     let fit = |need: u64| vc.destination.free_bytes.map(|f| f >= need);
     Ok(match (fit(sp.extract_extra), fit(consume_needs)) {

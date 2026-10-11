@@ -78,8 +78,21 @@ const _: () = assert!(WINDOW == 32 * 1024, "SLOT_CAP assumes a 32 KiB window");
 const BLOCK_SLACK: u64 = 4 << 20;
 const PREAMBLE_MAGIC: &[u8; 5] = b"TZJP1";
 
+/// What is being consumed: ZIP, or another container whose files are stored byte ranges and
+/// can therefore be described as a ZIP layout (ISO images, `crate::isoconsume`). Everything
+/// after the scan (journal, ordering, punching, crash recovery) is shared.
+pub(crate) struct Format<'a> {
+    /// First bytes of the journal preamble; tells the formats' journals apart.
+    pub magic: &'static [u8; 5],
+    /// Parse the archive into a layout with every entry's CRC-32 known (fresh starts only).
+    pub scan: &'a dyn Fn(&dyn FileHandle) -> Result<Layout>,
+    /// Refusal for overlapping entries without `--allow-overlap`, given their count.
+    pub overlap_refusal: &'a dyn Fn(usize) -> String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Preamble {
+    magic: [u8; 5],
     archive_id: [u8; 16],
     original_len: u64,
     file_id: trunc_fs::FileId,
@@ -89,7 +102,7 @@ struct Preamble {
 
 impl Preamble {
     fn encode(&self) -> Vec<u8> {
-        let mut b = PREAMBLE_MAGIC.to_vec();
+        let mut b = self.magic.to_vec();
         b.extend_from_slice(&self.archive_id);
         b.extend_from_slice(&self.original_len.to_le_bytes());
         b.extend_from_slice(&self.file_id.volume.to_le_bytes());
@@ -102,7 +115,8 @@ impl Preamble {
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
-        if b.get(..5)? != PREAMBLE_MAGIC {
+        let magic: [u8; 5] = b.get(..5)?.try_into().ok()?;
+        if magic != *PREAMBLE_MAGIC && magic != *crate::isoconsume::PREAMBLE_MAGIC {
             return None;
         }
         let archive_id = b.get(5..21)?.try_into().ok()?;
@@ -113,6 +127,7 @@ impl Preamble {
         let dest = PathBuf::from(std::str::from_utf8(b.get(57..57 + dl)?).ok()?);
         let layout = Layout::from_bytes(b.get(57 + dl..)?)?;
         Some(Self {
+            magic,
             archive_id,
             original_len,
             file_id: trunc_fs::FileId { volume, file },
@@ -342,6 +357,7 @@ fn decode_entry(
     e: &Entry,
     sink: &mut dyn FnMut(&[u8]) -> std::result::Result<(), InflateError>,
     need_free: u64,
+    check_crc: bool,
 ) -> Result<()> {
     let _prof = trunc_prof::span("zip.decode_entry").bytes(e.size);
     let (total, crc) = match e.method {
@@ -378,7 +394,7 @@ fn decode_entry(
             (off, h.finalize())
         }
     };
-    if total != e.size || crc != e.crc32 {
+    if total != e.size || (check_crc && crc != e.crc32) {
         return Err(Error::Integrity(format!(
             "{}: CRC or size mismatch",
             e.name
@@ -444,6 +460,7 @@ fn extract_whole(
             Ok(())
         },
         need_free,
+        true,
     )?;
     out.set_len(e.size)?;
     out.set_modified(system_time(e.mtime_unix, 0))?;
@@ -682,6 +699,29 @@ pub fn consume_zip(
     opts: &ConsumeOptions,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ConsumeSummary> {
+    let format = Format {
+        magic: PREAMBLE_MAGIC,
+        scan: &|h| {
+            zip::parse(h).map_err(|e| Error::Input(format!("{}: {e}", archive_path.display())))
+        },
+        overlap_refusal: &|n| {
+            format!(
+                "{n} entries overlap (a zip-bomb technique); pass --allow-overlap to process them"
+            )
+        },
+    };
+    consume_layout(fs, archive_path, dest, opts, progress, &format)
+}
+
+/// Consume an archive described by a ZIP layout (see [`Format`]).
+pub(crate) fn consume_layout(
+    fs: &dyn FsBackend,
+    archive_path: &Path,
+    dest: &Path,
+    opts: &ConsumeOptions,
+    progress: &mut dyn FnMut(Progress),
+    format: &Format<'_>,
+) -> Result<ConsumeSummary> {
     let absolute = |p: &Path| std::path::absolute(p).map_err(|e| Error::Input(e.to_string()));
     let dest = absolute(dest)?;
     let archive_path = &absolute(archive_path)?;
@@ -698,6 +738,9 @@ pub fn consume_zip(
             let (j, pre, _) = existing.expect("checked");
             let p = Preamble::decode(&pre)
                 .ok_or_else(|| Error::Integrity("journal preamble unreadable".into()))?;
+            if p.magic != *format.magic {
+                return Err(other_format(&jpath));
+            }
             if !same_dest(&p.dest, &dest) {
                 return Err(wrong_dest(&p.dest));
             }
@@ -722,6 +765,9 @@ pub fn consume_zip(
         Some((j, pre_bytes, latest)) => {
             let pre = Preamble::decode(&pre_bytes)
                 .ok_or_else(|| Error::Integrity("journal preamble unreadable".into()))?;
+            if pre.magic != *format.magic {
+                return Err(other_format(&jpath));
+            }
             if !same_dest(&pre.dest, &dest) {
                 return Err(wrong_dest(&pre.dest));
             }
@@ -735,15 +781,14 @@ pub fn consume_zip(
             (pre, j, latest.and_then(|b| EntryCkpt::decode(&b)))
         }
         None => {
-            let layout = zip::parse(handle.as_ref())
-                .map_err(|e| Error::Input(format!("{}: {e}", archive_path.display())))?;
+            let layout = (format.scan)(handle.as_ref())?;
             if !layout.overlaps.is_empty() && !opts.zip.allow_overlap {
-                return Err(Error::Refused(format!(
-                    "{} entries overlap (a zip-bomb technique); pass --allow-overlap to process them",
-                    layout.overlaps.len()
+                return Err(Error::Refused((format.overlap_refusal)(
+                    layout.overlaps.len(),
                 )));
             }
             let pre = Preamble {
+                magic: *format.magic,
                 archive_id: trunc_hash::blake3(&layout.to_bytes())[..16]
                     .try_into()
                     .expect("16 bytes"),
@@ -970,6 +1015,13 @@ pub(crate) fn same_dest(recorded: &Path, dest: &Path) -> bool {
     }
 }
 
+fn other_format(jpath: &Path) -> Error {
+    Error::Refused(format!(
+        "{} belongs to the consumption of another kind of archive",
+        jpath.display()
+    ))
+}
+
 pub(crate) fn wrong_dest(recorded: &Path) -> Error {
     Error::Refused(format!(
         "this archive is being extracted into {}; resume with that destination",
@@ -1025,7 +1077,7 @@ pub fn verify_zip(fs: &dyn FsBackend, archive: &Path) -> Result<(usize, u64)> {
         zip::parse(h.as_ref()).map_err(|e| Error::Input(format!("{}: {e}", archive.display())))?;
     let mut bytes = 0u64;
     for e in layout.entries.iter().filter(|e| e.kind == Kind::File) {
-        decode_entry(h.as_ref(), e, &mut |_| Ok(()), 0)?;
+        decode_entry(h.as_ref(), e, &mut |_| Ok(()), 0, true)?;
         bytes += e.size;
     }
     Ok((layout.entries.len(), bytes))
@@ -1047,8 +1099,21 @@ pub fn extract_zip(
             layout.overlaps.len()
         )));
     }
+    extract_layout(fs, h.as_ref(), &layout, dest, overwrite, true)
+}
+
+/// Non-destructive extraction of the entries of `layout`, read from `h`. Without `check_crc`
+/// the entries' CRC fields are ignored (formats without checksums).
+pub(crate) fn extract_layout(
+    fs: &dyn FsBackend,
+    h: &dyn FileHandle,
+    layout: &Layout,
+    dest: &Path,
+    overwrite: bool,
+    check_crc: bool,
+) -> Result<ConsumeSummary> {
     ensure_dir(fs, dest)?;
-    let items = items_of(&layout);
+    let items = items_of(layout);
     let mut summary = ConsumeSummary::default();
     let mut dirs: Vec<String> = Vec::new();
     for it in &items {
@@ -1107,7 +1172,7 @@ pub fn extract_zip(
         };
         let mut off = 0u64;
         decode_entry(
-            h.as_ref(),
+            h,
             e,
             &mut |b| {
                 out.write_all_at(b, off)?;
@@ -1115,6 +1180,7 @@ pub fn extract_zip(
                 Ok(())
             },
             0,
+            check_crc,
         )?;
         out.set_modified(system_time(e.mtime_unix, 0))?;
         drop(out);
