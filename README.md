@@ -153,10 +153,12 @@ Run `trunc <command> --help` for every flag, or see the
 
 | Format | Extract | `--consume` | Space comes back |
 |---|---|---|---|
-| ZIP (Stored, Deflate, Zip64) | yes | yes | from the end, after each group of entries, and every 64 MiB inside entries of 256 MiB or more |
+| ZIP (Stored, Deflate, bzip2, zstd, xz, Zip64) | yes | yes | from the end, after each group of entries, and every 64 MiB inside entries of 256 MiB or more |
 | `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` | yes | yes | from the front, every 64 MiB of output, or after each block or frame decoded in parallel |
 | Single files: `.gz`, `.bz2`, `.xz`, `.zst` | yes | yes | the same as tarballs |
 | ISO 9660 images (`.iso`) | yes | yes | as for ZIP |
+| Uncompressed `.tar` | yes | yes | as for ZIP |
+| 7z (Copy, LZMA, LZMA2, BCJ, Delta) | yes | not yet | — |
 | Compressed tarballs and files split into `.001` or `.aa` parts | yes | yes | as above, and each part is deleted once its data is safe |
 | ZIP, ISO and `.trnc` split into parts | yes | not yet | — |
 | Container images (`docker save`, OCI archives) | yes | no | — |
@@ -357,14 +359,24 @@ a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `
 | `crates/trunc-chunk` | Splitting content into blocks |
 | `crates/trunc-fs` | Filesystem access: sparse files, file ids, volume checks, cloud-sync detection |
 | `crates/trunc-journal` | The crash-safe journal used when consuming ZIP files and compressed archives |
-| `crates/trunc-legacy` | ZIP and tar readers, split archives, and the resumable Deflate, bzip2, xz and zstd decoders |
+| `crates/trunc-legacy` | ZIP, tar, ISO and 7z readers, split archives, and the resumable Deflate, bzip2, xz and zstd decoders |
 | `crates/trunc-engine` | Creating, extracting, verifying and consuming archives |
 | `crates/trunc-cli` | The `trunc` command |
 | `crates/trunc-prof` | The span profiler behind `--profile` |
 | `crates/trunc-testkit` | A simulated filesystem that can crash on demand, plus test fixtures |
+| `crates/flavors/`, `flavors/` | Tools built on trunc: weightdrop, layerless, ci-restore |
 | `fuzz/` | Fuzz targets |
 
 </details>
+
+## Built on trunc
+
+- [weightdrop](crates/flavors/weightdrop/): unpack sharded model weights and datasets on GPU
+  boxes with small disks.
+- [layerless](crates/flavors/layerless/): pull a container image straight to a root filesystem,
+  with no tarball and no daemon.
+- [ci-restore](flavors/ci-restore/): restore big CI caches and artifacts without doubling runner
+  disk.
 
 ## License
 
