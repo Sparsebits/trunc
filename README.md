@@ -20,8 +20,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
-  <a href="#zip-files">ZIP</a> ·
-  <a href="#compressed-tarballs-and-files">.tar.gz, .tar.zst, .xz</a> ·
+  <a href="#formats">Formats</a> ·
   <a href="docs/guide.md">User guide</a>
 </p>
 
@@ -50,7 +49,8 @@ it carries on from where it stopped.
   space while they decompress, not just when each file finishes.
 - **Checks everything.** Every block is hashed, and archives can be signed. Nothing is deleted until
   the output that replaces it has been verified.
-- **Fast.** Blocks decompress in parallel at over 1 GiB/s.
+- **Fast.** `.trnc` blocks decompress in parallel at over 1 GiB/s. bzip2 files, multi-block xz
+  files and multi-frame zstd files decode on all cores too.
 
 ## Install
 
@@ -113,8 +113,8 @@ archive   consumed; receipt kept at data.trnc.receipt
 time      1.52s (3 batches)
 ```
 
-The same command works on ZIP and `.tar.gz` files. Without `--consume`, `trunc x` is an
-ordinary extractor and leaves the archive alone.
+The same command works on ZIP files, compressed tarballs and single compressed files. Without
+`--consume`, `trunc x` is an ordinary extractor and leaves the archive alone.
 
 <details>
 <summary><b>More commands</b></summary>
@@ -199,6 +199,20 @@ than underestimate.
 
 </details>
 
+## Formats
+
+| Format | Extract | `--consume` | Space comes back |
+|---|---|---|---|
+| `.trnc` | yes | yes | from the end, after each batch of blocks |
+| ZIP (Stored, Deflate, Zip64) | yes | yes | from the end, after each group of entries, and every 64 MiB inside entries of 256 MiB or more |
+| `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` | yes | yes | from the front, every 64 MiB of output, or after each block or frame decoded in parallel |
+| Single files: `.gz`, `.bz2`, `.xz`, `.zst` | yes | yes | the same as tarballs |
+| Compressed tarballs and files split into `.001` or `.aa` parts | yes | yes | as above, and each part is deleted once its data is safe |
+| ZIP and `.trnc` split into parts | yes | not yet | |
+
+All of them resume after a crash with `trunc resume`. The
+[user guide](docs/guide.md#supported-formats) has the details for each format.
+
 ## ZIP files
 
 ZIP files weren't designed to be taken apart from the end, so trunc does more work before it
@@ -235,6 +249,14 @@ Saving a position means saving the decompressor's state, which off-the-shelf lib
 allow, so trunc has its own decoders for all four formats. They are tested against the reference
 implementations and fuzzed against them.
 
+Parts of a file that need nothing from the parts before them decode on all cores, in both
+passes: bzip2 blocks, the blocks of an xz file made with `xz -T0`, and zstd frames that declare
+their size, as `pzstd` writes them. A 437 MiB `.tar.xz` from `xz -T0` verifies in 0.65 s instead
+of 4.1 s. Such a block or frame is decoded whole, so its space comes back when it ends rather
+than every 64 MiB; `trunc plan` counts this. gzip files, and xz and zstd files written as one
+block or frame, decode on one core. The user guide explains
+[what this means for space and memory](docs/guide.md#parallel-decoding).
+
 A compressed file that isn't a tarball, like `disk.img.xz` or `dump.sql.gz`, becomes one file
 without the suffix. `--raw` does the same for a tarball, turning `big.tar.zst` into `big.tar` in
 place.
@@ -253,8 +275,8 @@ archives can be extracted, but not consumed yet.
 ## When not to use it
 
 - **You want to keep the archive.** Leave off `--consume`.
-- **The archive is in OneDrive, Dropbox or Google Drive.** The sync client would upload every change.
-  trunc refuses unless you pass `--allow-sync`.
+- **The archive is in OneDrive, Dropbox, Google Drive or iCloud.** The sync client would upload
+  every change. trunc refuses unless you pass `--allow-sync`.
 - **Your disk keeps snapshots**, such as System Restore points, btrfs or ZFS snapshots. A snapshot
   holds on to the space trunc frees, so you save nothing.
 - **The drive is FAT32 or exFAT.** These filesystems can lose their own records in a crash.
@@ -316,8 +338,8 @@ commit, and Linux builds for x86-64 and ARM64. FAT32 and exFAT drives work with
 
 ## Documentation
 
-- [User guide](docs/guide.md): creating archives, what `--consume` guarantees, ZIP, compressed
-  tarballs and split archives, exit codes
+- [User guide](docs/guide.md): supported formats, creating archives, what `--consume`
+  guarantees, ZIP, compressed tarballs and split archives, parallel decoding, profiling, exit codes
 - [Format spec](docs/spec/trnc-format-v1.md): the `.trnc` v1 file format
 - [Crash-safety invariants](docs/spec/invariants.md): what must hold after any crash, and the test for each
 - [Security checklist](docs/security.md): how hostile archives are handled, and known gaps
@@ -333,8 +355,8 @@ cargo test --workspace
 ```
 
 To see where a run spends its time, add `--profile run.json` to any command: it prints a
-summary and writes a trace for <https://ui.perfetto.dev> (see the
-[user guide](docs/guide.md#profiling)).
+summary and writes a trace for <https://ui.perfetto.dev>. The user guide explains
+[how to read it](docs/guide.md#performance-and-profiling).
 
 The parsers are fuzzed with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). On Linux with
 a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `tar`,
@@ -350,10 +372,11 @@ a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `
 | `crates/trunc-codec` | zstd, lz4 and uncompressed blocks |
 | `crates/trunc-chunk` | Splitting content into blocks |
 | `crates/trunc-fs` | Filesystem access: sparse files, file ids, volume checks, cloud-sync detection |
-| `crates/trunc-journal` | The crash-safe journal used for ZIP extraction |
-| `crates/trunc-legacy` | ZIP and tar readers, gzip framing, and the resumable Deflate decoder |
+| `crates/trunc-journal` | The crash-safe journal used when consuming ZIP files and compressed archives |
+| `crates/trunc-legacy` | ZIP and tar readers, split archives, and the resumable Deflate, bzip2, xz and zstd decoders |
 | `crates/trunc-engine` | Creating, extracting, verifying and consuming archives |
 | `crates/trunc-cli` | The `trunc` command |
+| `crates/trunc-prof` | The span profiler behind `--profile` |
 | `crates/trunc-testkit` | A simulated filesystem that can crash on demand, plus test fixtures |
 | `fuzz/` | Fuzz targets |
 
