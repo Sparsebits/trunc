@@ -1084,6 +1084,7 @@ dependencies = [
  "flate2",
  "liblzma",
  "trunc-fs",
+ "trunc-hash",
  "zstd",
 ]
 

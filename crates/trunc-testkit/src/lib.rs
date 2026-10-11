@@ -3,6 +3,7 @@
 //! - [`fixtures`] writes deterministic input trees (many small files, one large file, empty
 //!   files and directories, incompressible and all-zero data).
 //! - [`tree`] snapshots and compares directory trees byte for byte.
+//! - [`imagebuild`] builds container image tarballs (`docker save`, OCI layouts).
 //!
 //! - [`faultfs`] is an in-memory filesystem with crash, torn-write, lost-unflushed-data, ENOSPC
 //!   and mapped-file fault injection, plus occupancy tracking.
@@ -15,6 +16,7 @@ pub use faultfs::{CrashModel, Fault, FaultFs};
 
 pub mod faultfs;
 pub mod fixtures;
+pub mod imagebuild;
 pub mod tarbuild;
 pub mod tree;
 pub mod zipbuild;
