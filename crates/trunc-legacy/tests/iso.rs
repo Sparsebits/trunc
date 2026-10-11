@@ -360,3 +360,113 @@ fn looping_continuation_areas_are_refused() {
     bytes[area..area + 28].copy_from_slice(&field);
     refused(&bytes, "CE loop");
 }
+
+fn relocated(extra: &[Spec]) -> Built {
+    let mut b = IsoBuilder::new()
+        .rock_ridge(true)
+        .relocate("a/b/c", "rr_moved");
+    for s in relocated_specs().iter().chain(extra) {
+        b.add(s.clone());
+    }
+    b.build()
+}
+
+fn relocated_specs() -> Vec<Spec> {
+    vec![
+        Spec::file("a/b/c/deep.txt", b"deep"),
+        Spec::file("a/b/c/d/deeper.txt", b"deeper"),
+        Spec::file("top.txt", b"top"),
+    ]
+}
+
+#[test]
+fn relocated_directories_are_listed_where_they_belong() {
+    let built = relocated(&[]);
+    let img = parse(&built.bytes).unwrap();
+    let mut want = want(&relocated_specs());
+    assert_eq!(contents(&built.bytes, &img), want, "rr_moved is dropped");
+    let c = img
+        .layout
+        .entries
+        .iter()
+        .find(|e| e.name == "a/b/c")
+        .unwrap();
+    assert_eq!((c.kind, c.mode), (Kind::Dir, Some(0o755)));
+
+    // A relocation directory with other content is kept (without the relocated directory).
+    let built = relocated(&[Spec::file("rr_moved/note.txt", b"kept")]);
+    let img = parse(&built.bytes).unwrap();
+    want.insert("rr_moved".into(), None);
+    want.insert("rr_moved/note.txt".into(), Some(b"kept".to_vec()));
+    assert_eq!(contents(&built.bytes, &img), want);
+}
+
+#[test]
+fn unlinked_or_misplaced_relocations_are_refused() {
+    let built = relocated(&[]);
+    // The placeholder loses its CL field: the relocated directory is reached from nowhere.
+    let mut bytes = built.bytes.clone();
+    let at = built.records[&(Tree::Primary, "a/b/c".into())][0];
+    let cl = at
+        + bytes[at..at + 255]
+            .windows(4)
+            .position(|w| w == b"CL\x0c\x01")
+            .unwrap();
+    bytes[cl..cl + 2].copy_from_slice(b"XX");
+    let e = parse(&bytes).unwrap_err();
+    assert!(e.to_string().contains("not linked"), "{e}");
+    // An RE entry that is not a directory.
+    let mut bytes = built.bytes.clone();
+    let re = built.records[&(Tree::Primary, "RE:a/b/c".into())][0];
+    bytes[re + 25] &= !2;
+    let e = parse(&bytes).unwrap_err();
+    assert!(e.to_string().contains("not a directory"), "{e}");
+}
+
+#[test]
+fn directory_extents_skip_their_extended_attribute_records() {
+    let specs = vec![Spec::file("DIR/FILE.TXT", b"in a directory")];
+    let mut built = build(IsoBuilder::new(), &specs);
+    // Say "DIR" has a one-block extended attribute record before its records.
+    let (lba, _) = built.extent(Tree::Primary, "DIR");
+    built.set_extent(Tree::Primary, "DIR", lba - 1);
+    let o = built.records[&(Tree::Primary, "DIR".into())][0];
+    built.bytes[o + 1] = 1;
+    let img = parse(&built.bytes).unwrap();
+    assert_eq!(contents(&built.bytes, &img), want(&specs));
+}
+
+#[test]
+fn joliet_block_size_is_checked() {
+    let mut built = build(IsoBuilder::new().joliet(true), &[Spec::file("a", b"x")]);
+    let o = 17 * 2048 + 128;
+    built.bytes[o..o + 4].copy_from_slice(&[0, 2, 2, 0]); // 512, both byte orders
+    let e = parse(&built.bytes).unwrap_err();
+    assert!(matches!(e, IsoError::Unsupported(_)), "{e}");
+}
+
+#[test]
+fn unset_record_dates_fall_back_to_the_volume_date() {
+    let specs = vec![Spec::file("A.TXT", b"a"), Spec::file("B.TXT", b"b")];
+    let mut built = build(IsoBuilder::new(), &specs);
+    let o = built.records[&(Tree::Primary, "A.TXT".into())][0];
+    built.bytes[o + 18..o + 25].fill(0);
+    let mtime = |bytes: &[u8]| {
+        let img = parse(bytes).unwrap();
+        let by: BTreeMap<_, _> = img
+            .layout
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.mtime_unix))
+            .collect();
+        (by["A.TXT"], by["B.TXT"])
+    };
+    // No volume creation date either: the epoch.
+    assert_eq!(mtime(&built.bytes), (0, isobuild::DATE_UNIX));
+    let pvd = 16 * 2048;
+    built.bytes[pvd + 813..pvd + 830].copy_from_slice(b"2024010203040500\0");
+    assert_eq!(
+        mtime(&built.bytes),
+        (isobuild::DATE_UNIX, isobuild::DATE_UNIX)
+    );
+}

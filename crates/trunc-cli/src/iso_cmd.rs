@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use trunc_core::space::SpaceParams;
-use trunc_engine::consume::ConsumeOptions;
+use trunc_engine::consume::{ConsumeOptions, ConsumeSummary};
 use trunc_engine::isoconsume;
 use trunc_engine::preflight;
 use trunc_engine::zipconsume;
@@ -67,8 +67,22 @@ pub fn extract(
             s.specials_skipped
         );
     }
+    summary_lines(&s);
     println!("time      {:.2}s", t.elapsed().as_secs_f64());
     Ok(ExitCode::SUCCESS)
+}
+
+/// ISO-only lines of an extraction or consumption summary.
+pub fn summary_lines(s: &ConsumeSummary) {
+    if s.associated_skipped > 0 {
+        println!(
+            "skipped   {} associated files (resource forks)",
+            s.associated_skipped
+        );
+    }
+    if s.hidden > 0 {
+        println!("hidden    {} files flagged hidden (extracted)", s.hidden);
+    }
 }
 
 pub fn verify(archive: &Path) -> Result<ExitCode> {
@@ -158,6 +172,11 @@ fn skipped_lines(img: &Image) {
         println!(
             "skipped    {} devices, FIFOs or sockets",
             img.specials_skipped
+        );
+    }
+    if isoconsume::skipped_refusal(img).is_some() {
+        println!(
+            "note       skipped entries are lost with the image; --consume needs --allow-skipped"
         );
     }
 }

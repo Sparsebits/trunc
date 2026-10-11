@@ -54,6 +54,10 @@ pub struct ConsumeFlags {
     /// data (ISO hard links).
     #[arg(long)]
     pub allow_overlap: bool,
+    /// ISO: consume images holding entries that are never extracted (associated files such as
+    /// resource forks, devices, FIFOs), which are destroyed with the image.
+    #[arg(long)]
+    pub allow_skipped: bool,
     /// ZIP and ISO: never free space inside an entry while it is extracted.
     #[arg(long)]
     pub no_punch: bool,
@@ -188,7 +192,14 @@ pub fn run(
     };
     let result = match kind {
         Kind::Zip => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
-        Kind::Iso => isoconsume::consume_iso(&fs, archive, dest, &opts, &mut progress),
+        Kind::Iso => isoconsume::consume_iso(
+            &fs,
+            archive,
+            dest,
+            &opts,
+            flags.allow_skipped,
+            &mut progress,
+        ),
         Kind::SevenZ => unreachable!("refused above"),
         Kind::Tar => tarconsume::consume_tar(&fs, archive, dest, &opts, &mut progress),
         Kind::Stream(..) => streamconsume::consume_stream(&fs, archive, dest, &opts, &mut progress),
@@ -228,6 +239,7 @@ pub fn run(
                     s.specials_skipped
                 );
             }
+            crate::iso_cmd::summary_lines(&s);
             match &s.receipt {
                 Some(r) => println!("archive   consumed; receipt kept at {}", r.display()),
                 None => println!("archive   consumed and removed"),

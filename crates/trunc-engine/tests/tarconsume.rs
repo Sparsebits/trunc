@@ -351,7 +351,8 @@ fn zip_iso_and_tar_journals_are_not_mixed_up() {
     assert_eq!(recorded.file_name().unwrap(), "out");
     let e = zipconsume::consume_zip(&fs, p, Path::new(DEST), &opts(), &mut |_| {}).unwrap_err();
     assert!(e.to_string().contains("another kind of archive"), "{e}");
-    let e = isoconsume::consume_iso(&fs, p, Path::new(DEST), &opts(), &mut |_| {}).unwrap_err();
+    let e =
+        isoconsume::consume_iso(&fs, p, Path::new(DEST), &opts(), false, &mut |_| {}).unwrap_err();
     assert!(e.to_string().contains("another kind of archive"), "{e}");
     run(&fs, &opts()).unwrap();
     assert_complete(&fs, &expected(&sp));

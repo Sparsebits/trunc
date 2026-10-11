@@ -96,7 +96,7 @@ fn fresh(model: CrashModel, bytes: &[u8]) -> FaultFs {
 }
 
 fn run(fs: &FaultFs, o: &ConsumeOptions) -> Result<ConsumeSummary, Error> {
-    isoconsume::consume_iso(fs, Path::new(ARC), Path::new(DEST), o, &mut |_| {})
+    isoconsume::consume_iso(fs, Path::new(ARC), Path::new(DEST), o, false, &mut |_| {})
 }
 
 fn assert_complete(fs: &FaultFs, want: &BTreeMap<String, Option<Vec<u8>>>) {
@@ -192,9 +192,75 @@ fn symlinks_and_devices_are_skipped() {
     ];
     let bytes = build(&sp);
     let fs = fresh(CrashModel::LoseUnflushed, &bytes);
-    let s = run(&fs, &opts()).unwrap();
-    assert_eq!(s.symlinks_skipped, 2);
+    // The device would be lost with the image: refused, untouched, without the opt-in.
+    let e = run(&fs, &opts()).unwrap_err();
+    assert!(matches!(e, Error::Refused(_)), "{e:?}");
+    assert!(e.to_string().contains("--allow-skipped"), "{e}");
+    assert_eq!(fs.get_file(Path::new(ARC)).unwrap(), bytes);
+    assert!(fs.get_file(Path::new("/a.iso.trncj")).is_none());
+    let s = run_allowing_skipped(&fs, &opts()).unwrap();
+    assert_eq!((s.symlinks_skipped, s.specials_skipped), (2, 1));
     assert_complete(&fs, &expected(&sp[..1]));
+}
+
+fn run_allowing_skipped(fs: &FaultFs, o: &ConsumeOptions) -> Result<ConsumeSummary, Error> {
+    isoconsume::consume_iso(fs, Path::new(ARC), Path::new(DEST), o, true, &mut |_| {})
+}
+
+#[test]
+fn associated_files_and_hidden_counts_reach_the_summary() {
+    let sp = vec![
+        Spec::file("doc.txt", b"document"),
+        Spec::file("doc.rsrc", b"resource fork").associated(),
+        Spec::file("secret.txt", b"hidden").hidden(),
+    ];
+    let bytes = build(&sp);
+    let want = expected(&[sp[0].clone(), sp[2].clone()]);
+
+    // Plain extraction reports them.
+    let fs = fresh(CrashModel::WriteThrough, &bytes);
+    let s = isoconsume::extract_iso(&fs, Path::new(ARC), Path::new(DEST), false, false).unwrap();
+    assert_eq!((s.associated_skipped, s.hidden, s.files), (1, 1, 2));
+
+    // Consumption refuses to destroy the resource fork unless told to.
+    let fs = fresh(CrashModel::WriteThrough, &bytes);
+    let e = run(&fs, &opts()).unwrap_err();
+    assert!(
+        e.to_string().contains("1 associated files") && e.to_string().contains("--allow-skipped"),
+        "{e}"
+    );
+    assert_eq!(fs.get_file(Path::new(ARC)).unwrap(), bytes);
+    let s = run_allowing_skipped(&fs, &opts()).unwrap();
+    assert_eq!((s.associated_skipped, s.hidden, s.files), (1, 1, 2));
+    assert_complete(&fs, &want);
+
+    // Hidden files alone lose nothing: no opt-in needed.
+    let only_hidden = build(&[sp[0].clone(), sp[2].clone()]);
+    let fs = fresh(CrashModel::WriteThrough, &only_hidden);
+    let s = run(&fs, &opts()).unwrap();
+    assert_eq!((s.associated_skipped, s.hidden), (0, 1));
+    assert_complete(&fs, &want);
+}
+
+#[test]
+fn relocated_directories_are_consumed() {
+    // Rock Ridge deep-directory relocation: the placeholder becomes the directory, and the
+    // relocation directory (holding nothing else) is not extracted.
+    let sp = vec![
+        Spec::file("a/b/c/deep.txt", b"deep"),
+        Spec::file("a/b/c/d/deeper.txt", b"deeper"),
+        Spec::file("top.txt", b"top"),
+    ];
+    let mut b = IsoBuilder::new()
+        .rock_ridge(true)
+        .relocate("a/b/c", "rr_moved");
+    for s in &sp {
+        b.add(s.clone());
+    }
+    let bytes = b.build().bytes;
+    let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+    run(&fs, &opts()).unwrap();
+    assert_complete(&fs, &expected(&sp));
 }
 
 #[test]
@@ -471,7 +537,7 @@ fn consumes_on_the_real_filesystem() {
     std::fs::write(&arc, build(&sp)).unwrap();
     assert!(isoconsume::is_iso(&OsFs::new(), &arc));
     let dest = d.path().join("out");
-    isoconsume::consume_iso(&OsFs::new(), &arc, &dest, &opts(), &mut |_| {}).unwrap();
+    isoconsume::consume_iso(&OsFs::new(), &arc, &dest, &opts(), false, &mut |_| {}).unwrap();
     assert!(!arc.exists() && !isoconsume::journal_path(&arc).exists());
     for s in &sp {
         if let SpecKind::File(data) = &s.kind {
