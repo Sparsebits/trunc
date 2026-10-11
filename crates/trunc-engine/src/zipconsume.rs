@@ -290,7 +290,13 @@ pub fn zip_space(
                     u128::from(window) * u128::from(e.compressed_size) / u128::from(e.size),
                 )
                 .unwrap_or(u64::MAX);
-                (len + written + e.size).saturating_sub(e.compressed_size) + tail + granularity
+                // Only whole units inside the freed range are released: the partial unit at
+                // each end (the region start is not aligned) stays allocated. At a checkpoint
+                // the output is allocated up to a whole cluster past its written length.
+                (len + written + e.size).saturating_sub(e.compressed_size)
+                    + tail
+                    + 2 * granularity
+                    + (cl - 1)
             } else {
                 entry_mode
             };
@@ -1136,4 +1142,603 @@ pub fn extract_zip(
         summary.files += 1;
     }
     Ok(summary)
+}
+
+/// Randomized checks of the ZIP planner (`groups`, `zip_space`) against a simulation of the
+/// consume loop.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
+mod tests {
+    use std::ops::Range;
+
+    use trunc_testkit::Rng;
+
+    use super::*;
+
+    fn pick<T: Copy>(rng: &mut Rng, xs: &[T]) -> T {
+        xs[rng.below(xs.len() as u64) as usize]
+    }
+
+    /// Inclusive range `lo..=hi`.
+    fn between(rng: &mut Rng, lo: u64, hi: u64) -> u64 {
+        lo + rng.below(hi - lo + 1)
+    }
+
+    fn round_up(x: u64, unit: u64) -> u64 {
+        x.div_ceil(unit) * unit
+    }
+
+    fn random_size(rng: &mut Rng, large_ok: bool) -> u64 {
+        match rng.below(20) {
+            0..=1 => 0,
+            2..=7 => between(rng, 1, 100),
+            8..=13 => between(rng, 1, 64 << 10),
+            14..=17 => between(rng, 1, 16 << 20),
+            _ if large_ok => between(rng, 16 << 20, 1536 << 20),
+            _ => between(rng, 1, 4 << 20),
+        }
+    }
+
+    /// A random layout: entries back to back after an optional self-extractor stub, then the
+    /// central directory. With `overlap`, some entries reuse an earlier entry's bytes.
+    fn random_layout(rng: &mut Rng, overlap: bool) -> Layout {
+        let n = match rng.below(4) {
+            0 => between(rng, 1, 5),
+            1 => between(rng, 1, 1500),
+            _ => between(rng, 1, 300),
+        };
+        let large_ok = n <= 300 && rng.below(2) == 0;
+        let tiny_only = n > 300 && rng.below(2) == 0;
+        let stub = between(rng, 1, 64 << 10);
+        let mut pos = pick(rng, &[0, 0, 0, stub]);
+        let mut cd = 0u64;
+        let mut entries = Vec::new();
+        for i in 0..n {
+            let name = format!("e{i}");
+            let name_len = between(rng, 1, 80);
+            let hdr = 30 + name_len + pick(rng, &[0, 0, 20, 36]);
+            let kind = match rng.below(20) {
+                0..=1 => Kind::Dir,
+                2 => Kind::Symlink,
+                _ => Kind::File,
+            };
+            let size = match kind {
+                Kind::Dir => 0,
+                Kind::Symlink => between(rng, 1, 100),
+                Kind::File if tiny_only => between(rng, 0, 64),
+                Kind::File => random_size(rng, large_ok),
+            };
+            let method = if kind == Kind::File && rng.below(3) != 0 {
+                Method::Deflate
+            } else {
+                Method::Stored
+            };
+            let compressed_size = match method {
+                Method::Stored => size,
+                Method::Deflate if size == 0 => 2,
+                Method::Deflate => match rng.below(4) {
+                    0 => between(rng, 1, size / 100 + 1),
+                    1 => between(rng, 1, size),
+                    2 => between(rng, size / 2 + 1, size),
+                    _ => between(rng, size, size + size / 64 + 16), // incompressible
+                },
+            };
+            let dd = if kind == Kind::File {
+                pick(rng, &[0, 0, 12, 16, 24])
+            } else {
+                0
+            };
+            let region_start = pos;
+            let data_offset = region_start + hdr;
+            let region_end = data_offset + compressed_size + dd;
+            entries.push(Entry {
+                name,
+                kind,
+                method,
+                crc32: 0,
+                compressed_size,
+                size,
+                region_start,
+                data_offset,
+                region_end,
+                mode: None,
+                mtime_unix: 0,
+            });
+            let gap = between(rng, 1, 100);
+            pos = region_end + pick(rng, &[0, 0, 0, 0, gap]);
+            cd += 46 + name_len;
+        }
+        let mut overlaps = Vec::new();
+        if overlap && n > 1 {
+            for _ in 0..between(rng, 1, n.min(20)) {
+                let j = between(rng, 1, n - 1) as usize;
+                let i = rng.below(j as u64) as usize;
+                let src = entries[i].clone();
+                let e = &mut entries[j];
+                (e.kind, e.method) = (src.kind, src.method);
+                (e.size, e.compressed_size) = (src.size, src.compressed_size);
+                e.region_start = src.region_start + rng.below(src.data_offset - src.region_start);
+                (e.data_offset, e.region_end) = (src.data_offset, src.region_end);
+                overlaps.push((i, j));
+            }
+        }
+        Layout {
+            entries,
+            cd_start: pos,
+            file_len: pos + cd + 22,
+            overlaps,
+        }
+    }
+
+    /// The archive file: its length and the ranges deallocated inside it.
+    struct Disk {
+        len: u64,
+        holes: Vec<Range<u64>>,
+    }
+
+    impl Disk {
+        fn occupied(&self) -> u64 {
+            self.len
+                - self
+                    .holes
+                    .iter()
+                    .map(|h| h.end.min(self.len).saturating_sub(h.start))
+                    .sum::<u64>()
+        }
+
+        /// What `deallocate(start, end)` frees: the whole units inside the range.
+        fn deallocate(&mut self, start: u64, end: u64, gran: u64) {
+            let (s, e) = (start.div_ceil(gran) * gran, end.min(self.len) / gran * gran);
+            if s >= e {
+                return;
+            }
+            let mut merged = s..e;
+            self.holes.retain(|h| {
+                let touches = h.start <= merged.end && merged.start <= h.end;
+                if touches {
+                    merged = merged.start.min(h.start)..merged.end.max(h.end);
+                }
+                !touches
+            });
+            self.holes.push(merged);
+        }
+
+        fn truncate(&mut self, to: u64) {
+            self.len = to;
+            self.holes.retain(|h| h.start < to);
+        }
+    }
+
+    /// How the compressed bytes of a punch-mode entry are spread over its output.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Spread {
+        /// Evenly, as `consume_peak` assumes.
+        Even,
+        /// Anyhow (input consumed is any non-decreasing function of output): only
+        /// `consume_peak_guaranteed` has to hold.
+        Skewed,
+    }
+
+    struct Case {
+        layout: Layout,
+        archive_len: u64,
+        opts: ConsumeOptions,
+        can_dealloc: bool,
+        gran: u64,
+        params: SpaceParams,
+        /// Largest deflate block output (the planner allows `BLOCK_SLACK`).
+        max_block: u64,
+        spread: Spread,
+    }
+
+    fn random_case(rng: &mut Rng) -> Case {
+        let overlap = rng.below(6) == 0;
+        let layout = random_layout(rng, overlap);
+        let params = SpaceParams {
+            cluster_size: pick(rng, &[1, 512, 4096, 65536]),
+            per_entry_overhead: pick(rng, &[0, 0, 1, 256, 4096]),
+            margin_fixed: pick(rng, &[0, 0, 0, 4096]),
+            margin_ppm: pick(rng, &[0, 0, 5_000]),
+            batch_max_u: pick(rng, &[1, 4096, 1 << 20, 64 << 20, 256 << 20, u64::MAX]),
+        };
+        let opts = ConsumeOptions {
+            space: params,
+            zip: ZipOptions {
+                allow_overlap: overlap,
+                punch: pick(
+                    rng,
+                    &[PunchPolicy::Auto, PunchPolicy::Auto, PunchPolicy::Never],
+                ),
+                punch_min: pick(rng, &[0, 1, 4096, 1 << 20, 256 << 20]),
+                checkpoint_every: pick(rng, &[0, 1, 4096, 1 << 20, 8 << 20, 64 << 20]),
+            },
+            ..ConsumeOptions::default()
+        };
+        // Resume after some groups (the archive was truncated at a group boundary), or start
+        // fresh, or after only the central directory went.
+        let order = schedule(&layout);
+        let after = ends_after(&layout, &order);
+        let all_max = order.first().map_or(0, |&i| layout.entries[i].region_end);
+        let archive_len = match rng.below(6) {
+            0 => all_max,
+            1 => after[rng.below(order.len() as u64) as usize],
+            _ => layout.file_len,
+        };
+        Case {
+            layout,
+            archive_len,
+            opts,
+            can_dealloc: rng.below(3) != 0,
+            gran: pick(rng, &[1, 512, 4096, 65536]),
+            params,
+            max_block: pick(rng, &[64 << 10, 1 << 20, BLOCK_SLACK]),
+            spread: if rng.below(4) == 0 {
+                Spread::Skewed
+            } else {
+                Spread::Even
+            },
+        }
+    }
+
+    /// `groups` partitions the schedule into non-empty runs, punch-mode entries alone, other
+    /// runs within `batch_max_u` (unless they hold a single file) and `GROUP_MAX_FILES`, and
+    /// each run is cut only where the next file would break a limit.
+    fn check_groups(
+        order: &[usize],
+        layout: &Layout,
+        punch: &dyn Fn(&Entry) -> bool,
+        batch_max_u: u64,
+        gs: &[Range<usize>],
+    ) {
+        let entry = |pos: usize| &layout.entries[order[pos]];
+        let is_file = |e: &Entry| e.kind == Kind::File && e.size > 0;
+        let tally = |g: &Range<usize>| {
+            g.clone()
+                .map(entry)
+                .filter(|e| is_file(e))
+                .fold((0u64, 0usize), |(b, f), e| (b + e.size, f + 1))
+        };
+        assert_eq!(gs.is_empty(), order.is_empty());
+        let mut next = 0;
+        for (k, g) in gs.iter().enumerate() {
+            assert_eq!(g.start, next, "groups leave a gap or overlap: {gs:?}");
+            assert!(g.end > g.start, "empty group");
+            next = g.end;
+            if g.clone().any(|p| punch(entry(p))) {
+                assert_eq!(g.len(), 1, "a punch-mode entry shares group {g:?}");
+                continue;
+            }
+            let (bytes, files) = tally(g);
+            assert!(files <= GROUP_MAX_FILES, "group {g:?} has {files} files");
+            assert!(
+                files <= 1 || bytes <= batch_max_u,
+                "group {g:?} holds {bytes} > {batch_max_u}"
+            );
+            if let Some(h) = gs.get(k + 1) {
+                let e = entry(h.start);
+                if !punch(e) {
+                    assert!(
+                        is_file(e) && (bytes + e.size > batch_max_u || files >= GROUP_MAX_FILES),
+                        "group {g:?} was cut before {h:?} without need"
+                    );
+                }
+            }
+        }
+        assert_eq!(next, order.len());
+    }
+
+    /// Replay `consume_zip` (from `archive_len`) and return its highest occupancy: the
+    /// archive's allocated bytes, plus every output this run allocates (rounded up to whole
+    /// clusters), plus per-entry metadata when this run creates the entries.
+    fn simulate(c: &Case, rng: &mut Rng) -> u64 {
+        let layout = &c.layout;
+        let cluster = c.params.cluster_size.max(1);
+        let order = schedule(layout);
+        let after = ends_after(layout, &order);
+        let punch = |e: &Entry| should_punch(layout, e, &c.opts, c.can_dealloc);
+        let gs = groups(&order, layout, &punch, c.opts.space.batch_max_u);
+        check_groups(&order, layout, &punch, c.opts.space.batch_max_u, &gs);
+
+        let mut disk = Disk {
+            len: c.archive_len,
+            holes: Vec::new(),
+        };
+        let meta = if c.archive_len == layout.file_len {
+            layout.entries.len() as u64 * c.params.per_entry_overhead
+        } else {
+            0
+        };
+        let mut out = 0u64;
+        let mut peak = disk.occupied() + meta;
+        let all_max = order.first().map_or(0, |&i| layout.entries[i].region_end);
+        if disk.len > all_max {
+            disk.truncate(all_max);
+        }
+        for g in &gs {
+            for &i in &order[g.clone()] {
+                let e = &layout.entries[i];
+                if e.region_end > disk.len || e.kind != Kind::File || e.size == 0 {
+                    continue;
+                }
+                if punch(e) {
+                    // Output grows (preallocated as written); at each checkpoint the compressed
+                    // bytes consumed so far, from the local header on, are deallocated.
+                    let every = c.opts.zip.checkpoint_every.max(1);
+                    let (mut done, mut last_ck, mut last_in) = (0u64, 0u64, 0u64);
+                    while done < e.size {
+                        let step = match e.method {
+                            Method::Stored => 1 << 20,
+                            Method::Deflate => between(rng, 1, c.max_block),
+                        };
+                        done += step.min(e.size - done);
+                        if done == e.size || done - last_ck < every {
+                            continue;
+                        }
+                        let even = u64::try_from(
+                            u128::from(done) * u128::from(e.compressed_size) / u128::from(e.size),
+                        )
+                        .unwrap();
+                        let input = match (e.method, c.spread) {
+                            (Method::Stored, _) => done,
+                            (_, Spread::Even) => even,
+                            (_, Spread::Skewed) => between(rng, last_in, e.compressed_size),
+                        };
+                        peak = peak.max(disk.occupied() + meta + out + round_up(done, cluster));
+                        disk.deallocate(e.region_start, e.data_offset + input, c.gran);
+                        (last_ck, last_in) = (done, input);
+                    }
+                }
+                out += round_up(e.size, cluster);
+                peak = peak.max(disk.occupied() + meta + out);
+            }
+            // The group is flushed, then released with one truncation.
+            let target = after[g.end - 1];
+            if target < disk.len {
+                disk.truncate(target);
+            }
+        }
+        peak
+    }
+
+    fn run_case(seed: u64, make: fn(&mut Rng) -> Case) {
+        let mut rng = Rng::new(seed);
+        let c = make(&mut rng);
+        let sp = zip_space(
+            &c.layout,
+            c.archive_len,
+            &c.opts,
+            c.can_dealloc,
+            c.gran,
+            &c.params,
+        );
+        assert!(sp.consume_peak <= sp.consume_peak_guaranteed);
+        assert_eq!(
+            sp.consume_extra,
+            sp.consume_peak.saturating_sub(c.archive_len)
+        );
+        let peak = simulate(&c, &mut rng);
+        let ctx = || {
+            format!(
+                "seed {seed}: {} entries, archive {} of {}, dealloc {} gran {}, {:?}, {:?}, {:?}",
+                c.layout.entries.len(),
+                c.archive_len,
+                c.layout.file_len,
+                c.can_dealloc,
+                c.gran,
+                c.spread,
+                c.opts.zip,
+                c.params
+            )
+        };
+        assert!(
+            peak <= sp.consume_peak_guaranteed,
+            "simulated peak {peak} > guaranteed {}; {}",
+            sp.consume_peak_guaranteed,
+            ctx()
+        );
+        if c.spread == Spread::Even {
+            assert!(
+                peak <= sp.consume_peak,
+                "simulated peak {peak} > planned {}; {}",
+                sp.consume_peak,
+                ctx()
+            );
+        }
+    }
+
+    #[test]
+    fn zip_planner_never_underestimates_the_consume_peak() {
+        for seed in 0..2000 {
+            run_case(seed, random_case);
+        }
+    }
+
+    /// A few large, compressible entries consumed in punch mode with no allowances: the peak
+    /// is set by the punching itself, not by the initial archive length.
+    fn punch_case(rng: &mut Rng) -> Case {
+        let mut layout = random_layout(rng, false);
+        layout.entries.truncate(between(rng, 1, 3) as usize);
+        let mut pos = between(rng, 0, 1 << 20);
+        for e in &mut layout.entries {
+            e.kind = Kind::File;
+            e.method = if rng.below(4) == 0 {
+                Method::Stored
+            } else {
+                Method::Deflate
+            };
+            e.size = between(rng, 32 << 20, 1536 << 20);
+            e.compressed_size = match e.method {
+                Method::Stored => e.size,
+                Method::Deflate if rng.below(4) == 0 => e.size + e.size / between(rng, 64, 4096),
+                Method::Deflate => e.size / between(rng, 1, 1000),
+            };
+            let hdr = e.data_offset - e.region_start;
+            let dd = pick(rng, &[0, 12, 16, 24]);
+            e.region_start = pos;
+            e.data_offset = pos + hdr;
+            e.region_end = e.data_offset + e.compressed_size + dd;
+            pos = e.region_end;
+        }
+        layout.cd_start = pos;
+        layout.file_len = pos + 22 + 100 * layout.entries.len() as u64;
+        let params = SpaceParams {
+            cluster_size: pick(rng, &[1, 512, 4096, 65536]),
+            per_entry_overhead: 0,
+            margin_fixed: 0,
+            margin_ppm: 0,
+            batch_max_u: pick(rng, &[1, u64::MAX]),
+        };
+        let opts = ConsumeOptions {
+            space: params,
+            zip: ZipOptions {
+                allow_overlap: false,
+                punch: PunchPolicy::Auto,
+                punch_min: 0,
+                checkpoint_every: pick(rng, &[1 << 20, 8 << 20, 64 << 20]),
+            },
+            ..ConsumeOptions::default()
+        };
+        Case {
+            archive_len: layout.file_len,
+            layout,
+            opts,
+            can_dealloc: true,
+            gran: pick(rng, &[1, 512, 4096, 65536]),
+            params,
+            max_block: pick(rng, &[64 << 10, 1 << 20, BLOCK_SLACK]),
+            spread: Spread::Even,
+        }
+    }
+
+    #[test]
+    fn zip_planner_holds_in_punch_mode() {
+        for seed in 0..2000 {
+            run_case(seed, punch_case);
+        }
+    }
+
+    /// Regression: deallocation frees only whole units inside `[region_start, upto)`, so a
+    /// partial unit stays allocated at *each* end. The punch estimate used to allow for one
+    /// unit, which a deflate entry whose region starts just past a unit boundary and whose
+    /// last checkpoint ends just before one exceeds by almost a whole unit.
+    #[test]
+    fn zip_punch_estimate_covers_partial_units_at_both_ends() {
+        const G: u64 = 64 << 10;
+        let hdr = 40;
+        // Deflate blocks (output bytes): one checkpoint after the first, then just under a
+        // checkpoint interval, then a last block of `BLOCK_SLACK`. Compression is even (ratio
+        // 1), so the input consumed at the checkpoint equals the output.
+        let first = PUNCH_E + G - (hdr + 2);
+        let size = first + (PUNCH_E - 1) + BLOCK_SLACK;
+        // A one-byte stub before the entry: the first unit is shared with it.
+        let (layout, opts, params) = one_punch_entry(1, hdr, size, 1);
+        let e = &layout.entries[0];
+
+        // Replay: the central directory goes, the first block is written and checkpointed (its
+        // input freed), then the rest of the entry is written.
+        let mut disk = Disk {
+            len: e.region_end,
+            holes: Vec::new(),
+        };
+        disk.deallocate(e.region_start, e.data_offset + first, G);
+        assert_eq!(
+            disk.occupied(),
+            e.region_end - (PUNCH_E - G),
+            "units [G, E) freed"
+        );
+        let peak = disk.occupied() + size;
+
+        let sp = zip_space(&layout, layout.file_len, &opts, true, G, &params);
+        assert!(
+            peak <= sp.consume_peak,
+            "peak {peak} > planned {} (short by {})",
+            sp.consume_peak,
+            peak - sp.consume_peak
+        );
+    }
+
+    /// Regression: at a checkpoint the output is allocated up to a whole cluster past its
+    /// written length, more than the rounding of its final size allows when that size is a
+    /// multiple of the cluster. Shown with a checkpoint just before the end of the entry and
+    /// no deallocation rounding at all.
+    #[test]
+    fn zip_punch_estimate_covers_the_output_cluster_at_a_checkpoint() {
+        const CL: u64 = 64 << 10;
+        let hdr = 40;
+        // Blocks: B1 (checkpoint), just under an interval, `BLOCK_SLACK` (checkpoint), then a
+        // last block of 1000 bytes. B1 is chosen so the size is a multiple of the cluster.
+        let size = 97 * CL;
+        let rest = 1000;
+        let b1 = size - rest - (PUNCH_E - 1) - BLOCK_SLACK;
+        assert!((PUNCH_E..=BLOCK_SLACK).contains(&b1));
+        let (layout, opts, params) = one_punch_entry(0, hdr, size, CL);
+        let e = &layout.entries[0];
+
+        // At the second checkpoint, before its release: input up to B1 is gone, output is at
+        // `size - rest`, which occupies `size` bytes.
+        let mut disk = Disk {
+            len: e.region_end,
+            holes: Vec::new(),
+        };
+        disk.deallocate(e.region_start, e.data_offset + b1, 1);
+        let peak = disk.occupied() + round_up(size - rest, CL);
+
+        let sp = zip_space(&layout, layout.file_len, &opts, true, 1, &params);
+        assert!(
+            peak <= sp.consume_peak,
+            "peak {peak} > planned {} (short by {})",
+            sp.consume_peak,
+            peak - sp.consume_peak
+        );
+    }
+
+    /// Checkpoint interval of the regression tests.
+    const PUNCH_E: u64 = 1 << 20;
+
+    /// A ZIP holding one deflate entry (compressed size = size) at `region_start`, set up to be
+    /// consumed in punch mode with no allowances.
+    fn one_punch_entry(
+        region_start: u64,
+        hdr: u64,
+        size: u64,
+        cluster: u64,
+    ) -> (Layout, ConsumeOptions, SpaceParams) {
+        let e = Entry {
+            name: "big".into(),
+            kind: Kind::File,
+            method: Method::Deflate,
+            crc32: 0,
+            compressed_size: size,
+            size,
+            region_start,
+            data_offset: region_start + hdr,
+            region_end: region_start + hdr + size,
+            mode: None,
+            mtime_unix: 0,
+        };
+        let layout = Layout {
+            file_len: e.region_end + 46 + 3 + 22,
+            cd_start: e.region_end,
+            entries: vec![e],
+            overlaps: Vec::new(),
+        };
+        let params = SpaceParams {
+            cluster_size: cluster,
+            per_entry_overhead: 0,
+            margin_fixed: 0,
+            margin_ppm: 0,
+            batch_max_u: u64::MAX,
+        };
+        let opts = ConsumeOptions {
+            space: params,
+            zip: ZipOptions {
+                punch_min: 0,
+                checkpoint_every: PUNCH_E,
+                ..ZipOptions::default()
+            },
+            ..ConsumeOptions::default()
+        };
+        assert!(should_punch(&layout, &layout.entries[0], &opts, true));
+        (layout, opts, params)
+    }
 }
