@@ -18,6 +18,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use trunc_core::path::CaseMode;
 use trunc_core::space::SpaceParams;
 use trunc_fs::{Dealloc, FileHandle, FsBackend, FsError, NodeKind, OpenMode, Share};
 use trunc_journal::Journal;
@@ -86,8 +87,9 @@ const PREAMBLE_MAGIC: &[u8; 5] = b"TZJP1";
 pub(crate) struct Format<'a> {
     /// First bytes of the journal preamble; tells the formats' journals apart.
     pub magic: &'static [u8; 5],
-    /// Parse the archive into a layout with every entry's CRC-32 known (fresh starts only).
-    pub scan: &'a dyn Fn(&dyn FileHandle) -> Result<Layout>,
+    /// Parse the archive into a layout with every entry's CRC-32 known (fresh starts only),
+    /// comparing names as the destination does.
+    pub scan: &'a dyn Fn(&dyn FileHandle, CaseMode) -> Result<Layout>,
     /// Refusal for overlapping entries without `--allow-overlap`, given their count.
     pub overlap_refusal: &'a dyn Fn(usize) -> String,
 }
@@ -795,8 +797,9 @@ pub fn consume_zip(
 ) -> Result<ConsumeSummary> {
     let format = Format {
         magic: PREAMBLE_MAGIC,
-        scan: &|h| {
-            zip::parse(h).map_err(|e| Error::Input(format!("{}: {e}", archive_path.display())))
+        scan: &|h, case| {
+            zip::parse_with(h, case)
+                .map_err(|e| Error::Input(format!("{}: {e}", archive_path.display())))
         },
         overlap_refusal: &|n| {
             format!(
@@ -875,7 +878,10 @@ pub(crate) fn consume_layout(
             (pre, j, latest.and_then(|b| EntryCkpt::decode(&b)))
         }
         None => {
-            let layout = (format.scan)(handle.as_ref())?;
+            // A resume needs no probe: these names were checked against this destination
+            // before the journal existed.
+            let case = crate::stage::dest_case(fs, &dest)?;
+            let layout = (format.scan)(handle.as_ref(), case)?;
             if !layout.overlaps.is_empty() && !opts.zip.allow_overlap {
                 return Err(Error::Refused((format.overlap_refusal)(
                     layout.overlaps.len(),
@@ -1192,8 +1198,9 @@ pub fn extract_zip(
     overwrite: bool,
 ) -> Result<ConsumeSummary> {
     let h = crate::source::open_read(fs, archive)?;
-    let layout =
-        zip::parse(h.as_ref()).map_err(|e| Error::Input(format!("{}: {e}", archive.display())))?;
+    let case = crate::stage::dest_case(fs, dest)?;
+    let layout = zip::parse_with(h.as_ref(), case)
+        .map_err(|e| Error::Input(format!("{}: {e}", archive.display())))?;
     if !layout.overlaps.is_empty() {
         return Err(Error::Refused(format!(
             "{} entries overlap (a zip-bomb technique)",

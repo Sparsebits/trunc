@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{FileHandle, FsBackend};
 use trunc_journal::Journal;
 use trunc_legacy::tar;
@@ -43,10 +44,11 @@ pub fn journal_path(archive: &Path) -> PathBuf {
     zipconsume::journal_path(archive)
 }
 
-/// Describe a plain tar as a layout of stored entries.
-fn layout_of(h: &dyn FileHandle, what: &str) -> Result<TarFile> {
+/// Describe a plain tar as a layout of stored entries, comparing names as `case` says the
+/// destination does.
+fn layout_of(h: &dyn FileHandle, what: &str, case: CaseMode) -> Result<TarFile> {
     let file_len = h.size()?;
-    let entries = crate::image::index_tar(h, file_len, what)?;
+    let entries = crate::image::index_tar(h, file_len, what, case)?;
     let mut out = Vec::with_capacity(entries.len());
     let mut specials = 0usize;
     let mut prev_end = 0u64;
@@ -62,7 +64,8 @@ fn layout_of(h: &dyn FileHandle, what: &str) -> Result<TarFile> {
             }
             tar::Kind::HardLink(_) => {
                 return Err(crate::Error::Refused(format!(
-                    "{what}: hard link {:?}; hard links in uncompressed tar archives are not                      supported yet",
+                    "{what}: hard link {:?}; hard links in uncompressed tar archives are not \
+                     supported yet",
                     e.name
                 )));
             }
@@ -98,15 +101,19 @@ fn layout_of(h: &dyn FileHandle, what: &str) -> Result<TarFile> {
     })
 }
 
-fn parse(fs: &dyn FsBackend, archive: &Path) -> Result<(Box<dyn FileHandle>, TarFile)> {
+fn parse(
+    fs: &dyn FsBackend,
+    archive: &Path,
+    case: CaseMode,
+) -> Result<(Box<dyn FileHandle>, TarFile)> {
     let h = crate::source::open_read(fs, archive)?;
-    let t = layout_of(h.as_ref(), &archive.display().to_string())?;
+    let t = layout_of(h.as_ref(), &archive.display().to_string(), case)?;
     Ok((h, t))
 }
 
 /// Parse a plain tar for inspection or planning.
 pub fn open_tar(fs: &dyn FsBackend, archive: &Path) -> Result<TarFile> {
-    parse(fs, archive).map(|(_, t)| t)
+    parse(fs, archive, CaseMode::host()).map(|(_, t)| t)
 }
 
 fn overlap_refusal(n: usize) -> String {
@@ -127,8 +134,8 @@ pub fn consume_tar(
     let specials = std::cell::Cell::new(0usize);
     let format = Format {
         magic: PREAMBLE_MAGIC,
-        scan: &|h| {
-            let t = layout_of(h, &what)?;
+        scan: &|h, case| {
+            let t = layout_of(h, &what, case)?;
             specials.set(t.specials_skipped);
             crate::isoconsume::checksummed(h, t.layout, parallel)
         },
@@ -147,7 +154,7 @@ pub fn extract_tar(
     dest: &Path,
     overwrite: bool,
 ) -> Result<ConsumeSummary> {
-    let (h, t) = parse(fs, archive)?;
+    let (h, t) = parse(fs, archive, crate::stage::dest_case(fs, dest)?)?;
     let mut s = zipconsume::extract_layout(fs, h.as_ref(), &t.layout, dest, overwrite, false)?;
     s.specials_skipped = t.specials_skipped;
     Ok(s)

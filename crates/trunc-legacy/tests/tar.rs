@@ -424,3 +424,34 @@ fn safe_names_reader_compares_exactly_and_keeps_safety() {
         );
     }
 }
+
+/// The case mode decides the duplicate and nesting checks and how a hard link's target is
+/// found: one key for all three.
+#[test]
+fn case_mode_keys_duplicates_nesting_and_link_targets() {
+    use trunc_core::path::CaseMode;
+    let parse_with = |tar: &[u8], case: CaseMode| {
+        let mut r = Reader::with_case(case);
+        r.feed(tar)?;
+        r.finish()
+    };
+    let twins = tarbuild::tar(&[Spec::file("A.txt", b"1"), Spec::file("a.txt", b"2")]);
+    let nested = tarbuild::tar(&[Spec::file("x", b"1"), Spec::file("X/y", b"2")]);
+    for tar in [&twins, &nested] {
+        assert!(parse_with(tar, CaseMode::Sensitive).is_ok());
+        assert!(matches!(
+            parse_with(tar, CaseMode::Insensitive),
+            Err(TarError::Name { .. })
+        ));
+    }
+    let link = tarbuild::tar(&[
+        Spec::file("Dir/A.txt", b"1"),
+        Spec::hardlink("l", "dir/a.txt"),
+    ]);
+    let e = parse_with(&link, CaseMode::Insensitive).unwrap();
+    assert_eq!(e[1].kind, Kind::HardLink(0));
+    assert!(parse_with(&link, CaseMode::Sensitive).is_err());
+    // The safe-names reader (image layers) always compares exactly.
+    let mut r = Reader::with_safe_names();
+    assert!(r.feed(&link).and_then(|()| r.finish()).is_err());
+}

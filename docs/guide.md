@@ -193,7 +193,7 @@ Smaller blocks (`--block-size 4M`) mean less extra space during `--consume`; lar
 `.trnc` archives only hold names that work on Windows, macOS and Linux. Archives from other tools often don't: Linux tarballs contain names with backslashes or colons, and source trees have files that differ only in case (`Makefile` and `makefile`). For tar, ZIP, ISO, single compressed files and container images, trunc follows the computer it runs on:
 
 - On Linux and macOS, names that only Windows forbids are accepted: `\`, `:`, `<>"|?*`, trailing dots or spaces, and device names like `CON`.
-- On Linux, names that differ only in case are separate files. macOS compares names without case, like Windows, so there the second one is refused.
+- On Linux, names that differ only in case are separate files. macOS compares names without case, like Windows, so there the second one is refused. A Linux destination that folds case (a `casefold` folder, a mounted NTFS, FAT or exFAT volume, an SMB share) is detected before the scan and treated the same way. Container images skip such twins and list them instead of refusing.
 - On Windows, the portable rules apply.
 
 A name the computer cannot hold is refused before anything is written. Names that could reach outside the destination (`..`, absolute paths, `C:` prefixes, control characters) are refused everywhere.

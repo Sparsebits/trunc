@@ -15,6 +15,7 @@ use trunc_testkit::imagebuild::{
 };
 use trunc_testkit::tarbuild::{self, Spec};
 use trunc_testkit::tree::{Node, snapshot};
+use trunc_testkit::{CrashModel, FaultFs};
 
 fn opts() -> ImageOptions {
     ImageOptions::default()
@@ -705,5 +706,86 @@ fn stale_temp_copies_are_removed_unless_in_use() {
         let found = image::stale_temp_files(&fs, t.path());
         assert_eq!(found, vec![(busy.clone(), false)]);
         drop(h);
+    }
+}
+
+/// Paths that differ only in case, in one layer or across layers, are left out and reported
+/// when the destination folds case (a `casefold` or NTFS folder on Linux, found by probing),
+/// and extracted where it does not (on Linux; Windows and macOS always compare
+/// case-insensitively). A whiteout that names a path only up to case is refused there.
+#[test]
+fn case_insensitive_destinations_are_found_up_front() {
+    let one = vec![ib::layer(
+        &[
+            Spec::file("etc/A.txt", b"upper"),
+            Spec::file("etc/a.txt", b"lower"),
+            Spec::file("etc/keep", b"k"),
+        ],
+        Compression::None,
+    )];
+    let two = vec![
+        ib::layer(
+            &[
+                Spec::file("etc/A.txt", b"upper"),
+                Spec::file("etc/keep", b"k"),
+            ],
+            Compression::None,
+        ),
+        ib::layer(&[Spec::file("etc/a.txt", b"lower")], Compression::Gzip),
+    ];
+    for ls in [one, two] {
+        let bytes = ib::oci_archive(&[("linux/amd64", ls)]);
+        for folds in [true, false] {
+            let skips = folds || cfg!(any(windows, target_os = "macos"));
+            let fs = FaultFs::new(CrashModel::WriteThrough);
+            fs.set_case_insensitive(folds);
+            fs.put_file(Path::new("/img.tar"), &bytes);
+            let s = image::extract_image(
+                &fs,
+                Path::new("/img.tar"),
+                Path::new("/root"),
+                &opts(),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            let skipped: Vec<&str> = s.skipped.iter().map(|k| k.path.as_str()).collect();
+            let mut want = vec!["img.tar", "root", "root/etc", "root/etc/keep"];
+            if skips {
+                assert_eq!(skipped, ["etc/A.txt", "etc/a.txt"], "folds={folds}");
+            } else {
+                assert!(skipped.is_empty(), "folds={folds}: {skipped:?}");
+                want.extend(["root/etc/A.txt", "root/etc/a.txt"]);
+                want.sort_unstable();
+            }
+            assert_eq!(fs.snapshot().keys().collect::<Vec<_>>(), want);
+        }
+    }
+
+    // `.wh.foo` does not delete `Foo` where names fold case: refused before anything is written.
+    let wh = vec![
+        ib::layer(&[Spec::file("etc/Foo", b"f")], Compression::None),
+        ib::layer(&[Spec::file("etc/.wh.foo", b"")], Compression::None),
+    ];
+    let bytes = ib::oci_archive(&[("linux/amd64", wh)]);
+    for folds in [true, false] {
+        let refuses = folds || cfg!(any(windows, target_os = "macos"));
+        let fs = FaultFs::new(CrashModel::WriteThrough);
+        fs.set_case_insensitive(folds);
+        fs.put_file(Path::new("/img.tar"), &bytes);
+        let r = image::extract_image(
+            &fs,
+            Path::new("/img.tar"),
+            Path::new("/root"),
+            &opts(),
+            &mut |_| Ok(()),
+        );
+        assert_eq!(r.is_err(), refuses, "folds={folds}: {r:?}");
+        if refuses {
+            assert!(format!("{:?}", r.unwrap_err()).contains("differ only in case"));
+            assert_eq!(
+                fs.snapshot().keys().collect::<Vec<_>>(),
+                ["img.tar", "root"]
+            );
+        }
     }
 }

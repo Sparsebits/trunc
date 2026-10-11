@@ -135,6 +135,31 @@ fn a_file_where_a_directory_goes_is_refused() {
     assert!(matches!(e, Error::Refused(_)), "{e}");
 }
 
+/// Names that differ only in case are refused before anything is written when the destination
+/// folds case (a `casefold` or NTFS folder on Linux), and extracted where it does not (on Linux;
+/// Windows and macOS always compare case-insensitively).
+#[test]
+fn case_insensitive_destinations_are_found_up_front() {
+    let items = vec![
+        Item7::file("A.txt", b"upper"),
+        Item7::file("a.txt", b"lower"),
+    ];
+    let bytes = build(&items, &Opts7::default());
+    for folds in [true, false] {
+        let refused = folds || cfg!(any(windows, target_os = "macos"));
+        let fs = setup(&bytes);
+        fs.set_case_insensitive(folds);
+        let r = extract(&fs, false);
+        assert_eq!(r.is_err(), refused, "folds={folds}: {r:?}");
+        if refused {
+            assert!(matches!(r, Err(Error::Input(_))), "{r:?}");
+            assert_eq!(fs.snapshot().keys().collect::<Vec<_>>(), vec!["a.7z"]);
+        } else {
+            assert_eq!(out_tree(&fs), expected(&items));
+        }
+    }
+}
+
 #[test]
 fn hostile_names_are_refused_before_writing() {
     let items = vec![Item7::file("ok", b"fine"), Item7::file("../evil", b"x")];

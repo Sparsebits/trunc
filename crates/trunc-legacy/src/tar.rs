@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use trunc_core::path::CaseMode;
 use unicode_normalization::UnicodeNormalization;
 
 pub const BLOCK: u64 = 512;
@@ -309,15 +310,17 @@ pub struct Reader {
     zero_blocks: u32,
     pending: Pending,
     entries: Vec<Entry>,
-    /// Entry index by name, as this computer compares names.
+    /// Entry index by name, under [`Reader::key`].
     seen: HashMap<String, usize>,
     deferred: Option<Box<Deferred>>,
     /// Sparse-map segments still accepted.
     sparse_left: usize,
     name_bytes: usize,
-    /// Names must be valid on this computer and are compared as it compares them; otherwise
-    /// only the safety rules apply and names are compared exactly.
+    /// Names must be valid on this computer; otherwise only the safety rules apply.
     host_names: bool,
+    /// How names are compared for the duplicate, nesting and hard-link checks (exactly,
+    /// [`CaseMode::Sensitive`], without `host_names`).
+    case: CaseMode,
 }
 
 impl Default for Reader {
@@ -327,7 +330,13 @@ impl Default for Reader {
 }
 
 impl Reader {
+    /// A reader that validates names for extraction on this computer.
     pub fn new() -> Self {
+        Self::with_case(CaseMode::host())
+    }
+
+    /// A reader that validates names for a destination that compares them as `case` says.
+    pub fn with_case(case: CaseMode) -> Self {
         Self {
             pos: 0,
             state: State::Header,
@@ -340,6 +349,7 @@ impl Reader {
             sparse_left: MAX_SPARSE_SEGMENTS,
             name_bytes: 0,
             host_names: true,
+            case,
         }
     }
 
@@ -350,17 +360,13 @@ impl Reader {
     pub fn with_safe_names() -> Self {
         Self {
             host_names: false,
-            ..Self::new()
+            ..Self::with_case(CaseMode::Sensitive)
         }
     }
 
-    /// Key for the duplicate and nesting checks.
+    /// Key for the duplicate, nesting and hard-link checks.
     fn key(&self, name: &str) -> String {
-        if self.host_names {
-            trunc_core::path::host_key(name)
-        } else {
-            name.to_owned()
-        }
+        self.case.key(name)
     }
 
     /// Bytes of the stream consumed so far.
@@ -468,7 +474,7 @@ impl Reader {
         if self.pos == 0 {
             return Err(TarError::NotTar);
         }
-        check_nesting(&self.entries, &|n| self.key(n))?;
+        check_nesting(&self.entries, self.case)?;
         Ok(self.entries)
     }
 
@@ -614,12 +620,7 @@ impl Reader {
         if self.seen.contains_key(&key) {
             return Err(TarError::Name {
                 name,
-                reason: if self.host_names {
-                    DUPLICATE
-                } else {
-                    "duplicate entry"
-                }
-                .into(),
+                reason: duplicate(self.case).into(),
             });
         }
         if self.entries.len() >= MAX_ENTRIES {
@@ -979,14 +980,15 @@ fn number(f: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-/// Bytes up to the first NUL.
-/// Why a second entry with the same name (as this computer compares names) is refused.
-const DUPLICATE: &str = if cfg!(any(windows, target_os = "macos")) {
-    "duplicate entry (names differ only in case)"
-} else {
-    "duplicate entry"
-};
+/// Why a second entry with the same name (as the destination compares names) is refused.
+fn duplicate(case: CaseMode) -> &'static str {
+    match case {
+        CaseMode::Insensitive => "duplicate entry (names differ only in case)",
+        CaseMode::Sensitive => "duplicate entry",
+    }
+}
 
+/// Bytes up to the first NUL.
 fn cstr(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
@@ -1063,16 +1065,16 @@ fn parse_pax_time(v: &str) -> Option<(i64, u32)> {
 }
 
 /// No entry may live under a file entry ("a" plus "a/b").
-fn check_nesting(entries: &[Entry], key: &dyn Fn(&str) -> String) -> Result<()> {
+fn check_nesting(entries: &[Entry], case: CaseMode) -> Result<()> {
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| key(&e.name))
+        .map(|e| case.key(&e.name))
         .collect();
     for e in entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&key(pp)) {
+            if files.contains(&case.key(pp)) {
                 return Err(TarError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),
