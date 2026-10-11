@@ -1,6 +1,6 @@
 # Journal format, version 1 (`<archive>.trncj`)
 
-Status: implemented in `trunc-journal`. Used by ZIP consumption (ADR-0008) and by consumption of compressed tarballs and files (ADR-0011, ADR-0012, ADR-0013). Native `.trnc` consumption needs no journal (ADR-0007).
+Status: implemented in `trunc-journal`. Used by ZIP consumption (ADR-0008), ISO 9660 image consumption (ADR-0015) and consumption of compressed tarballs and files (ADR-0011, ADR-0012, ADR-0013). Native `.trnc` consumption needs no journal (ADR-0007).
 
 The journal holds one immutable **preamble** and a **latest checkpoint**. An append-only log was considered (the earlier draft) and rejected: punch mode writes a ~33 KiB checkpoint every 64 MiB of output, so a log would grow without bound on large entries.
 
@@ -24,6 +24,7 @@ SLOT B        same
 
 - **Preamble:** `"TZJP1"` | archive id [16] | original length u64 | file id (volume u64, file u128) | destination (u32 length + UTF-8) | serialized ZIP layout.
 - **Slot:** entry index u32 | inflate checkpoint (bit position u64, output total u64, CRC u32, window length u32, window).
+- **ISO 9660 images** use the same contents with the magic `"TIJP1"`. Their layout holds stored entries whose CRC-32s were computed from the image before the journal was created. Each consumer refuses a journal with the other's magic, so a ZIP journal is never resumed as an ISO one or the other way round.
 
 ## Contents for compressed tarballs and files
 
