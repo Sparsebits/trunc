@@ -89,9 +89,7 @@ pub fn resolve(inputs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
         let Some(name) = f.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
             bail!("{}: file name is not valid UTF-8", f.display());
         };
-        if let Some(prev) = by_name.get(&name)
-            && prev != &f
-        {
+        if let Some(prev) = by_name.get(&name).filter(|prev| *prev != &f) {
             bail!(
                 "{name} is named twice ({} and {}); shards must have distinct names",
                 prev.display(),

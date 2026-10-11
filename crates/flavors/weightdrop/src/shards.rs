@@ -113,10 +113,11 @@ fn parse(name: &str) -> Option<Parsed> {
         suffix,
         stem: stem.to_owned(),
     };
-    if let Some((rest, total)) = trailing_digits(stem)
-        && let Some(rest) = rest.strip_suffix("-of-").or(rest.strip_suffix("_of_"))
-        && let Some((prefix, index)) = trailing_digits(rest)
-    {
+    let of_total = trailing_digits(stem).and_then(|(rest, total)| {
+        let rest = rest.strip_suffix("-of-").or(rest.strip_suffix("_of_"))?;
+        trailing_digits(rest).map(|(prefix, index)| (prefix, index, total))
+    });
+    if let Some((prefix, index, total)) = of_total {
         p.prefix = strip_sep(prefix).to_owned();
         p.index = index.parse().ok();
         p.total = total.parse().ok();
@@ -250,9 +251,7 @@ fn check_numbering(prefix: &str, total: Option<u64>, shards: &[Shard]) -> Result
         Some(t) => (1, t),
         None => (first, last),
     };
-    if let Some(t) = total
-        && last > hi
-    {
+    if let Some(t) = total.filter(|_| last > hi) {
         return Err(format!(
             "set {prefix:?}: shard {last} is past the total of {t}"
         ));

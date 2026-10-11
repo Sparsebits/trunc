@@ -447,9 +447,8 @@ pub fn unpack(opts: &UnpackOptions, events: &mut dyn FnMut(Event)) -> Result<Unp
             }
         },
     };
-    if st.as_ref().is_some_and(|s| s.layout == Layout::Flat)
-        && let Some((name, a, b)) = first_clash(&per_shard)
-    {
+    let flat = st.as_ref().is_some_and(|s| s.layout == Layout::Flat);
+    if let Some((name, a, b)) = first_clash(&per_shard).filter(|_| flat) {
         bail!("{a} and {b} both contain {name:?}; nothing more was changed");
     }
 
