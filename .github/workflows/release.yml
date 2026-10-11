@@ -31,6 +31,8 @@ jobs:
       matrix:
         include:
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          # Cross-compiled on the x64 runner, whose Visual Studio has the ARM64 build tools.
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest }
     runs-on: ${{ matrix.os }}
@@ -68,8 +70,9 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then build=zigbuild; else build=build; fi
           cargo $build --locked --profile dist --target ${{ matrix.target }} -p trunc-cli
 
+      # The aarch64 binaries are cross-compiled and cannot run on these x64 runners.
       - name: smoke test
-        if: matrix.target != 'aarch64-unknown-linux-musl'
+        if: ${{ !startsWith(matrix.target, 'aarch64-') }}
         shell: bash
         run: |
           bin="$PWD/target/${{ matrix.target }}/dist/trunc"
@@ -168,6 +171,13 @@ jobs:
         with:
           subject-path: dist/trunc-x86_64-pc-windows-msvc.zip
           sbom-path: dist/trunc-x86_64-pc-windows-msvc.cdx.json
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: ${{ !github.event.repository.private }}
+        env:
+          NODE_OPTIONS: --max-http-header-size=32768 # as the attest-* wrapper actions set it
+        with:
+          subject-path: dist/trunc-aarch64-pc-windows-msvc.zip
+          sbom-path: dist/trunc-aarch64-pc-windows-msvc.cdx.json
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         if: ${{ !github.event.repository.private }}
         env:

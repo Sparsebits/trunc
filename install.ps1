@@ -1,4 +1,4 @@
-# Install trunc from its GitHub releases (Windows x64; also runs on ARM64 under emulation).
+# Install trunc from its GitHub releases (Windows x64 and ARM64).
 #
 #   powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Sparsebits/trunc/main/install.ps1 | iex"
 #
@@ -23,28 +23,60 @@ $version = if ($env:TRUNC_VERSION) { $env:TRUNC_VERSION } else { 'latest' }
 $dir = if ($env:TRUNC_INSTALL_DIR) { $env:TRUNC_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\trunc' }
 $attest = if ($env:TRUNC_VERIFY_ATTESTATION) { $env:TRUNC_VERIFY_ATTESTATION } else { 'auto' }
 
-if (@('AMD64', 'ARM64') -notcontains $env:PROCESSOR_ARCHITECTURE) {
-    throw "trunc-install: unsupported CPU $env:PROCESSOR_ARCHITECTURE"
-}
-# There is no native ARM64 build yet. Windows 11 on ARM runs x64 programs; Windows 10 on ARM
-# does not.
-if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -and [Environment]::OSVersion.Version.Build -lt 22000) {
-    throw "trunc-install: Windows 10 on ARM cannot run the x64 build; build from source with cargo"
-}
 if (@('0', '1', 'auto') -cnotcontains $attest) {
     throw "trunc-install: TRUNC_VERIFY_ATTESTATION must be 0, 1 or auto, not '$attest'"
 }
-$name = 'trunc-x86_64-pc-windows-msvc'
-$asset = "$name.zip"
-$url = if ($version -eq 'latest') { "$base/latest/download/$asset" } else { "$base/download/$version/$asset" }
+
+# The machine's CPU, not this process's: PowerShell itself may be running as x64 under emulation
+# on ARM64 (where $env:PROCESSOR_ARCHITECTURE says AMD64), or as 32-bit on x64. The system-wide
+# value in the registry is the native one.
+$cpu = $env:PROCESSOR_ARCHITECTURE
+try {
+    $native = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+    if ($native) { $cpu = $native }
+}
+catch {}
+try { if ([string][Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { $cpu = 'ARM64' } } catch {}
+$cpu = "$cpu".ToUpperInvariant()
+
+# Release assets to try, in order. Releases before the native ARM64 build (v0.1.0) have only the
+# x64 one; Windows 11 on ARM runs it under emulation, Windows 10 on ARM cannot.
+$x64 = 'trunc-x86_64-pc-windows-msvc'
+$arm64 = 'trunc-aarch64-pc-windows-msvc'
+$names = @(switch ($cpu) {
+    'AMD64' { @($x64) }
+    'ARM64' { if ([Environment]::OSVersion.Version.Build -ge 22000) { @($arm64, $x64) } else { @($arm64) } }
+    default { throw "trunc-install: unsupported CPU $cpu" }
+})
+$release = if ($version -eq 'latest') { 'the latest release' } else { $version }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("trunc-install-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
-    Write-Host "trunc-install: downloading $url"
-    $zip = Join-Path $tmp $asset
-    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+    foreach ($name in $names) {
+        $asset = "$name.zip"
+        $url = if ($version -eq 'latest') { "$base/latest/download/$asset" } else { "$base/download/$version/$asset" }
+        $zip = Join-Path $tmp $asset
+        Write-Host "trunc-install: downloading $url"
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+            break
+        }
+        catch {
+            $status = $null
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($status -ne 404) { throw }
+            if ($name -ne $names[-1]) {
+                Write-Warning "trunc-install: $release has no native ARM64 build ($asset); installing the x64 build, which Windows 11 on ARM runs under emulation"
+                continue
+            }
+            if ($name -eq $arm64) {
+                throw "trunc-install: $release has no native ARM64 build ($asset), and Windows 10 on ARM cannot run the x64 build; install a newer release or build from source with cargo"
+            }
+            throw "trunc-install: $url was not found; check that $release is a trunc release"
+        }
+    }
     Invoke-WebRequest -UseBasicParsing -Uri "$url.sha256" -OutFile "$zip.sha256"
     $expected = ((Get-Content -Raw "$zip.sha256").Trim() -split '\s+')[0].ToLowerInvariant()
     $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
