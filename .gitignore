@@ -4,3 +4,8 @@
 /fuzz/artifacts
 *.spool
 *.partial
+# Local tool and editor state
+/.claude/
+.idea/
+.vscode/
+.DS_Store
