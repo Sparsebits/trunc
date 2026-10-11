@@ -24,6 +24,7 @@ use crate::zip::{Entry, Kind, Layout, Method};
 
 /// Logical block size: the only one supported (and the only one real images use).
 pub const SECTOR: u64 = 2048;
+const SECTOR_BYTES: usize = 2048;
 /// The volume descriptor set starts at sector 16, after the system area.
 const FIRST_DESCRIPTOR: u64 = 16;
 /// Volume descriptors read before giving up on finding the set terminator.
@@ -155,7 +156,7 @@ fn read_descriptors(src: &dyn FileHandle, file_len: u64) -> Result<Descriptors> 
         if !in_bounds(off, SECTOR, file_len) {
             break;
         }
-        let d = read(src, off, SECTOR as usize)?;
+        let d = read(src, off, SECTOR_BYTES)?;
         match &d[1..6] {
             b"CD001" => {}
             b"BEA01" | b"NSR02" | b"NSR03" | b"TEA01" => {
@@ -484,7 +485,7 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
         while p < buf.len() {
             if buf[p] == 0 {
                 // Records never cross a sector; the rest of this one is padding.
-                p = (p / SECTOR as usize + 1) * SECTOR as usize;
+                p = (p / SECTOR_BYTES + 1) * SECTOR_BYTES;
                 continue;
             }
             let r = record(&buf[p..])?;
@@ -658,7 +659,7 @@ fn rock_ridge(src: &dyn FileHandle, file_len: u64, root: &Record<'_>) -> Result<
     if !in_bounds(off, SECTOR, file_len) || root.size < 34 {
         return Err(corrupt("root directory lies outside the image"));
     }
-    let b = read(src, off, SECTOR as usize)?;
+    let b = read(src, off, SECTOR_BYTES)?;
     let dot = record(&b)?;
     if dot.name != [0] {
         return Ok(None);
