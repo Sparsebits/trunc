@@ -247,6 +247,8 @@ fn scan(fs: &OsFs, path: &Path, dest: &Path) -> Result<(Scanned, preflight::Volu
         can_dealloc,
         u64::from(vc.archive_volume.sparse_granularity.max(1)),
         &trunc_engine::source::part_sizes(fs, path)?,
+        // TODO: take this from the destination filesystem (FAT/exFAT copy hard links).
+        true,
         &params,
     );
     let space = ShardSpace {

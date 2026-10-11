@@ -666,13 +666,14 @@ fn run(
                 Kind::File => ItemKind::File,
                 Kind::Dir => ItemKind::Dir,
                 Kind::Symlink => ItemKind::Symlink,
-                Kind::Special => return None,
+                Kind::Special | Kind::HardLink(_) => return None,
             };
             let e = n.entry.as_ref();
             Some(Item {
                 path: n.name.clone(),
                 kind,
                 size: e.map_or(0, |e| e.size),
+                len: e.map_or(0, |e| e.size),
                 mode: e.and_then(|e| e.mode),
                 mtime_unix: e.map_or(0, |e| e.mtime_unix),
                 mtime_nanos: e.map_or(0, |e| e.mtime_nanos),
@@ -694,6 +695,7 @@ fn run(
         symlinks_skipped: count(ItemKind::Symlink),
         specials_skipped: m.tree.values().filter(|n| n.kind == Kind::Special).count(),
         stats: m.stats,
+        skipped: Vec::new(),
     };
     if tops.is_empty() {
         fs.remove_dir(stage)?;
