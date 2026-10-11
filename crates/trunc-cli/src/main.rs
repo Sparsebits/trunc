@@ -346,7 +346,7 @@ fn create(a: CreateArgs) -> Result<ExitCode> {
 fn extract(a: ExtractArgs) -> Result<ExitCode> {
     if image_cmd::detect(&a.archive, &a.stream) {
         image_cmd::refuse_flags(&a.trust.policy()?, a.allow_symlinks)?;
-        return image_cmd::extract(
+        match image_cmd::extract(
             &a.archive,
             &a.dest,
             a.consume,
@@ -355,7 +355,10 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
             &a.image,
             &a.stream,
             a.threads,
-        );
+        ) {
+            Err(e) if image_cmd::not_an_image(&e, &a.archive) => {}
+            r => return r,
+        }
     }
     if a.consume {
         if a.overwrite || a.allow_symlinks {
@@ -542,7 +545,10 @@ fn signer_line(archive: &Archive) -> String {
 
 fn inspect(a: InspectArgs) -> Result<ExitCode> {
     if image_cmd::detect(&a.archive, &a.stream) {
-        return image_cmd::inspect(&a.archive, a.entries, &a.image, &a.stream);
+        match image_cmd::inspect(&a.archive, a.entries, &a.image, &a.stream) {
+            Err(e) if image_cmd::not_an_image(&e, &a.archive) => {}
+            r => return r,
+        }
     }
     match Kind::detect(&a.archive, a.stream.raw) {
         Kind::Stream(..) => {
@@ -644,7 +650,10 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
 fn verify(a: VerifyArgs) -> Result<ExitCode> {
     if image_cmd::detect(&a.archive, &a.stream) {
         image_cmd::refuse_flags(&a.trust.policy()?, false)?;
-        return image_cmd::verify(&a.archive, &a.image, &a.stream, a.threads);
+        match image_cmd::verify(&a.archive, &a.image, &a.stream, a.threads) {
+            Err(e) if image_cmd::not_an_image(&e, &a.archive) => {}
+            r => return r,
+        }
     }
     let kind = Kind::detect(&a.archive, a.stream.raw);
     refuse_trust_flags(&a.trust.policy()?, kind)?;

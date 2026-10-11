@@ -20,8 +20,9 @@
 //! macOS) are left out of the tree after the merge and reported; see [`Skipped`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use trunc_fs::{Dealloc, FileHandle, FileId, FsBackend, FsError, NodeKind, OpenMode, Share};
 use trunc_hash::Sha256Hasher;
@@ -43,6 +44,14 @@ const MAX_JSON: u64 = 16 << 20;
 const MAX_INDEX_DEPTH: usize = 4;
 /// Decoded bytes looked at to recognise a compressed image tarball.
 const PEEK_BYTES: usize = 64 << 10;
+/// Largest metadata file decoded past [`PEEK_BYTES`] to confirm a compressed image tarball.
+const PEEK_META: u64 = 1 << 20;
+/// Most descriptors followed through an image's indexes.
+const MAX_DESCRIPTORS: usize = 4096;
+/// Free space left untouched by the temporary copy of a compressed outer tar.
+const TEMP_RESERVE: u64 = 64 << 20;
+/// Start of the error for archives that turn out not to be images (see [`is_not_an_image`]).
+const NOT_AN_IMAGE: &str = "not a container image";
 const READ_CHUNK: usize = 1 << 20;
 
 /// Settings for container images.
@@ -58,6 +67,8 @@ pub struct ImageOptions {
     pub max_window: u64,
     /// Decode threads (0: one per core).
     pub threads: usize,
+    /// Skip the free-space check for the temporary copy of a compressed outer tar.
+    pub ignore_space: bool,
 }
 
 impl ImageOptions {
@@ -380,25 +391,114 @@ pub(crate) fn index_tar(h: &dyn FileHandle, len: u64, what: &str) -> Result<Vec<
     r.finish().map_err(tar_err(what))
 }
 
+/// A temporary file, removed when dropped (on errors and panics too) unless removed already.
+struct TempFile<'a> {
+    fs: &'a dyn FsBackend,
+    path: PathBuf,
+    live: bool,
+}
+
+impl TempFile<'_> {
+    fn remove(mut self) -> Result<()> {
+        self.live = false;
+        Ok(self.fs.remove_file(&self.path)?)
+    }
+}
+
+impl Drop for TempFile<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            let _ = self.fs.remove_file(&self.path);
+        }
+    }
+}
+
+/// The indexed outer tar and its temporary decompressed copy, if any. Fields drop in order:
+/// the copy's handle is closed before the copy is removed.
+struct Opened<'a> {
+    outer: Outer,
+    temp: Option<TempFile<'a>>,
+}
+
+fn is_temp_name(n: &str) -> bool {
+    n.strip_prefix(".trunc-image-")
+        .and_then(|r| r.strip_suffix(".tar"))
+        .is_some_and(|h| h.len() == 16 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Temporary copies of compressed outer tars (`.trunc-image-<hex>.tar`) that an interrupted
+/// run left in `dir`, each with whether it was removed. A copy still in use is held
+/// exclusively by its run and so left alone; where that cannot be told (neither Windows nor
+/// Linux), nothing is removed.
+pub fn stale_temp_files(fs: &dyn FsBackend, dir: &Path) -> Vec<(PathBuf, bool)> {
+    let Ok(names) = fs.read_dir(dir) else {
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter(|n| is_temp_name(n))
+        .map(|n| {
+            let p = dir.join(n);
+            let removed = cfg!(any(windows, target_os = "linux"))
+                && fs
+                    .open(&p, OpenMode::ReadWrite, Share::Exclusive)
+                    .map(drop)
+                    .is_ok()
+                && fs.remove_file(&p).is_ok();
+            (p, removed)
+        })
+        .collect()
+}
+
 impl Outer {
     /// Open and index the outer tar. A compressed one is decompressed into a new file in
-    /// `temp_dir`, which `close` removes.
-    fn open(
-        fs: &dyn FsBackend,
+    /// `temp_dir`, removed when the result is dropped.
+    fn open<'a>(
+        fs: &'a dyn FsBackend,
         archive: &Path,
         temp_dir: &Path,
         opts: &ImageOptions,
-    ) -> Result<(Self, Option<PathBuf>)> {
+    ) -> Result<Opened<'a>> {
         let h = source::open_read(fs, archive)?;
         let file_len = h.size()?;
         let codec = Codec::sniff(&head(h.as_ref(), file_len)?);
         let what = archive.display().to_string();
         let Some(c) = codec else {
             let entries = index_tar(h.as_ref(), file_len, &what)?;
-            return Ok((Self::from_entries(h, &entries, None, file_len), None));
+            return Ok(Opened {
+                outer: Self::from_entries(h, &entries, None, file_len),
+                temp: None,
+            });
         };
-        let temp = temp_dir.join(format!(".trunc-image-{}.tar", random_hex()));
-        let out = fs.open(&temp, OpenMode::CreateNew, Share::Exclusive)?;
+        // The copy is at least about as large as the archive and may be much larger: refuse
+        // up front when even the archive's size does not fit, and stop decoding (rather than
+        // fill the volume) when the copy outgrows the free space.
+        let budget = match fs.probe_volume(temp_dir).ok().and_then(|v| v.free_bytes) {
+            Some(free) if !opts.ignore_space => free.saturating_sub(TEMP_RESERVE),
+            _ => u64::MAX,
+        };
+        let no_room = || {
+            Error::Refused(format!(
+                "not enough free space in {} for the decompressed copy of the archive that \
+                 reading a compressed image needs (about {} MiB usable); free some space, or \
+                 decompress the archive first (`trunc x --raw`)",
+                temp_dir.display(),
+                budget >> 20
+            ))
+        };
+        if file_len > budget {
+            return Err(no_room());
+        }
+        // The guard is declared before the handle, so on a panic too the handle is closed
+        // before the file is removed; it is armed only once the file is ours.
+        let mut temp = Some(TempFile {
+            fs,
+            path: temp_dir.join(format!(".trunc-image-{}.tar", random_hex())),
+            live: false,
+        });
+        let guard = temp.as_mut().expect("just set");
+        let out = fs.open(&guard.path, OpenMode::CreateNew, Share::Exclusive)?;
+        guard.live = true;
         let result = (|| -> Result<Vec<tar::Entry>> {
             let mut reader = tar::Reader::new();
             let mut at = 0u64;
@@ -410,6 +510,9 @@ impl Outer {
                 },
                 opts.limits(),
                 &mut |b| {
+                    if at.saturating_add(b.len() as u64) > budget {
+                        return Err(no_room());
+                    }
                     reader.feed(b).map_err(tar_err(&what))?;
                     out.write_all_at(b, at)?;
                     at += b.len() as u64;
@@ -419,13 +522,14 @@ impl Outer {
             reader.finish().map_err(tar_err(&what))
         })();
         match result {
-            Ok(entries) => Ok((
-                Self::from_entries(out, &entries, Some(c), file_len),
-                Some(temp),
-            )),
+            Ok(entries) => Ok(Opened {
+                outer: Self::from_entries(out, &entries, Some(c), file_len),
+                temp: temp.take(),
+            }),
             Err(e) => {
+                // Close the copy before the guard removes it.
                 drop(out);
-                let _ = fs.remove_file(&temp);
+                drop(temp);
                 Err(e)
             }
         }
@@ -472,15 +576,6 @@ impl Outer {
         let mut b = vec![0u8; usize::try_from(r.len).expect("bounded")];
         r.read_exact_at(&mut b, 0)?;
         Ok(Some(b))
-    }
-
-    fn read_json(&self, path: &str) -> Result<Option<Json>> {
-        match self.read_file(path)? {
-            None => Ok(None),
-            Some(b) => Json::parse(&b)
-                .map(Some)
-                .map_err(|e| Error::Input(format!("{path}: invalid JSON: {e}"))),
-        }
     }
 
     /// The JSON blob a descriptor points at, checked against its digest and size.
@@ -816,16 +911,46 @@ fn docker_candidates(j: &Json) -> Result<Vec<Candidate>> {
         .collect()
 }
 
+/// State of a walk through an OCI index: blobs already read (by digest, with their length),
+/// descriptors followed so far, and the candidates already found.
+#[derive(Default)]
+struct OciWalk {
+    blobs: HashMap<String, (u64, Rc<Json>)>,
+    descriptors: usize,
+    found: HashSet<(String, Option<String>, Option<String>)>,
+    out: Vec<Candidate>,
+}
+
+impl OciWalk {
+    /// The JSON blob `d` points at, read and checked once per digest.
+    fn blob(&mut self, outer: &Outer, d: &Descriptor) -> Result<Rc<Json>> {
+        if let Some((len, j)) = self.blobs.get(&d.digest) {
+            if let Some(size) = d.size.filter(|s| s != len) {
+                return Err(Error::Integrity(format!(
+                    "{}: {len} bytes, but its descriptor says {size}",
+                    blob_path(&d.digest)?
+                )));
+            }
+            return Ok(Rc::clone(j));
+        }
+        let path = blob_path(&d.digest)?;
+        let len = outer.files.get(&path).map_or(0, |&(_, len)| len);
+        let j = Rc::new(outer.read_blob_json(d)?);
+        self.blobs.insert(d.digest.clone(), (len, Rc::clone(&j)));
+        Ok(j)
+    }
+}
+
 /// Candidates reachable from an OCI index, following nested indexes. Manifests whose blob is
 /// not in the archive (other platforms of a multi-platform image that was saved for one) are
-/// left out.
+/// left out, and so are repeats of the same manifest, name and platform.
 fn oci_candidates(
     outer: &Outer,
     index: &Json,
     what: &str,
     inherited: Option<&str>,
     depth: usize,
-    out: &mut Vec<Candidate>,
+    walk: &mut OciWalk,
 ) -> Result<()> {
     if depth > MAX_INDEX_DEPTH {
         return Err(Error::Input(format!(
@@ -837,6 +962,12 @@ fn oci_candidates(
         .and_then(Json::arr)
         .ok_or_else(|| Error::Input(format!("{what}: no manifests list")))?;
     for m in list {
+        walk.descriptors += 1;
+        if walk.descriptors > MAX_DESCRIPTORS {
+            return Err(Error::Input(format!(
+                "{what}: the image indexes list more than {MAX_DESCRIPTORS} manifests"
+            )));
+        }
         let d = descriptor(m, what)?;
         if d.attestation {
             continue;
@@ -846,7 +977,7 @@ fn oci_candidates(
             continue;
         }
         let name = d.name.as_deref().or(inherited);
-        let blob = outer.read_blob_json(&d)?;
+        let blob = walk.blob(outer, &d)?;
         let mt = d
             .media_type
             .as_deref()
@@ -857,13 +988,20 @@ fn oci_candidates(
         let is_manifest =
             MANIFEST_TYPES.contains(&mt) || (mt.is_empty() && blob.get("layers").is_some());
         if is_index {
-            oci_candidates(outer, &blob, &path, name, depth + 1, out)?;
+            oci_candidates(outer, &blob, &path, name, depth + 1, walk)?;
         } else if is_manifest {
-            out.push(Candidate {
-                names: name.map(|n| vec![n.to_owned()]).unwrap_or_default(),
-                platform: d.platform.clone(),
-                kind: CandidateKind::Oci(blob),
-            });
+            let key = (
+                d.digest.clone(),
+                name.map(str::to_owned),
+                d.platform.clone(),
+            );
+            if walk.found.insert(key) {
+                walk.out.push(Candidate {
+                    names: name.map(|n| vec![n.to_owned()]).unwrap_or_default(),
+                    platform: d.platform.clone(),
+                    kind: CandidateKind::Oci(Json::clone(&blob)),
+                });
+            }
         } else {
             return Err(Error::Input(format!(
                 "{path}: unsupported manifest media type {mt:?}"
@@ -890,77 +1028,143 @@ fn diff_ids(config: &Json, what: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Whether `manifest.json` has the shape `docker save` writes: a non-empty array of objects
+/// with a `Config` path and a `Layers` list.
+fn docker_manifest_ok(j: &Json) -> bool {
+    j.arr().is_some_and(|a| {
+        !a.is_empty()
+            && a.iter().all(|m| {
+                m.get_str("Config").is_some() && m.get("Layers").and_then(Json::arr).is_some()
+            })
+    })
+}
+
+fn oci_layout_ok(j: &Json) -> bool {
+    j.get_str("imageLayoutVersion").is_some()
+}
+
+/// Whether `index.json` is an OCI index: a `manifests` list of descriptors.
+fn oci_index_ok(j: &Json) -> bool {
+    j.get("manifests")
+        .and_then(Json::arr)
+        .is_some_and(|a| a.iter().all(|d| d.get_str("digest").is_some()))
+}
+
+/// The image structure of the outer tar, if it has one: `manifest.json` (preferred: it carries
+/// the repository tags) or `oci-layout` with `index.json`.
+enum Structure {
+    Docker(Json),
+    Oci(Json),
+}
+
+fn structure(outer: &Outer) -> Option<Structure> {
+    let json = |name: &str| {
+        outer
+            .read_file(name)
+            .ok()
+            .flatten()
+            .and_then(|b| Json::parse(&b).ok())
+    };
+    if let Some(m) = json("manifest.json").filter(docker_manifest_ok) {
+        return Some(Structure::Docker(m));
+    }
+    if json("oci-layout").is_some_and(|l| oci_layout_ok(&l)) {
+        if let Some(i) = json("index.json").filter(oci_index_ok) {
+            return Some(Structure::Oci(i));
+        }
+    }
+    None
+}
+
+/// Whether `e` says the archive is not a container image after all (a tarball whose first
+/// entries looked like one): it can then be handled as an ordinary tarball.
+pub fn is_not_an_image(e: &Error) -> bool {
+    matches!(e, Error::Input(m) if m.starts_with(NOT_AN_IMAGE))
+}
+
+/// Each layer's blob path, with its descriptor when the image has one.
+type LayerRefs = Vec<(String, Option<Descriptor>)>;
+
+/// A candidate's image config (checked against its digest when known), its digest and its
+/// layers.
+fn config_of(outer: &Outer, c: &Candidate) -> Result<(Json, Option<String>, LayerRefs)> {
+    match &c.kind {
+        CandidateKind::Docker { config, layers } => {
+            // Classic `docker save` names the config after its digest (the image id).
+            let digest = digest_from_blob_path(config).or_else(|| {
+                let d = format!("sha256:{}", config.strip_suffix(".json")?);
+                digest_hex(&d).is_ok().then_some(d)
+            });
+            let b = outer.read_file(config)?.ok_or_else(|| {
+                Error::Input(format!(
+                    "manifest.json: config {config} is not in the archive"
+                ))
+            })?;
+            if let Some(d) = &digest {
+                check_digest(config, d, &trunc_hash::sha256(&b))?;
+            }
+            let j = Json::parse(&b)
+                .map_err(|e| Error::Input(format!("{config}: invalid JSON: {e}")))?;
+            Ok((
+                j,
+                digest,
+                layers.iter().map(|l| (l.clone(), None)).collect(),
+            ))
+        }
+        CandidateKind::Oci(m) => {
+            let cd = descriptor(
+                m.get("config")
+                    .ok_or_else(|| Error::Input("image manifest has no config".into()))?,
+                "image manifest",
+            )?;
+            let j = outer.read_blob_json(&cd)?;
+            let layers = m
+                .get("layers")
+                .and_then(Json::arr)
+                .ok_or_else(|| Error::Input("image manifest has no layers".into()))?
+                .iter()
+                .map(|l| {
+                    let d = descriptor(l, "image manifest")?;
+                    Ok((blob_path(&d.digest)?, Some(d)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((j, Some(cd.digest), layers))
+        }
+    }
+}
+
 /// Read the image metadata and select one image.
 fn metadata(outer: &Outer, opts: &ImageOptions) -> Result<ImageInfo> {
-    let manifest = outer.read_json("manifest.json")?;
-    let (format, cands) = if let Some(m) = &manifest {
-        (ImageFormat::Docker, docker_candidates(m)?)
-    } else if let Some(index) = outer.read_json("index.json")? {
-        if let Some(layout) = outer.read_json("oci-layout")? {
-            if layout.get_str("imageLayoutVersion").is_none() {
-                return Err(Error::Input("oci-layout: no imageLayoutVersion".into()));
+    let (format, mut cands) = match structure(outer) {
+        Some(Structure::Docker(m)) => (ImageFormat::Docker, docker_candidates(&m)?),
+        Some(Structure::Oci(index)) => {
+            let mut walk = OciWalk::default();
+            oci_candidates(outer, &index, "index.json", None, 0, &mut walk)?;
+            if walk.out.is_empty() {
+                return Err(Error::Input(
+                    "index.json: no image manifest whose blob is in the archive".into(),
+                ));
             }
+            (ImageFormat::Oci, walk.out)
         }
-        let mut c = Vec::new();
-        oci_candidates(outer, &index, "index.json", None, 0, &mut c)?;
-        if c.is_empty() {
-            return Err(Error::Input(
-                "index.json: no image manifest whose blob is in the archive".into(),
-            ));
+        None => {
+            return Err(Error::Input(format!(
+                "{NOT_AN_IMAGE}: no valid manifest.json, nor oci-layout with index.json"
+            )));
         }
-        (ImageFormat::Oci, c)
-    } else {
-        return Err(Error::Input(
-            "not a container image: no manifest.json or index.json".into(),
-        ));
     };
+    // `docker save` entries and descriptors without a platform: take it from the config, so
+    // `--platform` and the host default can tell them apart. A config that cannot be read
+    // here fails later, if its image is the one chosen.
+    if cands.len() > 1 {
+        for c in &mut cands {
+            if c.platform.is_none() {
+                c.platform = config_of(outer, c).ok().map(|(j, _, _)| platform_of(&j));
+            }
+        }
+    }
     let (chosen, others) = choose(cands, opts)?;
-    // Each layer's blob path, with its descriptor when the image has one.
-    type LayerRefs = Vec<(String, Option<Descriptor>)>;
-    let (config_json, config_digest, layer_refs): (Json, Option<String>, LayerRefs) =
-        match &chosen.kind {
-            CandidateKind::Docker { config, layers } => {
-                // Classic `docker save` names the config after its digest (the image id).
-                let digest = digest_from_blob_path(config).or_else(|| {
-                    let d = format!("sha256:{}", config.strip_suffix(".json")?);
-                    digest_hex(&d).is_ok().then_some(d)
-                });
-                let b = outer.read_file(config)?.ok_or_else(|| {
-                    Error::Input(format!(
-                        "manifest.json: config {config} is not in the archive"
-                    ))
-                })?;
-                if let Some(d) = &digest {
-                    check_digest(config, d, &trunc_hash::sha256(&b))?;
-                }
-                let j = Json::parse(&b)
-                    .map_err(|e| Error::Input(format!("{config}: invalid JSON: {e}")))?;
-                (
-                    j,
-                    digest,
-                    layers.iter().map(|l| (l.clone(), None)).collect(),
-                )
-            }
-            CandidateKind::Oci(m) => {
-                let cd = descriptor(
-                    m.get("config")
-                        .ok_or_else(|| Error::Input("image manifest has no config".into()))?,
-                    "image manifest",
-                )?;
-                let j = outer.read_blob_json(&cd)?;
-                let layers = m
-                    .get("layers")
-                    .and_then(Json::arr)
-                    .ok_or_else(|| Error::Input("image manifest has no layers".into()))?
-                    .iter()
-                    .map(|l| {
-                        let d = descriptor(l, "image manifest")?;
-                        Ok((blob_path(&d.digest)?, Some(d)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                (j, Some(cd.digest), layers)
-            }
-        };
+    let (config_json, config_digest, layer_refs) = config_of(outer, &chosen)?;
     let platform = platform_of(&config_json);
     if let Some(want) = &opts.platform {
         if !platform_matches(&platform, want) {
@@ -1127,6 +1331,8 @@ fn read_layer(
 
 const OPAQUE: &str = ".wh..wh..opq";
 const WHITEOUT: &str = ".wh.";
+/// Prefix of aufs bookkeeping names (`.wh..wh.plnk/`, `.wh..wh.orph/`, `.wh..wh.aufs`).
+const AUFS: &str = ".wh..wh.";
 
 #[derive(Debug, Clone)]
 struct Node {
@@ -1229,18 +1435,70 @@ fn leave_out(
     out
 }
 
+fn case_clash(a: &str, b: &str) -> Error {
+    Error::Refused(format!(
+        "layers name the same path as {a:?} and {b:?}, which differ only in case on this          computer; refusing to merge them"
+    ))
+}
+
+/// Check the ancestors of the whiteout or opaque marker `path` (in layer `li`) against the
+/// tree: each one there must be named exactly as in `path` (not only up to case), and must not
+/// be a symlink.
+/// Runtimes resolve such a path through the symlink (`lib/x` with `lib -> usr/lib` lands in
+/// `usr/lib/x`); that is not supported yet, so it is refused rather than merged wrongly.
+fn check_ancestors(tree: &BTreeMap<String, Node>, path: &str, li: usize) -> Result<()> {
+    let mut end = 0usize;
+    while let Some(i) = path[end..].find('/') {
+        let a = &path[..end + i];
+        end += i + 1;
+        if let Some(n) = tree.get(&trunc_core::path::host_key(a)) {
+            if n.name != a {
+                return Err(case_clash(&n.name, a));
+            }
+            if n.kind == Kind::Symlink {
+                return Err(through_symlink(li, path, a, n.layer));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn through_symlink(li: usize, path: &str, link: &str, link_layer: usize) -> Error {
+    Error::Refused(format!(
+        "layer {}: {path:?} is reached through {link:?}, a symlink from layer {}; images that \
+         write through symlinks (such as /lib -> usr/lib in merged-/usr bases) are not \
+         supported yet",
+        li + 1,
+        link_layer + 1
+    ))
+}
+
 /// Merge the layers' entries in order with OCI whiteout semantics into the final tree.
 ///
 /// In each layer, its whiteouts (`.wh.<name>`: delete `<name>` from the layers below) and
 /// opaque markers (`.wh..wh..opq`: hide everything the layers below have in this directory)
 /// apply first, so they never affect entries of the same layer; then its entries are added,
 /// replacing what is at their path (a directory over a directory keeps the contents below,
-/// anything else replaces the whole subtree). A path through a lower non-directory replaces it
-/// with a directory. Whiteout files themselves are never part of the tree.
+/// anything else replaces the whole subtree). A path through a lower file replaces it with a
+/// directory; a path (or whiteout) through a symlink is refused (see [`check_ancestors`]), as
+/// is a whiteout that names a path only up to case. Whiteout files themselves are never part
+/// of the tree, and aufs bookkeeping (any name under a `.wh..wh.` component, other than the
+/// opaque marker) is skipped.
 ///
 /// Paths this computer cannot create are then left out of the tree and returned (see
 /// [`leave_out`]); whiteouts and opaque markers have applied to them as to any path.
 pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeStats, Vec<Skipped>)> {
+    // Tarballs make hard links from staged targets; layers would need that across the merge
+    // (a later layer may delete or replace the target), which is not supported yet.
+    for (li, layer) in layers.iter().enumerate() {
+        if let Some(e) = layer.iter().find(|e| matches!(e.kind, Kind::HardLink(_))) {
+            return Err(Error::Refused(format!(
+                "layer {}: hard link {:?}; hard links in container images are not supported yet",
+                li + 1,
+                e.name
+            )));
+        }
+    }
     let mut tree: BTreeMap<String, Node> = BTreeMap::new();
     let mut stats = MergeStats::default();
     // Tree keys that entries named in different case: every name each was given.
@@ -1262,19 +1520,27 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
     for (li, entries) in layers.iter().enumerate() {
         stats.entries += entries.len();
         let mut regular = Vec::with_capacity(entries.len());
-        let mut opaque: Vec<String> = Vec::new();
-        let mut deleted: Vec<String> = Vec::new();
+        // (target, whiteout entry name)
+        let mut opaque: Vec<(String, &str)> = Vec::new();
+        let mut deleted: Vec<(String, &str)> = Vec::new();
         for (ei, e) in entries.iter().enumerate() {
+            let comps: Vec<&str> = e.name.split('/').collect();
+            let last = comps.len() - 1;
+            if comps.iter().enumerate().any(|(i, c)| {
+                c.starts_with(AUFS) && !(i == last && *c == OPAQUE && e.kind != Kind::Dir)
+            }) {
+                // aufs bookkeeping (`.wh..wh.plnk/<hard link>`, `.wh..wh.orph/`, ...),
+                // whatever its type: skipped, like Docker does.
+                continue;
+            }
             let parent = trunc_core::path::parent(&e.name);
-            let base = e.name.rsplit('/').next().unwrap_or(&e.name);
-            if let Some(p) = parent {
-                if p.split('/').any(|c| c.starts_with(WHITEOUT)) {
-                    return Err(Error::Refused(format!(
-                        "layer {}: {:?} is inside a whiteout",
-                        li + 1,
-                        e.name
-                    )));
-                }
+            let base = comps[last];
+            if comps[..last].iter().any(|c| c.starts_with(WHITEOUT)) {
+                return Err(Error::Refused(format!(
+                    "layer {}: {:?} is inside a whiteout",
+                    li + 1,
+                    e.name
+                )));
             }
             let Some(target) = base.strip_prefix(WHITEOUT) else {
                 regular.push(ei);
@@ -1288,10 +1554,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                 )));
             }
             if base == OPAQUE {
-                opaque.push(parent.unwrap_or("").to_owned());
-            } else if target.starts_with(WHITEOUT) {
-                // Other `.wh..wh.` names are aufs bookkeeping (`.wh..wh.plnk`, ...): ignored,
-                // like Docker does.
+                opaque.push((parent.unwrap_or("").to_owned(), &e.name));
             } else if target.is_empty() || target == "." || target == ".." || target.contains('\\')
             {
                 return Err(Error::Refused(format!(
@@ -1300,19 +1563,29 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                     e.name
                 )));
             } else {
-                deleted.push(match parent {
-                    Some(p) => format!("{p}/{target}"),
-                    None => target.to_owned(),
-                });
+                deleted.push((
+                    match parent {
+                        Some(p) => format!("{p}/{target}"),
+                        None => target.to_owned(),
+                    },
+                    &e.name,
+                ));
             }
         }
-        for d in &opaque {
+        for (d, marker) in &opaque {
+            check_ancestors(&tree, marker, li)?;
             let gone = remove_children(&mut tree, &trunc_core::path::host_key(d));
             shadow(gone, &mut stats);
             stats.opaques += 1;
         }
-        for d in &deleted {
-            let gone = remove_subtree(&mut tree, &trunc_core::path::host_key(d));
+        for (d, marker) in &deleted {
+            check_ancestors(&tree, marker, li)?;
+            let key = trunc_core::path::host_key(d);
+            // `.wh.Foo` must not delete `foo` just because this computer folds case.
+            if let Some(n) = tree.get(&key).filter(|n| n.name != *d) {
+                return Err(case_clash(&n.name, d));
+            }
+            let gone = remove_subtree(&mut tree, &key);
             shadow(gone, &mut stats);
             stats.whiteouts += 1;
         }
@@ -1329,6 +1602,9 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                 }
                 match tree.get(&key) {
                     Some(n) if n.kind == Kind::Dir => continue,
+                    Some(n) if n.kind == Kind::Symlink => {
+                        return Err(through_symlink(li, &e.name, a, n.layer));
+                    }
                     Some(_) => {
                         let gone = remove_subtree(&mut tree, &key);
                         shadow(gone, &mut stats);
@@ -1395,11 +1671,21 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
 // ---------------------------------------------------------------------------------------------
 // Entry points.
 
-/// Whether the file at `path` looks like a container image tarball. Uncompressed tars are
-/// recognised by `manifest.json` or `index.json` at their root (read from the headers only);
-/// compressed ones by the first entries decoded (`oci-layout`, `blobs/sha256/<hex>`,
-/// `repositories`, `<hex>/layer.tar`, `manifest.json` or `index.json`).
+/// Whether the file at `path` is a container image tarball. Uncompressed tars are confirmed
+/// from their structure (a valid `manifest.json`, or `oci-layout` with a valid `index.json`,
+/// read through the headers only). Compressed ones are judged by their first entries decoded:
+/// the same metadata files when they are among them (so an ordinary tarball with a root
+/// `index.json` is not taken for an image), else `blobs/sha256/<hex>` or `<hex>/layer.tar`
+/// entries; such an archive is confirmed once decompressed, and [`is_not_an_image`] tells the
+/// caller when it was not one. An archive with a consume journal is never an image: it is
+/// being consumed, and resumed through its journal.
 pub fn detect(fs: &dyn FsBackend, path: &Path) -> bool {
+    if matches!(
+        fs.metadata(&crate::zipconsume::journal_path(path)),
+        Ok(Some(_))
+    ) {
+        return false;
+    }
     let Ok(h) = source::open_read(fs, path) else {
         return false;
     };
@@ -1409,7 +1695,7 @@ pub fn detect(fs: &dyn FsBackend, path: &Path) -> bool {
     let Ok(first) = head(h.as_ref(), len) else {
         return false;
     };
-    let names: Vec<String> = match Codec::sniff(&first) {
+    match Codec::sniff(&first) {
         None => {
             let mut block = [0u8; 512];
             if len < 512
@@ -1419,41 +1705,62 @@ pub fn detect(fs: &dyn FsBackend, path: &Path) -> bool {
                 return false;
             }
             match index_tar(h.as_ref(), len, "") {
-                Ok(entries) => {
-                    return entries.iter().any(|e| {
-                        e.kind == Kind::File
-                            && (e.name == "manifest.json" || e.name == "index.json")
-                    });
-                }
-                Err(_) => return false,
+                Ok(entries) => structure(&Outer::from_entries(h, &entries, None, len)).is_some(),
+                Err(_) => false,
             }
         }
-        Some(c) => {
-            let Ok(prefix) = stream::peek(
-                c,
-                Input {
-                    src: h.as_ref(),
-                    len,
-                },
-                PEEK_BYTES,
-            ) else {
-                return false;
-            };
-            if prefix.len() < 512 || !tar::looks_like_header(&prefix[..512]) {
-                return false;
-            }
-            let mut r = tar::Reader::new();
-            let _ = r.feed(&prefix);
-            r.entries().iter().map(|e| e.name.clone()).collect()
-        }
+        Some(c) => prefix_is_image(c, h.as_ref(), len),
+    }
+}
+
+/// [`detect`] for a compressed outer tar, from its first entries.
+fn prefix_is_image(c: Codec, h: &dyn FileHandle, len: u64) -> bool {
+    const META: [&str; 3] = ["manifest.json", "oci-layout", "index.json"];
+    let peek = |n: usize| stream::peek(c, Input { src: h, len }, n).ok();
+    let entries = |p: &[u8]| {
+        let mut r = tar::Reader::new();
+        let _ = r.feed(p);
+        r.entries().to_vec()
     };
+    let Some(mut prefix) = peek(PEEK_BYTES) else {
+        return false;
+    };
+    if prefix.len() < 512 || !tar::looks_like_header(&prefix[..512]) {
+        return false;
+    }
+    let mut es = entries(&prefix);
+    // A metadata file cut off by the end of the prefix: decode a little further.
+    let end = es
+        .iter()
+        .filter(|e| e.kind == Kind::File && META.contains(&e.name.as_str()) && e.size <= PEEK_META)
+        .map(|e| e.data_offset.saturating_add(e.size))
+        .max();
+    if let Some(end) = end.filter(|&end| end > prefix.len() as u64) {
+        if let Some(p) = peek(usize::try_from(end).unwrap_or(usize::MAX)) {
+            prefix = p;
+            es = entries(&prefix);
+        }
+    }
+    // `None`: not among the first entries (or not whole); else whether it is valid.
+    let check = |name: &str, ok: fn(&Json) -> bool| -> Option<bool> {
+        let e = es.iter().find(|e| e.kind == Kind::File && e.name == name)?;
+        let start = usize::try_from(e.data_offset).ok()?;
+        let b = prefix.get(start..start.checked_add(usize::try_from(e.size).ok()?)?)?;
+        Some(Json::parse(b).is_ok_and(|j| ok(&j)))
+    };
+    let docker = check("manifest.json", docker_manifest_ok);
+    let layout = check("oci-layout", oci_layout_ok);
+    let index = check("index.json", oci_index_ok);
+    if docker == Some(true) || (layout == Some(true) && index != Some(false)) {
+        return true;
+    }
+    if [docker, layout, index].contains(&Some(false)) {
+        return false;
+    }
     let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit());
-    names.iter().any(|n| {
-        matches!(
-            n.as_str(),
-            "oci-layout" | "repositories" | "manifest.json" | "index.json"
-        ) || n.strip_prefix("blobs/sha256/").is_some_and(hex64)
-            || n.strip_suffix("/layer.tar").is_some_and(hex64)
+    es.iter().any(|e| {
+        e.name.strip_prefix("blobs/sha256/").is_some_and(hex64)
+            || e.name.strip_suffix("/layer.tar").is_some_and(hex64)
     })
 }
 
@@ -1465,11 +1772,12 @@ fn with_outer<T>(
     opts: &ImageOptions,
     f: impl FnOnce(&Outer) -> Result<T>,
 ) -> Result<T> {
-    let (outer, temp) = Outer::open(fs, archive, temp_dir, opts)?;
-    let r = f(&outer);
+    let opened = Outer::open(fs, archive, temp_dir, opts)?;
+    let r = f(&opened.outer);
+    let Opened { outer, temp } = opened;
     drop(outer);
     if let Some(t) = temp {
-        let removed = fs.remove_file(&t);
+        let removed = t.remove();
         if r.is_ok() {
             removed?;
         }
@@ -1854,6 +2162,84 @@ mod tests {
         } else {
             assert_eq!(got.len(), 6, "{got:?}");
             assert_eq!(s, []);
+        }
+    }
+
+    #[test]
+    fn aufs_bookkeeping_is_skipped_whatever_its_type() {
+        let got = names(&[vec![
+            d(".wh..wh.plnk"),
+            f(".wh..wh.plnk/123.456"),
+            d(".wh..wh.orph"),
+            d(".wh..wh.orph/sub"),
+            f(".wh..wh.aufs"),
+            d(".wh..wh..opq"),
+            d("etc"),
+            f("etc/.wh..wh.foo"),
+            f("etc/hostname"),
+        ]]);
+        assert_eq!(
+            got,
+            vec![
+                ("etc".into(), 0, Kind::Dir),
+                ("etc/hostname".into(), 0, Kind::File),
+            ]
+        );
+    }
+
+    fn l(name: &str) -> tar::Entry {
+        e(name, Kind::Symlink, 0)
+    }
+
+    #[test]
+    fn paths_through_symlinks_are_refused() {
+        let base = vec![d("usr"), d("usr/lib"), f("usr/lib/libc"), l("lib")];
+        for top in [
+            vec![f("lib/extra")],
+            vec![f("lib/.wh.libc")],
+            vec![f("lib/.wh..wh..opq")],
+            vec![d("lib/sub")],
+        ] {
+            let e = merge_layers(&[base.clone(), top.clone()]).unwrap_err();
+            assert!(e.to_string().contains("symlink"), "{top:?}: {e}");
+        }
+        // Within one layer too.
+        assert!(merge_layers(&[vec![l("lib"), f("lib/x")]]).is_err());
+        // An entry of its own replaces the symlink first, as runtimes do.
+        let got = names(&[base.clone(), vec![d("lib"), f("lib/x")]]);
+        assert!(got.contains(&("lib/x".into(), 1, Kind::File)), "{got:?}");
+        // Deleting or replacing the symlink itself is fine.
+        assert!(merge_layers(&[base.clone(), vec![f(".wh.lib")]]).is_ok());
+        assert!(merge_layers(&[base, vec![f("lib")]]).is_ok());
+    }
+
+    #[test]
+    fn whiteouts_match_names_exactly() {
+        let r = merge_layers(&[vec![d("Etc"), f("Etc/Passwd")], vec![f("Etc/.wh.passwd")]]);
+        let r2 = merge_layers(&[vec![d("Etc"), f("Etc/Passwd")], vec![f(".wh.etc")]]);
+        let r3 = merge_layers(&[vec![d("Etc"), f("Etc/x")], vec![f("etc/.wh..wh..opq")]]);
+        if cfg!(any(windows, target_os = "macos")) {
+            for r in [r, r2, r3] {
+                assert!(r.unwrap_err().to_string().contains("only in case"));
+            }
+        } else {
+            // Different names on Linux: the whiteouts name nothing that exists.
+            assert_eq!(r.unwrap().0.len(), 2);
+            assert_eq!(r2.unwrap().0.len(), 2);
+            assert_eq!(r3.unwrap().0.len(), 2);
+        }
+    }
+
+    #[test]
+    fn temp_names() {
+        assert!(is_temp_name(".trunc-image-0123456789abcdef.tar"));
+        for n in [
+            ".trunc-image-0123.tar",
+            ".trunc-image-0123456789abcdef.tar.gz",
+            "trunc-image-0123456789abcdef.tar",
+            ".trunc-image-0123456789abcdeg.tar",
+        ] {
+            assert!(!is_temp_name(n), "{n}");
         }
     }
 
