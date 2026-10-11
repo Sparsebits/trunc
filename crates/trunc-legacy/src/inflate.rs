@@ -255,7 +255,10 @@ struct Huffman {
 }
 
 impl Huffman {
-    fn new(lengths: &[u8]) -> Result<Self> {
+    /// The canonical code of `lengths`. As in zlib, the code must be complete, except that a
+    /// code with no symbols is allowed (it fails when used) and, with `allow_single`, so is a
+    /// code with a single symbol of length 1 (the other one-bit code fails when used).
+    fn new(lengths: &[u8], allow_single: bool) -> Result<Self> {
         let mut counts = [0u16; MAX_BITS + 1];
         for &l in lengths {
             counts[usize::from(l)] += 1;
@@ -266,6 +269,12 @@ impl Huffman {
             left = (left << 1) - i32::from(c);
             if left < 0 {
                 return Err(InflateError::Corrupt("over-subscribed Huffman code"));
+            }
+        }
+        if left > 0 {
+            let max = counts.iter().rposition(|&c| c != 0).unwrap_or(0);
+            if max != 0 && (max != 1 || !allow_single) {
+                return Err(InflateError::Corrupt("incomplete Huffman code"));
             }
         }
         let mut offs = [0u16; MAX_BITS + 2];
@@ -362,10 +371,11 @@ fn fixed_tables() -> (Huffman, Huffman) {
     l[144..256].fill(9);
     l[256..280].fill(7);
     l[280..].fill(8);
-    let d = [5u8; 30];
+    // All 32 codes, so the code is complete; symbols 30 and 31 are refused when decoded.
+    let d = [5u8; 32];
     (
-        Huffman::new(&l).expect("fixed table"),
-        Huffman::new(&d).expect("fixed table"),
+        Huffman::new(&l, false).expect("fixed table"),
+        Huffman::new(&d, false).expect("fixed table"),
     )
 }
 
@@ -635,7 +645,7 @@ fn dynamic_tables(br: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
     for &i in &CL_ORDER[..hclen] {
         cl[i] = u8::try_from(br.get(3)?).expect("3 bits");
     }
-    let clh = Huffman::new(&cl)?;
+    let clh = Huffman::new(&cl, false)?;
     let mut lengths = vec![0u8; hlit + hdist];
     let mut i = 0;
     while i < lengths.len() {
@@ -662,7 +672,7 @@ fn dynamic_tables(br: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
         return Err(InflateError::Corrupt("no end-of-block code"));
     }
     Ok((
-        Huffman::new(&lengths[..hlit])?,
-        Huffman::new(&lengths[hlit..])?,
+        Huffman::new(&lengths[..hlit], true)?,
+        Huffman::new(&lengths[hlit..], true)?,
     ))
 }

@@ -219,3 +219,130 @@ proptest! {
         prop_assert_eq!(crc, crc32fast::hash(&data));
     }
 }
+
+/// A bit writer for hand-built DEFLATE streams.
+#[derive(Default)]
+struct Bits {
+    out: Vec<u8>,
+    n: usize,
+}
+
+impl Bits {
+    /// `n` bits of `v`, least significant first (header fields, extra bits).
+    fn put(&mut self, v: u32, n: usize) {
+        for k in 0..n {
+            if self.n % 8 == 0 {
+                self.out.push(0);
+            }
+            *self.out.last_mut().unwrap() |= (((v >> k) & 1) as u8) << (self.n % 8);
+            self.n += 1;
+        }
+    }
+
+    /// A Huffman code of `len` bits, most significant first.
+    fn code(&mut self, c: u32, len: usize) {
+        for k in (0..len).rev() {
+            self.put((c >> k) & 1, 1);
+        }
+    }
+}
+
+/// A final dynamic block with a literal/length code of 'a' (length 1), 256 (length 2) and 257
+/// (length `l257`, 0 for none), one distance code of `dist_len` bits, and a code-length code of
+/// 0, 1, 2 and 18 at length 2 (18 at `cl18`). It encodes "aaaa": a literal, a match of 3 at
+/// distance 1, the end (just "a" without 257).
+fn dynamic_block(l257: u32, dist_len: u32, cl18: u32) -> Vec<u8> {
+    let mut b = Bits::default();
+    b.put(1, 1); // BFINAL
+    b.put(2, 2); // dynamic
+    b.put(1, 5); // 258 literal/length codes
+    b.put(0, 5); // 1 distance code
+    b.put(14, 4); // 18 code-length code lengths, up to the one for 1
+    // In the order 16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1.
+    for l in [0, 0, cl18, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2] {
+        b.put(l, 3);
+    }
+    // Code-length codes (canonical, all of length 2): 0 -> 00, 1 -> 01, 2 -> 10, 18 -> 11.
+    let len = |b: &mut Bits, l: u32| b.code(l, 2);
+    let zeros = |b: &mut Bits, n: u32| {
+        b.code(3, 2);
+        b.put(n - 11, 7);
+    };
+    zeros(&mut b, 97);
+    len(&mut b, 1); // 'a'
+    zeros(&mut b, 138);
+    zeros(&mut b, 20);
+    len(&mut b, 2); // 256
+    len(&mut b, l257);
+    len(&mut b, dist_len);
+    // Literal/length codes: 'a' -> 0, 256 -> 10, 257 -> 11; distance 1 -> all zeros.
+    b.code(0, 1);
+    if l257 != 0 {
+        b.code(3, 2);
+        b.code(0, dist_len as usize);
+    }
+    b.code(2, 2);
+    b.out
+}
+
+fn inflate_bytes(c: &[u8]) -> Result<Vec<u8>, InflateError> {
+    let (_fs, h) = host(c, 0);
+    inflate_all(h.as_ref(), 0, c.len() as u64, 1 << 20).map(|(o, _)| o)
+}
+
+/// flate2's (miniz_oxide's) verdict: the output of a whole stream, or `None`.
+fn flate2_inflate(c: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::DeflateDecoder::new(c), &mut out)
+        .ok()
+        .map(|_| out)
+}
+
+/// zlib (`inflate_table`) refuses incomplete Huffman codes, except a code with no symbols and a
+/// literal/length or distance code with a single symbol of length 1; trunc does the same, and
+/// so does flate2 (the fuzz oracle). zlib's verdicts, from Python's
+/// `zlib.decompress(bytes.fromhex(...), -15)`, are in the comments.
+#[test]
+fn incomplete_codes_are_refused_as_zlib_does() {
+    let cases: [(_, &str, Option<&[u8]>); 4] = [
+        // Complete codes, and a single distance code of length 1: "aaaa".
+        ((2, 1, 2), "0dc0010900000080a0adfe3f515a", Some(b"aaaa")),
+        // A single distance code of length 2: "invalid distances set".
+        ((2, 2, 2), "0dc0010900000080a0adfe3f519900", None),
+        // No 257, an incomplete literal/length code: "invalid literal/lengths set".
+        ((0, 1, 2), "0dc0010900000080a0adfe3f110a", None),
+        // 18 at length 3, an incomplete code-length code: "invalid code lengths set".
+        ((2, 1, 3), "0dc0810900000080a0adfe3f515a", None),
+    ];
+    for ((l257, dist_len, cl18), hex, want) in cases {
+        let c = dynamic_block(l257, dist_len, cl18);
+        let h: String = c.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(h, hex);
+        assert_eq!(inflate_bytes(&c).ok().as_deref(), want, "{hex}");
+        assert_eq!(flate2_inflate(&c).as_deref(), want, "{hex}");
+    }
+}
+
+/// Found by the `inflate_diff` fuzz target (input `176bff888fd78891`): flate2's stream of
+/// "\x8f\xd7" and 146 bytes copied from distance 2 (level 7, partial flush) with bit 3 of byte 3
+/// flipped. The code-length code is then incomplete, which zlib refuses ("invalid code lengths
+/// set") and so does miniz_oxide; trunc used to decode it.
+#[test]
+fn fuzz_incomplete_code_length_code_is_refused() {
+    let c = [
+        0xcc, 0xc1, 0xb1, 0x18, 0x00, 0x00, 0x00, 0x80, 0x40, 0xff, 0x29, 0xbc, 0x74, 0xd2, 0xe8,
+        0x1e, 0xd9, 0x49, 0x80, 0x01, 0x00,
+    ];
+    let e = inflate_bytes(&c).unwrap_err();
+    assert!(e.to_string().contains("incomplete"), "{e}");
+    // The undamaged stream still decodes.
+    let mut good = c;
+    good[3] ^= 1 << 3;
+    let mut want = vec![0x8f, 0xd7];
+    for _ in 0..146 {
+        want.push(want[want.len() - 2]);
+    }
+    assert_eq!(inflate_bytes(&good).unwrap(), want);
+    assert_eq!(flate2_inflate(&c), None);
+    assert_eq!(flate2_inflate(&good), Some(want));
+}
