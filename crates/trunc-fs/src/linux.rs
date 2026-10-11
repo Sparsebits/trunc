@@ -1,9 +1,11 @@
 //! Linux specifics, all through rustix (no `unsafe`): hole punching, space reservation,
-//! confined opens, no-replace renames, page-cache control, advisory locks and mount lookup.
+//! confined opens and hard links, no-replace renames, page-cache control, advisory locks and mount
+//! lookup.
 //!
 //! Each helper reports a missing kernel or filesystem feature as `Ok(None)` / `Ok(false)` so the
 //! caller can fall back, and every other failure as an `io::Error`.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::num::NonZeroU64;
@@ -12,7 +14,8 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{
-    Advice, CWD, FallocateFlags, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags, SeekFrom,
+    Advice, AtFlags, CWD, FallocateFlags, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
+    SeekFrom,
 };
 use rustix::io::Errno;
 
@@ -97,8 +100,9 @@ pub(crate) fn open_beneath(root: &Path, rel: &Path, flags: OFlags) -> io::Result
     }
 }
 
-/// `mkdirat` in the parent of `rel`, the parent resolved as in [`open_beneath`].
-pub(crate) fn mkdir_beneath(root: &Path, rel: &Path) -> io::Result<bool> {
+/// The parent directory of `rel`, opened beneath `root` as in [`open_beneath`], and the last
+/// component. `Ok(None)` if openat2 is missing.
+fn parent_beneath<'a>(root: &Path, rel: &'a Path) -> io::Result<Option<(OwnedFd, &'a OsStr)>> {
     let dir = open_root(root)?;
     let name = rel
         .file_name()
@@ -110,12 +114,33 @@ pub(crate) fn mkdir_beneath(root: &Path, rel: &Path) -> io::Result<bool> {
             let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
             match rustix::fs::openat2(&dir, p, flags, Mode::empty(), confined()) {
                 Ok(fd) => fd,
-                Err(e) if missing(e) => return Ok(false),
+                Err(e) if missing(e) => return Ok(None),
                 Err(e) => return Err(e.into()),
             }
         }
     };
-    rustix::fs::mkdirat(&parent_fd, name, Mode::from_raw_mode(0o777))?;
+    Ok(Some((parent_fd, name)))
+}
+
+/// `mkdirat` in the parent of `rel`, the parent resolved as in [`open_beneath`].
+pub(crate) fn mkdir_beneath(root: &Path, rel: &Path) -> io::Result<bool> {
+    let Some((parent, name)) = parent_beneath(root, rel)? else {
+        return Ok(false);
+    };
+    rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o777))?;
+    Ok(true)
+}
+
+/// `linkat` between the parents of `src` and `dst`, both resolved as in [`open_beneath`].
+/// `Ok(false)` if openat2 is missing.
+pub(crate) fn link_beneath(root: &Path, src: &Path, dst: &Path) -> io::Result<bool> {
+    let Some((sp, sname)) = parent_beneath(root, src)? else {
+        return Ok(false);
+    };
+    let Some((dp, dname)) = parent_beneath(root, dst)? else {
+        return Ok(false);
+    };
+    rustix::fs::linkat(&sp, sname, &dp, dname, AtFlags::empty())?;
     Ok(true)
 }
 

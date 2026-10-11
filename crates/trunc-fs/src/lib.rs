@@ -130,6 +130,12 @@ impl FsKind {
         )
     }
 
+    /// Whether a file can have several names. Only FAT and exFAT are known not to; elsewhere
+    /// a refused link is still handled (by copying), it is just not planned for.
+    pub fn hard_links(self) -> bool {
+        !matches!(self, FsKind::Fat32 | FsKind::ExFat)
+    }
+
     pub fn from_name(name: &str) -> Self {
         match name.to_ascii_uppercase().as_str() {
             "NTFS" => FsKind::Ntfs,
@@ -277,6 +283,38 @@ pub trait FsBackend: Send + Sync + Debug {
     }
     /// Rename without replacing: fails with [`FsError::AlreadyExists`] if `to` exists.
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Give the file at `src` a second name, `dst` (never replacing anything there). Fails with
+    /// [`FsError::Unsupported`] when the filesystem cannot (FAT, exFAT, or the file already has
+    /// as many names as it may), so the caller can copy instead.
+    fn hard_link(&self, src: &Path, dst: &Path) -> Result<()>;
+    /// [`hard_link`](Self::hard_link) with the confinement of
+    /// [`open_beneath`](Self::open_beneath) for both paths; `src` must be a regular file. Linux
+    /// does this atomically (`linkat` from directories opened with `openat2`); the default checks
+    /// first, which a concurrent local attacker could race, so callers should check what the new
+    /// name leads to.
+    fn hard_link_beneath(&self, root: &Path, src: &Path, dst: &Path) -> Result<()> {
+        check_beneath(self, root, src)?;
+        check_beneath(self, root, dst)?;
+        match self.metadata(src)? {
+            Some(Meta {
+                kind: NodeKind::File,
+                ..
+            }) => {}
+            Some(Meta {
+                kind: NodeKind::Link,
+                ..
+            }) => return Err(FsError::Link { path: src.into() }),
+            Some(_) => {
+                return Err(FsError::Io {
+                    op: "linking",
+                    path: src.into(),
+                    source: io::Error::other("not a regular file"),
+                });
+            }
+            None => return Err(FsError::NotFound { path: src.into() }),
+        }
+        self.hard_link(src, dst)
+    }
     fn remove_file(&self, path: &Path) -> Result<()>;
     /// Remove an empty directory.
     fn remove_dir(&self, path: &Path) -> Result<()>;

@@ -190,6 +190,35 @@ fn in_parallel(n: usize, f: &(dyn Fn(usize) -> Result<()> + Sync)) -> Result<()>
     }
 }
 
+/// A failed hard link. The errors that mean "this filesystem gives files one name" (FAT, exFAT,
+/// some network filesystems) or "this file has all the names it may have" become
+/// [`FsError::Unsupported`], so the caller can copy instead.
+fn link_err(path: &Path, e: io::Error) -> FsError {
+    // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_TOO_MANY_LINKS.
+    #[cfg(windows)]
+    let no_link = matches!(e.raw_os_error(), Some(1 | 50 | 1142));
+    #[cfg(unix)]
+    let no_link = e.raw_os_error().is_some_and(|n| {
+        [
+            rustix::io::Errno::PERM,
+            rustix::io::Errno::OPNOTSUPP,
+            rustix::io::Errno::MLINK,
+        ]
+        .iter()
+        .any(|x| x.raw_os_error() == n)
+    });
+    #[cfg(not(any(windows, unix)))]
+    let no_link = false;
+    if no_link {
+        FsError::Unsupported {
+            op: "hard link",
+            path: path.to_path_buf(),
+        }
+    } else {
+        FsError::from_io("linking", path, e)
+    }
+}
+
 /// Real locations of confinement roots, so each check costs one query on the opened handle.
 #[cfg(windows)]
 type RootMap = std::collections::HashMap<PathBuf, (u64, PathBuf)>;
@@ -404,6 +433,47 @@ impl FsBackend for OsFs {
                 });
             }
             fs::rename(from, to).map_err(err("renaming", from))
+        }
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.hard_link");
+        fs::hard_link(src, dst).map_err(|e| link_err(dst, e))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hard_link_beneath(&self, root: &Path, src: &Path, dst: &Path) -> Result<()> {
+        let _prof = trunc_prof::span("fs.hard_link");
+        let (s, d) = (
+            crate::relative_beneath(root, src)?,
+            crate::relative_beneath(root, dst)?,
+        );
+        match crate::linux::link_beneath(root, s, d) {
+            Ok(true) => {}
+            Ok(false) => {
+                crate::check_beneath(self, root, src)?;
+                crate::check_beneath(self, root, dst)?;
+                self.hard_link(src, dst)?;
+            }
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) => {
+                return Err(FsError::Link {
+                    path: dst.to_path_buf(),
+                });
+            }
+            Err(e) => return Err(link_err(dst, e)),
+        }
+        // linkat does not follow a symlink at `src`: it would link the symlink itself.
+        match self.metadata(dst)? {
+            Some(Meta {
+                kind: NodeKind::File,
+                ..
+            }) => Ok(()),
+            _ => {
+                let _ = fs::remove_file(dst);
+                Err(FsError::Link {
+                    path: src.to_path_buf(),
+                })
+            }
         }
     }
 

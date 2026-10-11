@@ -338,3 +338,66 @@ fn read_back_returns_only_durable_bytes() {
     h.read_back(&mut buf, 0).unwrap();
     assert_eq!(&buf, b"bbaa");
 }
+
+#[test]
+fn hard_links_are_entries_for_the_same_file() {
+    let fs = FaultFs::new(CrashModel::LoseUnflushed);
+    fs.put_file(p("/d/a"), b"shared");
+    fs.hard_link(p("/d/a"), p("/d/b")).unwrap();
+    let id = |s| {
+        fs.open(p(s), OpenMode::Read, Share::Shared)
+            .unwrap()
+            .file_id()
+            .unwrap()
+    };
+    assert_eq!(id("/d/a"), id("/d/b"));
+    assert_eq!(fs.used(), 6, "one file, two names");
+    assert!(matches!(
+        fs.hard_link(p("/d/a"), p("/d/b")),
+        Err(FsError::AlreadyExists { .. })
+    ));
+    assert!(matches!(
+        fs.hard_link(p("/d/missing"), p("/d/c")),
+        Err(FsError::NotFound { .. })
+    ));
+    // Like any new entry, the link needs its directory flushed.
+    fs.recover();
+    assert!(fs.get_file(p("/d/b")).is_none());
+    fs.hard_link(p("/d/a"), p("/d/b")).unwrap();
+    fs.flush_dir(p("/d")).unwrap();
+    fs.recover();
+    assert_eq!(fs.get_file(p("/d/b")).unwrap(), b"shared");
+    // Removing one name keeps the file.
+    fs.remove_file(p("/d/a")).unwrap();
+    assert_eq!((fs.get_file(p("/d/b")).unwrap().len(), fs.used()), (6, 6));
+
+    fs.set_hard_links_supported(false);
+    assert!(matches!(
+        fs.hard_link(p("/d/b"), p("/d/c")),
+        Err(FsError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn only_sparse_files_grow_holes() {
+    let fs = FaultFs::new(CrashModel::WriteThrough);
+    let plain = create(&fs, "/plain", b"x");
+    plain.set_len(10_000).unwrap();
+    assert_eq!(fs.used(), 10_000, "extending a plain file allocates");
+    let sparse = create(&fs, "/sparse", b"");
+    assert!(matches!(
+        sparse.deallocate(0, 1 << 20).unwrap(),
+        Dealloc::Freed { .. }
+    ));
+    sparse.write_all_at(b"data", 50_000).unwrap();
+    sparse.set_len(100_000).unwrap();
+    assert_eq!(fs.used(), 10_004, "a sparse file's gaps are holes");
+    assert_eq!(
+        sparse.allocated_ranges().unwrap(),
+        vec![50_000..50_004],
+        "{:?}",
+        sparse.allocated_ranges()
+    );
+    sparse.preallocate(200_000).unwrap();
+    assert_eq!(fs.used(), 110_004, "preallocating allocates");
+}
