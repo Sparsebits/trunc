@@ -97,7 +97,7 @@ option, including container images and trunc's own `.trnc` format.
 
 | Format | Extract | `--consume` | Space comes back |
 |---|---|---|---|
-| ZIP (Stored, Deflate, bzip2, zstd, xz, Zip64) | yes | yes | after each group of entries, and every 64 MiB inside big entries |
+| ZIP (Stored, Deflate, bzip2, zstd, xz, Zip64) | yes | yes | after each group of entries, and every 64 MiB inside big Deflate entries |
 | `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` and single `.gz`/`.bz2`/`.xz`/`.zst` files | yes | yes | every 64 MiB of output |
 | ISO 9660 images, uncompressed `.tar` | yes | yes | as for ZIP |
 | Compressed archives split into `.001` or `.aa` parts | yes | yes | as above, and each part is deleted once its data is safe |
