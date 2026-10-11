@@ -86,6 +86,22 @@ impl<'a> Backward<'a> {
 
     #[inline]
     fn refill(&mut self) {
+        if self.pos >= 64 {
+            // Eight whole bytes end at or above `pos`, so no edge cases: the word holds bits
+            // [8 * start, 8 * end) and 56 < pos - 8 * start <= 64.
+            let pos = self.pos as usize;
+            let start = pos.div_ceil(8) - 8;
+            let w = u64::from_le_bytes(self.b[start..start + 8].try_into().expect("8"));
+            let have = pos - 8 * start;
+            self.acc = w << (64 - have);
+            self.avail = have as u32;
+            return;
+        }
+        self.refill_slow();
+    }
+
+    #[cold]
+    fn refill_slow(&mut self) {
         if self.pos <= 0 {
             self.acc = 0;
             self.avail = 64;

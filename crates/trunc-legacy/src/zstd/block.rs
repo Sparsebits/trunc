@@ -351,10 +351,21 @@ fn sequences(
     let mut op = base;
     for i in 0..n {
         let (le, oe, me) = (ll.entries[sl], of.entries[so], ml.entries[sm]);
-        // Offset extra bits are at most 31, match and literal length bits 16 each.
-        bs.ensure(31);
+        // Usually all of the sequence's bits, state updates included, fit in one refill.
+        // Otherwise refill per part: offset extra bits are at most 31, match and literal length
+        // bits 16 each, state bits 9 + 9 + 8.
+        let need = u32::from(oe.add)
+            + u32::from(me.add)
+            + u32::from(le.add)
+            + u32::from(le.bits)
+            + u32::from(me.bits)
+            + u32::from(oe.bits);
+        let once = need <= 57;
+        bs.ensure(if once { need } else { 31 });
         let ov = u64::from(oe.base) + bs.take(u32::from(oe.add));
-        bs.ensure(32);
+        if !once {
+            bs.ensure(32);
+        }
         let mlen = me.base as usize + bs.take(u32::from(me.add)) as usize;
         let llen = le.base as usize + bs.take(u32::from(le.add)) as usize;
         let offset = if ov > 3 {
@@ -419,18 +430,26 @@ fn sequences(
                 k += 16;
             }
         } else {
-            // A short period: copy whole periods from the start of the match, doubling.
-            let mut done = 0;
-            while done < mlen {
-                let n = (mlen - done).min(d + done);
-                buf.copy_within(src..src + n, op + done);
-                done += n;
+            // A short period: the first bytes one at a time, until a source in the same phase
+            // lies `far` (a multiple of the period, 8 to 15) behind; then 8-byte chunks from
+            // there, each reading only bytes already written.
+            let far = if d >= 8 { d } else { d * 8usize.div_ceil(d) };
+            let head = far.min(mlen);
+            for k in 0..head {
+                buf[op + k] = buf[src + k];
+            }
+            let mut k = head;
+            while k < mlen {
+                let t: [u8; 8] = buf[op + k - far..op + k - far + 8].try_into().expect("8");
+                buf[op + k..op + k + 8].copy_from_slice(&t);
+                k += 8;
             }
         }
         op += mlen;
         if i + 1 < n {
-            // State bits are at most 9 + 9 + 8.
-            bs.ensure(26);
+            if !once {
+                bs.ensure(26);
+            }
             sl = usize::from(le.next) + bs.take(u32::from(le.bits)) as usize;
             sm = usize::from(me.next) + bs.take(u32::from(me.bits)) as usize;
             so = usize::from(oe.next) + bs.take(u32::from(oe.bits)) as usize;
