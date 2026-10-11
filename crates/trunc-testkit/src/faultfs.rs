@@ -141,6 +141,8 @@ struct State {
     /// A drive that acknowledges flushes without persisting anything.
     flush_lies: bool,
     hard_links: bool,
+    /// Names that differ only in case are the same file.
+    case_insensitive: bool,
 }
 
 /// In-memory, fault-injecting [`FsBackend`]. Cloning shares the same filesystem.
@@ -432,6 +434,35 @@ impl State {
             self.tree.get(k).copied()
         }
     }
+
+    /// The stored path `k` names: itself, or on a case-insensitive volume, component by
+    /// component, an existing entry whose name differs only in case (names keep the case they
+    /// were created with, as on NTFS or a `casefold` ext4 folder).
+    fn resolve(&self, k: String) -> String {
+        if !self.case_insensitive || k.is_empty() || self.tree.contains_key(&k) {
+            return k;
+        }
+        let fold = |c: &str| c.to_lowercase();
+        let mut out = String::new();
+        for comp in k.split('/') {
+            let exact = if out.is_empty() {
+                comp.to_owned()
+            } else {
+                format!("{out}/{comp}")
+            };
+            let want = fold(comp);
+            out = if self.tree.contains_key(&exact) {
+                exact
+            } else {
+                self.tree
+                    .keys()
+                    .find(|c| parent(c) == out && fold(c.rsplit('/').next().unwrap_or(c)) == want)
+                    .cloned()
+                    .unwrap_or(exact)
+            };
+        }
+        out
+    }
 }
 
 impl State {
@@ -492,6 +523,7 @@ impl FaultFs {
                 next_inode: 1,
                 flush_lies: false,
                 hard_links: true,
+                case_insensitive: false,
             })),
         }
     }
@@ -550,6 +582,12 @@ impl FaultFs {
     /// handle closed, the next file to ask for an id may get the same one.
     pub fn set_reuse_ids(&self, yes: bool) {
         self.st().reuse_ids = yes;
+    }
+
+    /// Compare names case-insensitively but keep the case they were created with, like NTFS,
+    /// exFAT or a `casefold` ext4 folder on Linux. [`FsBackend::folds_case`] then says so.
+    pub fn set_case_insensitive(&self, yes: bool) {
+        self.st().case_insensitive = yes;
     }
 
     /// Bytes currently allocated by all files.
@@ -675,6 +713,7 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let mut s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         if s.node(parent(&k)) != Some(Node::Dir) {
             return Err(not_found(path));
         }
@@ -737,6 +776,7 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let mut s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         if s.node(&k).is_some() {
             return Err(FsError::AlreadyExists {
                 path: path.to_path_buf(),
@@ -754,6 +794,7 @@ impl FsBackend for FaultFs {
         let k = key(dir)?;
         let mut s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         if s.node(&k) != Some(Node::Dir) {
             return Err(not_found(dir));
         }
@@ -775,6 +816,7 @@ impl FsBackend for FaultFs {
         let (a, b) = (key(from)?, key(to)?);
         let mut s = self.st();
         s.alive()?;
+        let (a, b) = (s.resolve(a), s.resolve(b));
         if s.node(&a).is_none() {
             return Err(not_found(from));
         }
@@ -802,6 +844,7 @@ impl FsBackend for FaultFs {
         let (a, b) = (key(src)?, key(dst)?);
         let mut s = self.st();
         s.alive()?;
+        let (a, b) = (s.resolve(a), s.resolve(b));
         let id = match s.node(&a) {
             Some(Node::File(id)) => id,
             Some(Node::Dir) => return Err(other("linking", src, "is a directory")),
@@ -830,6 +873,7 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let mut s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         let id = match s.node(&k) {
             Some(Node::File(id)) => id,
             Some(Node::Dir) => return Err(other("removing", path, "is a directory")),
@@ -846,6 +890,7 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let mut s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         if s.node(&k) != Some(Node::Dir) || k.is_empty() {
             return Err(not_found(path));
         }
@@ -862,6 +907,7 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         Ok(match s.node(&k) {
             None => None,
             Some(Node::Dir) => Some(Meta {
@@ -879,6 +925,7 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         if s.node(&k) != Some(Node::Dir) {
             return Err(not_found(path));
         }
@@ -893,11 +940,25 @@ impl FsBackend for FaultFs {
         let k = key(path)?;
         let mut s = self.st();
         s.alive()?;
+        let k = s.resolve(k);
         if s.node(&k).is_none() {
             return Err(not_found(path));
         }
         s.begin(Kind::Other, path)?;
         Ok(())
+    }
+
+    /// Answered from the setting rather than by creating a probe file, so the operation
+    /// indices that faults are scripted against stay the same.
+    fn folds_case(&self, dir: &Path) -> Result<bool> {
+        let k = key(dir)?;
+        let s = self.st();
+        s.alive()?;
+        let k = s.resolve(k);
+        if s.node(&k) != Some(Node::Dir) {
+            return Err(not_found(dir));
+        }
+        Ok(s.case_insensitive)
     }
 
     fn probe_volume(&self, _path: &Path) -> Result<VolumeInfo> {

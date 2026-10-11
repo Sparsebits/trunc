@@ -678,3 +678,15 @@ fn writes_past_a_deallocated_end_leave_holes() {
         assert!(allocated <= 1 << 20, "{allocated} bytes allocated");
     }
 }
+
+/// NTFS and APFS fold case; the probe finds that out and leaves nothing behind.
+#[test]
+fn case_folding_probe() {
+    let d = tempfile::tempdir().unwrap();
+    let folds = fs().folds_case(d.path()).unwrap();
+    if cfg!(any(windows, target_os = "macos")) {
+        assert!(folds);
+    }
+    assert!(fs().read_dir(d.path()).unwrap().is_empty());
+    assert!(fs().folds_case(&d.path().join("missing")).is_err());
+}

@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use trunc_core::path::CaseMode;
 use trunc_core::space::SpaceParams;
 use trunc_engine::consume::{ConsumeOptions, ConsumeSummary, RetryPolicy};
 use trunc_engine::streamconsume::{self, Mode, StreamOptions};
@@ -137,7 +138,14 @@ fn bound_with(arc: &str, bytes: &[u8], every: u64, o: &ConsumeOptions, hard_link
     let h = fs
         .open(Path::new(arc), OpenMode::Read, Share::Shared)
         .unwrap();
-    let layout = streamconsume::scan(h.as_ref(), Path::new(arc), every, &o.stream).unwrap();
+    let layout = streamconsume::scan(
+        h.as_ref(),
+        Path::new(arc),
+        every,
+        &o.stream,
+        CaseMode::host(),
+    )
+    .unwrap();
     // The margin covers the journal: header, entry list, checkpoint table and two slots.
     let p = SpaceParams {
         cluster_size: 1,
@@ -822,6 +830,7 @@ fn checkpoints(arc: &str, bytes: &[u8], o: &ConsumeOptions) -> usize {
         Path::new(arc),
         o.zip.checkpoint_every,
         &o.stream,
+        CaseMode::host(),
     )
     .unwrap()
     .ckpts
@@ -1431,5 +1440,55 @@ fn late_name_clashes_are_refused_untouched() {
             (insensitive, insensitive),
             "{a:?} vs {b:?}"
         );
+    }
+}
+
+/// A Linux destination can fold case (`casefold`, a mounted NTFS or exFAT volume). Names that
+/// differ only in case there are refused before anything is freed, not when the second output
+/// is created; a case-sensitive destination takes them (on Linux; Windows and macOS always
+/// compare case-insensitively).
+#[test]
+fn case_insensitive_destinations_are_found_up_front() {
+    let pairs: [&[Spec]; 3] = [
+        &[Spec::file("A.txt", b"upper"), Spec::file("a.txt", b"lower")],
+        &[Spec::file("x", b"file"), Spec::file("X/y", b"under")],
+        &[
+            Spec::file("d/Stra\u{df}e", b"1"),
+            Spec::file("D/STRA\u{df}E", b"2"),
+        ],
+    ];
+    for sp in pairs {
+        let bytes = tarbuild::gzip(&tarbuild::tar(sp), 6);
+        for folds in [true, false] {
+            let refused = folds || cfg!(any(windows, target_os = "macos"));
+            let fs = fresh(CrashModel::WriteThrough, &bytes);
+            fs.set_case_insensitive(folds);
+            let r = run(&fs, &opts(16 << 10));
+            assert_eq!(r.is_err(), refused, "{:?} folds={folds}: {r:?}", sp[1].name);
+            if refused {
+                let e = r.unwrap_err().to_string();
+                assert!(
+                    e.contains("differ only in case") || e.contains("nested"),
+                    "{e}"
+                );
+                assert_eq!(fs.get_file(Path::new(ARC)).unwrap(), bytes, "untouched");
+                assert!(fs.metadata(Path::new(DEST)).unwrap().is_none());
+            } else {
+                assert_complete(&fs, &expected(sp));
+            }
+
+            // Plain extraction refuses the same way, before writing anything.
+            let fs = fresh(CrashModel::WriteThrough, &bytes);
+            fs.set_case_insensitive(folds);
+            let r = streamconsume::extract_stream(
+                &fs,
+                Path::new(ARC),
+                Path::new(DEST),
+                false,
+                &StreamOptions::default(),
+            );
+            assert_eq!(r.is_err(), refused, "{:?} folds={folds}", sp[1].name);
+            assert_eq!(fs.metadata(Path::new(DEST)).unwrap().is_some(), !refused);
+        }
     }
 }

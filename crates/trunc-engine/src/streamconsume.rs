@@ -36,6 +36,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use trunc_core::path::CaseMode;
 use trunc_core::space::SpaceParams;
 use trunc_fs::{Dealloc, FileHandle, FileId, FsBackend, FsError, NodeKind, OpenMode, Share};
 use trunc_hash::Blake3Hasher;
@@ -617,12 +618,14 @@ fn single_name(codec: Codec, path: &Path) -> Result<String> {
 }
 
 /// Decode the whole archive without writing anything: check every codec checksum, parse and
-/// validate the tar headers, and build the checkpoint table for `every`.
+/// validate the tar headers (comparing names as `case` says the destination does), and build
+/// the checkpoint table for `every`.
 pub fn scan(
     archive: &dyn FileHandle,
     path: &Path,
     every: u64,
     opts: &StreamOptions,
+    case: CaseMode,
 ) -> Result<StreamLayout> {
     let file_len = archive.size()?;
     let _prof = trunc_prof::span("stream.scan").bytes(file_len);
@@ -632,7 +635,7 @@ pub fn scan(
             path.display()
         ))
     })?;
-    let reader = RefCell::new(tar::Reader::new());
+    let reader = RefCell::new(tar::Reader::with_case(case));
     let hasher = RefCell::new(Blake3Hasher::new());
     let mut ckpts = Vec::new();
     let end = run(
@@ -1672,11 +1675,14 @@ pub fn consume_stream(
                     archive_path.clone(),
                 ),
             };
+            // A resume needs no probe: these names were checked against this destination
+            // before the journal existed.
             let layout = scan(
                 held.input(),
                 &named,
                 opts.zip.checkpoint_every.max(1),
                 &opts.stream,
+                crate::stage::dest_case(fs, &dest)?,
             )?;
             let parts = match &held {
                 Held::One(_) => Vec::new(),
@@ -2041,7 +2047,13 @@ pub fn verify_stream(
     opts: &StreamOptions,
 ) -> Result<StreamLayout> {
     let h = source::open_read(fs, archive)?;
-    scan(h.as_ref(), &name_path(fs, archive)?, 0, opts)
+    scan(
+        h.as_ref(),
+        &name_path(fs, archive)?,
+        0,
+        opts,
+        CaseMode::host(),
+    )
 }
 
 /// Non-destructive extraction into `dest`. The archive is scanned (and every name validated)
@@ -2055,7 +2067,8 @@ pub fn extract_stream(
 ) -> Result<ConsumeSummary> {
     let _prof = trunc_prof::span("stream.extract");
     let h = source::open_read(fs, archive)?;
-    let layout = scan(h.as_ref(), &name_path(fs, archive)?, 0, opts)?;
+    let case = crate::stage::dest_case(fs, dest)?;
+    let layout = scan(h.as_ref(), &name_path(fs, archive)?, 0, opts, case)?;
     ensure_dir(fs, dest)?;
     let mut summary = ConsumeSummary::default();
     let mut dirs: BTreeSet<String> = BTreeSet::new();
@@ -2181,7 +2194,13 @@ pub fn open_layout(
     opts: &StreamOptions,
 ) -> Result<StreamLayout> {
     let h = source::open_read(fs, archive)?;
-    scan(h.as_ref(), &name_path(fs, archive)?, every, opts)
+    scan(
+        h.as_ref(),
+        &name_path(fs, archive)?,
+        every,
+        opts,
+        CaseMode::host(),
+    )
 }
 
 #[cfg(test)]

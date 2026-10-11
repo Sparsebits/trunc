@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use trunc_core::path::CaseMode;
 use trunc_fs::FileHandle;
 use unicode_normalization::UnicodeNormalization;
 
@@ -454,12 +455,18 @@ const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFLNK: u32 = 0o120_000;
 
-/// Parse an ISO 9660 image and validate it for extraction.
+/// Parse an ISO 9660 image and validate it for extraction on this computer.
 pub fn parse(src: &dyn FileHandle) -> Result<Image> {
-    parse_with(src, MAX_NAME_BYTES)
+    parse_with(src, CaseMode::host())
 }
 
-fn parse_with(src: &dyn FileHandle, max_name_bytes: usize) -> Result<Image> {
+/// Parse an ISO 9660 image and validate it for extraction into a destination that compares
+/// names as `case` says.
+pub fn parse_with(src: &dyn FileHandle, case: CaseMode) -> Result<Image> {
+    parse_limited(src, case, MAX_NAME_BYTES)
+}
+
+fn parse_limited(src: &dyn FileHandle, case: CaseMode, max_name_bytes: usize) -> Result<Image> {
     let file_len = src.size()?;
     let vds = read_descriptors(src, file_len)?;
     let pvd = &vds.primary;
@@ -654,10 +661,10 @@ fn parse_with(src: &dyn FileHandle, max_name_bytes: usize) -> Result<Image> {
             }
             let name = full_name(&dir.path, &comp)?;
             let last = name.rsplit('/').next().unwrap_or(&name);
-            if !seen.insert(trunc_core::path::host_key(last)) {
+            if !seen.insert(case.key(last)) {
                 return Err(IsoError::Name {
                     name,
-                    reason: if cfg!(any(windows, target_os = "macos")) {
+                    reason: if case == CaseMode::Insensitive {
                         "duplicate entry (names differ only in case)"
                     } else {
                         "duplicate entry"
@@ -907,8 +914,8 @@ mod tests {
             .expect("open");
         // 101 bytes for the directory, then 104 per file (its full path and a separator).
         let need = 101 + 20 * 104;
-        assert!(parse_with(h.as_ref(), need).is_ok());
-        match parse_with(h.as_ref(), need - 1) {
+        assert!(parse_limited(h.as_ref(), CaseMode::host(), need).is_ok());
+        match parse_limited(h.as_ref(), CaseMode::host(), need - 1) {
             Err(IsoError::Unsupported(m)) => assert!(m.contains("entry names"), "{m}"),
             other => panic!("expected a refusal, got {other:?}"),
         }

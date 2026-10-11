@@ -177,12 +177,49 @@ fn single(mut it: impl Iterator<Item = char>) -> Option<char> {
 
 /// Key used to detect entries that would be the same file on this computer: case-insensitive
 /// on Windows and macOS, exact on Linux (where `Makefile` and `makefile` are different files).
-/// Writes still check the exact name created, which catches case-insensitive Linux folders.
+/// Extraction probes the destination and uses [`CaseMode::key`] instead, so a case-insensitive
+/// Linux folder is caught too.
 pub fn host_key(path: &str) -> String {
-    if cfg!(any(windows, target_os = "macos")) {
-        collision_key(path)
-    } else {
-        path.to_owned()
+    CaseMode::host().key(path)
+}
+
+/// How a destination compares names, which decides when two entries are the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseMode {
+    /// Names are compared exactly (`Makefile` and `makefile` are two files).
+    Sensitive,
+    /// Names are compared through [`collision_key`].
+    Insensitive,
+}
+
+impl CaseMode {
+    /// How this computer's filesystems usually compare names: case-insensitively on Windows
+    /// and macOS, exactly elsewhere. A Linux folder can still be case-insensitive (`casefold`
+    /// ext4 or f2fs, a mounted NTFS, FAT, exFAT or SMB share, a case-insensitive ZFS dataset).
+    pub fn host() -> Self {
+        if cfg!(any(windows, target_os = "macos")) {
+            CaseMode::Insensitive
+        } else {
+            CaseMode::Sensitive
+        }
+    }
+
+    /// The mode for a destination that was found to fold case (or not). Folding is never
+    /// turned off where this computer's filesystems fold case by default.
+    pub fn for_destination(folds_case: bool) -> Self {
+        if folds_case {
+            CaseMode::Insensitive
+        } else {
+            Self::host()
+        }
+    }
+
+    /// Key under which two paths name the same file in this mode.
+    pub fn key(self, path: &str) -> String {
+        match self {
+            CaseMode::Sensitive => path.to_owned(),
+            CaseMode::Insensitive => collision_key(path),
+        }
     }
 }
 
@@ -384,6 +421,17 @@ mod tests {
             host_key("file") == host_key("f\u{131}le"),
             cfg!(any(windows, target_os = "macos"))
         );
+    }
+
+    #[test]
+    fn case_modes() {
+        assert_eq!(CaseMode::Sensitive.key("Makefile"), "Makefile");
+        assert_eq!(
+            CaseMode::Insensitive.key("Makefile"),
+            CaseMode::Insensitive.key("makef\u{131}le")
+        );
+        assert_eq!(CaseMode::for_destination(true), CaseMode::Insensitive);
+        assert_eq!(CaseMode::for_destination(false), CaseMode::host());
     }
 
     #[test]

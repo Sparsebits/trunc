@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use trunc_core::path::CaseMode;
 use trunc_fs::FileHandle;
 use unicode_normalization::UnicodeNormalization;
 
@@ -651,6 +652,7 @@ fn read_files(
     r: &mut Rd<'_>,
     folders: &mut [Folder],
     si: &StreamsInfo,
+    case: CaseMode,
 ) -> Result<(Vec<Entry>, usize)> {
     // Every file has a name of at least one code unit plus its terminator.
     let n = r.count("file")?;
@@ -759,10 +761,10 @@ fn read_files(
             (kind, size, crc, Some(fi), at)
         };
         let name = clean_name(raw)?;
-        if !seen.insert(trunc_core::path::host_key(&name)) {
+        if !seen.insert(case.key(&name)) {
             return Err(SevenZError::Name {
                 name,
-                reason: if cfg!(any(windows, target_os = "macos")) {
+                reason: if case == CaseMode::Insensitive {
                     "duplicate entry (names differ only in case)"
                 } else {
                     "duplicate entry"
@@ -794,12 +796,12 @@ fn read_files(
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| trunc_core::path::host_key(&e.name))
+        .map(|e| case.key(&e.name))
         .collect();
     for e in &entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&trunc_core::path::host_key(pp)) {
+            if files.contains(&case.key(pp)) {
                 return Err(SevenZError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),
@@ -811,7 +813,12 @@ fn read_files(
     Ok((entries, anti_items))
 }
 
-fn read_header(r: &mut Rd<'_>, header_offset: u64, max_window: u64) -> Result<Layout> {
+fn read_header(
+    r: &mut Rd<'_>,
+    header_offset: u64,
+    max_window: u64,
+    case: CaseMode,
+) -> Result<Layout> {
     let mut id = r.u8()?;
     if id == K_ARCHIVE_PROPERTIES {
         loop {
@@ -833,7 +840,7 @@ fn read_header(r: &mut Rd<'_>, header_offset: u64, max_window: u64) -> Result<La
     }
     let mut folders = place_folders(&si, header_offset)?;
     let (entries, anti_items) = if id == K_FILES_INFO {
-        let v = read_files(r, &mut folders, &si)?;
+        let v = read_files(r, &mut folders, &si, case)?;
         id = r.u8()?;
         v
     } else {
@@ -861,7 +868,7 @@ fn read_header(r: &mut Rd<'_>, header_offset: u64, max_window: u64) -> Result<La
     })
 }
 
-pub(super) fn parse(src: &dyn FileHandle, max_window: u64) -> Result<Layout> {
+pub(super) fn parse(src: &dyn FileHandle, max_window: u64, case: CaseMode) -> Result<Layout> {
     let file_len = src.size()?;
     if file_len < SIGNATURE_HEADER_LEN {
         return Err(SevenZError::NotSevenZ("too short"));
@@ -918,7 +925,7 @@ pub(super) fn parse(src: &dyn FileHandle, max_window: u64) -> Result<Layout> {
         let mut r = Rd::new(&buf);
         match r.u8()? {
             K_HEADER => {
-                let mut l = read_header(&mut r, header_offset, max_window)?;
+                let mut l = read_header(&mut r, header_offset, max_window, case)?;
                 l.file_len = file_len;
                 l.encoded_header = encoded;
                 return Ok(l);

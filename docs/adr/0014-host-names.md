@@ -24,8 +24,15 @@ case (`xt_CONNMARK.h` and `xt_connmark.h`). trunc refused both, everywhere.
 ## Consequences
 - The same tarball may extract on Linux and be refused on Windows. The refusal happens during
   the read-only scan, before anything is written or freed.
-- On a case-insensitive Linux folder (`casefold`), two entries that differ only in case are
-  caught when `--consume` creates the second, because staged outputs are checked against the
-  exact name the filesystem reports; that happens before anything is freed. A plain
-  extraction refuses the second as already existing, unless `--overwrite` is given, in which
-  case it replaces the first, as `tar` does.
+- A Linux destination can still be case-insensitive (ext4 or f2fs with `casefold`, a mounted
+  NTFS, FAT, exFAT or SMB share, ZFS with `casesensitivity=insensitive`). Before the scan,
+  trunc probes the destination (or its nearest existing ancestor) by creating
+  `.trunc-stage-case-probe`, looking it up upper-cased and removing it. If the name resolves,
+  duplicates are compared with the case-insensitive key for that run, for every format, so two
+  entries that differ only in case are refused during the read-only scan, before anything is
+  written or freed. Without the probe the clash would surface only when `--consume` created the
+  second output, after earlier archive bytes were freed, and again on every resume. A resume
+  reuses the names checked when its journal was created. Windows and macOS skip the probe:
+  names there always compare case-insensitively. Container image layers are the exception to
+  refusing: under the probed mode their case-only twins are left out and reported, and a
+  whiteout that names a path only up to case is refused (ADR-0016).

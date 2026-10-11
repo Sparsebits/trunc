@@ -21,6 +21,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{Dealloc, FileHandle, FileId, FsBackend, FsError};
 use trunc_hash::Sha256Hasher;
 use trunc_legacy::stream::{self, Codec, Input, Limits, NoHistory, StreamError};
@@ -291,12 +292,14 @@ struct Merger<'a> {
     tree: BTreeMap<String, Node>,
     stats: MergeStats,
     written: u64,
+    /// How the destination compares names; the tree is keyed by [`CaseMode::key`].
+    case: CaseMode,
 }
 
 fn case_clash(a: &str, b: &str) -> Error {
     Error::Refused(format!(
-        "layers name the same path as {a:?} and {b:?}, which differ only in case on this \
-         computer; refusing to merge them"
+        "layers name the same path as {a:?} and {b:?}, which differ only in case in the \
+         destination; refusing to merge them"
     ))
 }
 
@@ -379,7 +382,7 @@ impl Merger<'_> {
         }
         let target = &base[WHITEOUT.len()..];
         if base == OPAQUE {
-            let key = trunc_core::path::host_key(parent.unwrap_or(""));
+            let key = self.case.key(parent.unwrap_or(""));
             self.remove_lower(&key, li, true)?;
             self.stats.opaques += 1;
         } else if target.starts_with(WHITEOUT) {
@@ -395,7 +398,7 @@ impl Merger<'_> {
                 Some(p) => format!("{p}/{target}"),
                 None => target.to_owned(),
             };
-            let key = trunc_core::path::host_key(&victim);
+            let key = self.case.key(&victim);
             if let Some(n) = self.tree.get(&key) {
                 if n.name != victim {
                     return Err(case_clash(&n.name, &victim));
@@ -430,7 +433,7 @@ impl Merger<'_> {
         while let Some(i) = e.name[end..].find('/') {
             let a = &e.name[..end + i];
             end += i + 1;
-            let key = trunc_core::path::host_key(a);
+            let key = self.case.key(a);
             match self.tree.get(&key) {
                 Some(n) if n.name != a => return Err(case_clash(&n.name, a)),
                 Some(n) if n.kind == Kind::Dir => continue,
@@ -448,7 +451,7 @@ impl Merger<'_> {
                 },
             );
         }
-        let key = trunc_core::path::host_key(&e.name);
+        let key = self.case.key(&e.name);
         let mut dir_exists = false;
         if let Some(n) = self.tree.get(&key) {
             if n.name != e.name {
@@ -525,12 +528,15 @@ fn run(
     open: &mut OpenLayer<'_>,
     on_layer: &mut dyn FnMut(usize, &LayerSpec),
 ) -> Result<ImageSummary> {
+    // The stage lives in `dest`, so `dest` (which exists by now) decides how names compare.
+    let case = crate::stage::dest_case(fs, dest)?;
     let mut m = Merger {
         fs,
         stage,
         tree: BTreeMap::new(),
         stats: MergeStats::default(),
         written: 0,
+        case,
     };
     let protected = |_: &FileId| false;
     let guard = StageGuard {
@@ -551,7 +557,7 @@ fn run(
         let what = format!("layer {} ({})", li + 1, spec.digest);
         let body = open(li, spec)?;
         let blob = StreamBlob::new(&what, spec.size, body);
-        let mut reader = tar::Reader::new();
+        let mut reader = tar::Reader::with_case(case);
         let mut diff = Sha256Hasher::new();
         // The entry whose content is being written: (entry, handle).
         let mut cur: Option<(tar::Entry, Box<dyn FileHandle>)> = None;

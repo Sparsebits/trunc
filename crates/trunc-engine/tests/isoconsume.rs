@@ -349,6 +349,37 @@ fn hostile_images_are_refused_untouched() {
     assert_eq!(fs.snapshot().keys().collect::<Vec<_>>(), vec!["a.iso"]);
 }
 
+/// Rock Ridge names that differ only in case are refused before anything is freed when the
+/// destination folds case (a `casefold` or NTFS folder on Linux), and extracted where it does
+/// not (on Linux; Windows and macOS always compare case-insensitively).
+#[test]
+fn case_insensitive_destinations_are_found_up_front() {
+    let sp = vec![
+        Spec::file("d/A.txt", b"upper"),
+        Spec::file("d/a.txt", b"lower"),
+    ];
+    let bytes = build(&sp);
+    for folds in [true, false] {
+        let refused = folds || cfg!(any(windows, target_os = "macos"));
+        let fs = fresh(CrashModel::WriteThrough, &bytes);
+        fs.set_case_insensitive(folds);
+        let r = run(&fs, &opts());
+        assert_eq!(r.is_err(), refused, "folds={folds}: {r:?}");
+        if refused {
+            assert_eq!(fs.snapshot().keys().collect::<Vec<_>>(), vec!["a.iso"]);
+            assert_eq!(fs.get_file(Path::new(ARC)).unwrap(), bytes, "untouched");
+        } else {
+            assert_complete(&fs, &expected(&sp));
+        }
+
+        let fs = fresh(CrashModel::WriteThrough, &bytes);
+        fs.set_case_insensitive(folds);
+        let r = isoconsume::extract_iso(&fs, Path::new(ARC), Path::new(DEST), false, false);
+        assert_eq!(r.is_err(), refused, "extract, folds={folds}");
+        assert_eq!(fs.metadata(Path::new(DEST)).unwrap().is_some(), !refused);
+    }
+}
+
 #[test]
 fn a_file_changed_before_extraction_is_caught_before_release() {
     // Interrupt a consumption after its journal exists, then change a file still in the image

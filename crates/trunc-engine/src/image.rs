@@ -16,14 +16,16 @@
 //!    is ever deleted. Digests are checked again while decoding the second time.
 //!
 //! Symlinks, devices and FIFOs in the image are skipped (counted), as for tarballs. Paths this
-//! computer cannot create (names Windows forbids, names that differ only in case on Windows and
-//! macOS) are left out of the tree after the merge and reported; see [`Skipped`].
+//! computer cannot create (names Windows forbids, names that differ only in case in a
+//! destination that folds case: always on Windows and macOS, on Linux when the destination is
+//! found to) are left out of the tree after the merge and reported; see [`Skipped`].
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{Dealloc, FileHandle, FileId, FsBackend, FsError, NodeKind, OpenMode, Share};
 use trunc_hash::Sha256Hasher;
 use trunc_legacy::stream::{self, Codec, Input, Limits, NoHistory, StreamError};
@@ -355,8 +357,13 @@ fn decode(
 
 /// Index an uncompressed tar by reading its headers only: file contents are skipped (fed to
 /// the parser as zeros) rather than read.
-pub(crate) fn index_tar(h: &dyn FileHandle, len: u64, what: &str) -> Result<Vec<tar::Entry>> {
-    let mut r = tar::Reader::new();
+pub(crate) fn index_tar(
+    h: &dyn FileHandle,
+    len: u64,
+    what: &str,
+    case: CaseMode,
+) -> Result<Vec<tar::Entry>> {
+    let mut r = tar::Reader::with_case(case);
     let zeros = vec![0u8; 64 << 10];
     let mut block = [0u8; 512];
     let mut known = 0usize;
@@ -464,7 +471,7 @@ impl Outer {
         let codec = Codec::sniff(&head(h.as_ref(), file_len)?);
         let what = archive.display().to_string();
         let Some(c) = codec else {
-            let entries = index_tar(h.as_ref(), file_len, &what)?;
+            let entries = index_tar(h.as_ref(), file_len, &what, CaseMode::host())?;
             return Ok(Opened {
                 outer: Self::from_entries(h, &entries, None, file_len),
                 temp: None,
@@ -1362,7 +1369,7 @@ fn remove_children(tree: &mut BTreeMap<String, Node>, key: &str) -> Vec<Node> {
     keys.into_iter().filter_map(|k| tree.remove(&k)).collect()
 }
 
-/// Record that `a` and `b`, at tree key `key`, differ only in case on this computer.
+/// Record that `a` and `b`, at tree key `key`, differ only in case in the destination.
 fn note_clash(clashes: &mut BTreeMap<String, BTreeSet<String>>, key: &str, a: &str, b: &str) {
     let names = clashes.entry(key.to_owned()).or_default();
     names.insert(a.to_owned());
@@ -1372,10 +1379,12 @@ fn note_clash(clashes: &mut BTreeMap<String, BTreeSet<String>>, key: &str, a: &s
 /// Take out of the tree what this computer cannot create, each with everything below it:
 /// paths with a name it forbids ([`trunc_core::path::host_unusable`]: on Windows `:`, trailing
 /// dots, device names like `aux.h`, ...), and every name of a group that differs only in case
-/// (`clashes`), since keeping one would silently change what the others hold.
+/// (`clashes`), since keeping one would silently change what the others hold. `case` is how
+/// the tree is keyed.
 fn leave_out(
     tree: &mut BTreeMap<String, Node>,
     clashes: &BTreeMap<String, BTreeSet<String>>,
+    case: CaseMode,
 ) -> Vec<Skipped> {
     // Tree key of each path to leave out: its names, and why (`None`: a case clash).
     let mut roots: BTreeMap<String, (BTreeSet<String>, Option<&'static str>)> = clashes
@@ -1385,7 +1394,7 @@ fn leave_out(
     for n in tree.values() {
         if let Some((part, why)) = trunc_core::path::host_unusable(&n.name) {
             roots
-                .entry(trunc_core::path::host_key(part))
+                .entry(case.key(part))
                 .or_insert_with(|| (BTreeSet::from([part.to_owned()]), Some(why)));
         }
     }
@@ -1437,21 +1446,27 @@ fn leave_out(
 
 fn case_clash(a: &str, b: &str) -> Error {
     Error::Refused(format!(
-        "layers name the same path as {a:?} and {b:?}, which differ only in case on this          computer; refusing to merge them"
+        "layers name the same path as {a:?} and {b:?}, which differ only in case in the \
+         destination; refusing to merge them"
     ))
 }
 
 /// Check the ancestors of the whiteout or opaque marker `path` (in layer `li`) against the
 /// tree: each one there must be named exactly as in `path` (not only up to case), and must not
-/// be a symlink.
+/// be a symlink. `case` is how the tree is keyed.
 /// Runtimes resolve such a path through the symlink (`lib/x` with `lib -> usr/lib` lands in
 /// `usr/lib/x`); that is not supported yet, so it is refused rather than merged wrongly.
-fn check_ancestors(tree: &BTreeMap<String, Node>, path: &str, li: usize) -> Result<()> {
+fn check_ancestors(
+    tree: &BTreeMap<String, Node>,
+    path: &str,
+    li: usize,
+    case: CaseMode,
+) -> Result<()> {
     let mut end = 0usize;
     while let Some(i) = path[end..].find('/') {
         let a = &path[..end + i];
         end += i + 1;
-        if let Some(n) = tree.get(&trunc_core::path::host_key(a)) {
+        if let Some(n) = tree.get(&case.key(a)) {
             if n.name != a {
                 return Err(case_clash(&n.name, a));
             }
@@ -1486,8 +1501,19 @@ fn through_symlink(li: usize, path: &str, link: &str, link_layer: usize) -> Erro
 /// opaque marker) is skipped.
 ///
 /// Paths this computer cannot create are then left out of the tree and returned (see
-/// [`leave_out`]); whiteouts and opaque markers have applied to them as to any path.
+/// [`leave_out`]); whiteouts and opaque markers have applied to them as to any path. Names are
+/// compared as this computer usually does ([`CaseMode::host`]); see [`merge_layers_with`].
 pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeStats, Vec<Skipped>)> {
+    merge_layers_with(layers, CaseMode::host())
+}
+
+/// [`merge_layers`] for a destination that compares names as `case` says: in
+/// [`CaseMode::Insensitive`], paths that differ only in case are left out and reported, and a
+/// whiteout that names a path only up to case is refused.
+pub fn merge_layers_with(
+    layers: &[Vec<tar::Entry>],
+    case: CaseMode,
+) -> Result<(Vec<Winner>, MergeStats, Vec<Skipped>)> {
     // Tarballs make hard links from staged targets; layers would need that across the merge
     // (a later layer may delete or replace the target), which is not supported yet.
     for (li, layer) in layers.iter().enumerate() {
@@ -1573,15 +1599,15 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             }
         }
         for (d, marker) in &opaque {
-            check_ancestors(&tree, marker, li)?;
-            let gone = remove_children(&mut tree, &trunc_core::path::host_key(d));
+            check_ancestors(&tree, marker, li, case)?;
+            let gone = remove_children(&mut tree, &case.key(d));
             shadow(gone, &mut stats);
             stats.opaques += 1;
         }
         for (d, marker) in &deleted {
-            check_ancestors(&tree, marker, li)?;
-            let key = trunc_core::path::host_key(d);
-            // `.wh.Foo` must not delete `foo` just because this computer folds case.
+            check_ancestors(&tree, marker, li, case)?;
+            let key = case.key(d);
+            // `.wh.Foo` must not delete `foo` just because the destination folds case.
             if let Some(n) = tree.get(&key).filter(|n| n.name != *d) {
                 return Err(case_clash(&n.name, d));
             }
@@ -1596,7 +1622,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             while let Some(i) = e.name[end..].find('/') {
                 let a = &e.name[..end + i];
                 end += i + 1;
-                let key = trunc_core::path::host_key(a);
+                let key = case.key(a);
                 if let Some(n) = tree.get(&key).filter(|n| n.name != a) {
                     note_clash(&mut clashes, &key, &n.name, a);
                 }
@@ -1621,7 +1647,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                     },
                 );
             }
-            let key = trunc_core::path::host_key(&e.name);
+            let key = case.key(&e.name);
             if let Some(n) = tree.get(&key) {
                 if n.name != e.name {
                     note_clash(&mut clashes, &key, &n.name, &e.name);
@@ -1644,7 +1670,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             );
         }
     }
-    let skipped = leave_out(&mut tree, &clashes);
+    let skipped = leave_out(&mut tree, &clashes, case);
     stats.skipped = skipped.iter().map(|s| s.entries).sum();
     let winners = tree
         .into_values()
@@ -1704,7 +1730,7 @@ pub fn detect(fs: &dyn FsBackend, path: &Path) -> bool {
             {
                 return false;
             }
-            match index_tar(h.as_ref(), len, "") {
+            match index_tar(h.as_ref(), len, "", CaseMode::host()) {
                 Ok(entries) => structure(&Outer::from_entries(h, &entries, None, len)).is_some(),
                 Err(_) => false,
             }
@@ -1796,14 +1822,15 @@ pub fn inspect_image(
     with_outer(fs, archive, temp_dir, opts, |outer| metadata(outer, opts))
 }
 
-fn scan_outer(outer: &Outer, opts: &ImageOptions) -> Result<ImageScan> {
+fn scan_outer(outer: &Outer, opts: &ImageOptions, case: CaseMode) -> Result<ImageScan> {
     let _prof = trunc_prof::span("image.scan");
     let info = metadata(outer, opts)?;
     let mut all = Vec::with_capacity(info.layers.len());
     let mut lens = Vec::with_capacity(info.layers.len());
     for (i, layer) in info.layers.iter().enumerate() {
         let what = format!("layer {} ({})", i + 1, layer.path);
-        // Names this computer cannot create are left out after the merge, not refused here.
+        // Names the destination cannot hold (forbidden, or case-only twins) are left out after
+        // the merge, not refused here.
         let mut reader = tar::Reader::with_safe_names();
         let len = read_layer(outer, i, layer, opts, &mut |b| {
             reader.feed(b).map_err(tar_err(&what))
@@ -1812,7 +1839,7 @@ fn scan_outer(outer: &Outer, opts: &ImageOptions) -> Result<ImageScan> {
         lens.push(len);
         all.push(entries);
     }
-    let (tree, stats, skipped) = merge_layers(&all)?;
+    let (tree, stats, skipped) = merge_layers_with(&all, case)?;
     Ok(ImageScan {
         layer_entries: all.iter().map(Vec::len).collect(),
         info,
@@ -1833,7 +1860,9 @@ pub fn verify_image(
     temp_dir: &Path,
     opts: &ImageOptions,
 ) -> Result<ImageScan> {
-    with_outer(fs, archive, temp_dir, opts, |outer| scan_outer(outer, opts))
+    with_outer(fs, archive, temp_dir, opts, |outer| {
+        scan_outer(outer, opts, CaseMode::host())
+    })
 }
 
 /// Remove a staging tree left by a failed extraction (best effort; links are removed, never
@@ -1869,8 +1898,9 @@ pub fn extract_image(
 ) -> Result<ImageSummary> {
     let _prof = trunc_prof::span("image.extract");
     ensure_dir(fs, dest)?;
+    let case = crate::stage::dest_case(fs, dest)?;
     with_outer(fs, archive, dest, opts, |outer| {
-        let scan = scan_outer(outer, opts)?;
+        let scan = scan_outer(outer, opts, case)?;
         before_write(&scan)?;
         let items: Vec<Item> = scan
             .tree

@@ -13,6 +13,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{FileHandle, FsBackend};
 use trunc_journal::Journal;
 use trunc_legacy::iso::{self, Image, IsoError};
@@ -37,15 +38,19 @@ fn parse_err(archive: &Path, e: IsoError) -> Error {
     }
 }
 
-fn parse(fs: &dyn FsBackend, archive: &Path) -> Result<(Box<dyn FileHandle>, Image)> {
+fn parse(
+    fs: &dyn FsBackend,
+    archive: &Path,
+    case: CaseMode,
+) -> Result<(Box<dyn FileHandle>, Image)> {
     let h = crate::source::open_read(fs, archive)?;
-    let img = iso::parse(h.as_ref()).map_err(|e| parse_err(archive, e))?;
+    let img = iso::parse_with(h.as_ref(), case).map_err(|e| parse_err(archive, e))?;
     Ok((h, img))
 }
 
 /// Parse an image for inspection or planning.
 pub fn open_image(fs: &dyn FsBackend, archive: &Path) -> Result<Image> {
-    parse(fs, archive).map(|(_, img)| img)
+    parse(fs, archive, CaseMode::host()).map(|(_, img)| img)
 }
 
 /// Fill in every file's CRC-32 by reading its data once.
@@ -138,8 +143,8 @@ pub fn consume_iso(
     let scanned: Cell<Option<Counts>> = Cell::new(None);
     let format = Format {
         magic: PREAMBLE_MAGIC,
-        scan: &|h| {
-            let img = iso::parse(h).map_err(|e| parse_err(archive_path, e))?;
+        scan: &|h, case| {
+            let img = iso::parse_with(h, case).map_err(|e| parse_err(archive_path, e))?;
             if let Some(why) = skipped_refusal(&img).filter(|_| !allow_skipped) {
                 return Err(Error::Refused(why));
             }
@@ -171,7 +176,7 @@ pub fn extract_iso(
     overwrite: bool,
     allow_overlap: bool,
 ) -> Result<ConsumeSummary> {
-    let (h, img) = parse(fs, archive)?;
+    let (h, img) = parse(fs, archive, crate::stage::dest_case(fs, dest)?)?;
     if img.partial_overlaps > 0 && !allow_overlap {
         return Err(Error::Refused(format!(
             "{} files partly overlap another file's data, which no ISO authoring tool writes; \

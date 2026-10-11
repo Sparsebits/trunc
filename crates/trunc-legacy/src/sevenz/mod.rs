@@ -20,6 +20,7 @@
 mod folder;
 mod header;
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{FileHandle, FsError};
 
 pub use folder::decode_folder;
@@ -174,8 +175,13 @@ pub fn sniff(head: &[u8]) -> bool {
     head.starts_with(&SIGNATURE)
 }
 
-/// Parse and validate a 7z archive. `max_window` bounds every LZMA dictionary (memory), also
-/// the one of a compressed header.
+/// Parse and validate a 7z archive for extraction on this computer. `max_window` bounds every
+/// LZMA dictionary (memory), also the one of a compressed header.
 pub fn parse(src: &dyn FileHandle, max_window: u64) -> Result<Layout> {
-    header::parse(src, max_window)
+    parse_with(src, max_window, CaseMode::host())
+}
+
+/// [`parse`] for a destination that compares names as `case` says.
+pub fn parse_with(src: &dyn FileHandle, max_window: u64, case: CaseMode) -> Result<Layout> {
+    header::parse(src, max_window, case)
 }

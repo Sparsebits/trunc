@@ -334,7 +334,9 @@ pub fn extract_7z(
 ) -> Result<ConsumeSummary> {
     let _prof = trunc_prof::span("7z.extract");
     let h = source::open_read(fs, archive)?;
-    let layout = sevenz::parse(h.as_ref(), max_window).map_err(|e| sz_err(archive, e))?;
+    let case = crate::stage::dest_case(fs, dest)?;
+    let layout =
+        sevenz::parse_with(h.as_ref(), max_window, case).map_err(|e| sz_err(archive, e))?;
     ensure_dir(fs, dest)?;
     check_dest(fs, dest, &layout, overwrite)?;
     let stage: PathBuf = stage_dir(dest, &stage_id(h.as_ref(), &layout)?);
