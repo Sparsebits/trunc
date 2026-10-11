@@ -1,0 +1,23 @@
+# Recipe: a large downloaded artifact (model weights, a toolchain, a dataset).
+#
+# Instead of
+#     curl -fsSL https://example.com/model.tar.zst | tar --zstd -x -C models
+# which cannot check a checksum before extracting and leaves a half-extracted tree when the
+# connection drops, or
+#     curl -o model.tar.zst ... && sha256sum -c ... && tar -xf model.tar.zst && rm model.tar.zst
+# which needs the archive and the tree on disk at once, ci-restore downloads the archive (with
+# retries), checks its SHA-256, then unpacks it while freeing it: peak disk is about the size
+# of the tree.
+name: evaluate
+on: workflow_dispatch
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Sparsebits/trunc/flavors/ci-restore@main # pin to a commit SHA in real use
+        id: model
+        with:
+          archive: https://example.com/releases/model-7b.tar.zst
+          sha256: 0000000000000000000000000000000000000000000000000000000000000000 # the real one
+          path: models
+      - run: echo "wrote ${{ steps.model.outputs.bytes-written }} bytes in ${{ steps.model.outputs.duration }} s"
