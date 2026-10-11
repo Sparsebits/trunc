@@ -4,7 +4,7 @@
 /// A parsed JSON value. Numbers keep their text: image metadata only needs sizes, which are
 /// read as integers on demand.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Json {
+pub enum Json {
     Null,
     Bool(bool),
     Num(String),
@@ -16,7 +16,7 @@ pub(crate) enum Json {
 const MAX_DEPTH: usize = 64;
 
 impl Json {
-    pub(crate) fn parse(text: &[u8]) -> Result<Json, String> {
+    pub fn parse(text: &[u8]) -> Result<Json, String> {
         let mut p = Parser { b: text, i: 0 };
         // A UTF-8 byte order mark is tolerated (some tools write one).
         if p.b.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -31,28 +31,28 @@ impl Json {
     }
 
     /// The member `key` of an object.
-    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
+    pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Obj(m) => m.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    pub(crate) fn str(&self) -> Option<&str> {
+    pub fn str(&self) -> Option<&str> {
         match self {
             Json::Str(s) => Some(s),
             _ => None,
         }
     }
 
-    pub(crate) fn arr(&self) -> Option<&[Json]> {
+    pub fn arr(&self) -> Option<&[Json]> {
         match self {
             Json::Arr(a) => Some(a),
             _ => None,
         }
     }
 
-    pub(crate) fn u64(&self) -> Option<u64> {
+    pub fn u64(&self) -> Option<u64> {
         match self {
             Json::Num(n) => n.parse().ok(),
             _ => None,
@@ -60,7 +60,7 @@ impl Json {
     }
 
     /// `self[key]` as a string.
-    pub(crate) fn get_str(&self, key: &str) -> Option<&str> {
+    pub fn get_str(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(Json::str)
     }
 }

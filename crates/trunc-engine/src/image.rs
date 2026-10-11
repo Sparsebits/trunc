@@ -272,14 +272,14 @@ struct Outer {
     file_len: u64,
 }
 
-fn tar_err(what: &str) -> impl Fn(tar::TarError) -> Error + '_ {
+pub(crate) fn tar_err(what: &str) -> impl Fn(tar::TarError) -> Error + '_ {
     move |e| match e {
         tar::TarError::Name { .. } => Error::Refused(format!("{what}: {e}")),
         _ => Error::Input(format!("{what}: {e}")),
     }
 }
 
-fn stream_err(e: StreamError) -> Error {
+pub(crate) fn stream_err(e: StreamError) -> Error {
     match e {
         StreamError::Fs(f) => f.into(),
         StreamError::Corrupt(m) => Error::Integrity(m),
@@ -482,7 +482,7 @@ fn head(h: &dyn FileHandle, len: u64) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     let mut b = [0u8; 8];
     // A clash only makes the CreateNew fail; the clock is a fine fallback.
     if getrandom::fill(&mut b).is_err() {
@@ -513,7 +513,7 @@ fn blob_path(digest: &str) -> Result<String> {
     Ok(format!("blobs/sha256/{}", digest_hex(digest)?))
 }
 
-fn digest_hex(digest: &str) -> Result<&str> {
+pub(crate) fn digest_hex(digest: &str) -> Result<&str> {
     let (alg, hex) = digest
         .split_once(':')
         .ok_or_else(|| Error::Input(format!("invalid digest {digest:?}")))?;
@@ -528,7 +528,7 @@ fn digest_hex(digest: &str) -> Result<&str> {
     Ok(hex)
 }
 
-fn check_digest(what: &str, want: &str, got: &[u8; 32]) -> Result<()> {
+pub(crate) fn check_digest(what: &str, want: &str, got: &[u8; 32]) -> Result<()> {
     if digest_hex(want)? != hex::encode(got) {
         return Err(Error::Integrity(format!(
             "{what}: sha256 is sha256:{}, but the image says {want}",
@@ -609,7 +609,7 @@ pub fn host_platform() -> (&'static str, &'static str) {
 
 /// Whether `have` (`os/arch[/variant]`) is what `want` asks for; a request without a variant
 /// matches any variant.
-fn platform_matches(have: &str, want: &str) -> bool {
+pub fn platform_matches(have: &str, want: &str) -> bool {
     if have == want {
         return true;
     }
@@ -618,7 +618,7 @@ fn platform_matches(have: &str, want: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Declared {
+pub(crate) enum Declared {
     /// Not recorded (`docker save` layers): sniffed.
     Unknown,
     Tar,
@@ -626,7 +626,7 @@ enum Declared {
     Zstd,
 }
 
-fn declared(media_type: &str) -> Result<Declared> {
+pub(crate) fn declared(media_type: &str) -> Result<Declared> {
     const LAYER: [&str; 4] = [
         "application/vnd.oci.image.layer.v1.tar",
         "application/vnd.oci.image.layer.nondistributable.v1.tar",
@@ -1427,7 +1427,7 @@ pub fn verify_image(
 
 /// Remove a staging tree left by a failed extraction (best effort; links are removed, never
 /// followed).
-fn remove_tree(fs: &dyn FsBackend, p: &Path) {
+pub(crate) fn remove_tree(fs: &dyn FsBackend, p: &Path) {
     match fs.metadata(p) {
         Ok(Some(m)) if m.kind == NodeKind::Dir => {
             if let Ok(names) = fs.read_dir(p) {
