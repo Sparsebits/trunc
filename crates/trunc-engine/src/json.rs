@@ -63,6 +63,51 @@ impl Json {
     pub(crate) fn get_str(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(Json::str)
     }
+
+    /// Append compact JSON text that parses back to `self` (used by the fuzz targets).
+    pub(crate) fn write(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) => out.push_str(n),
+            Json::Str(s) => write_str(s, out),
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_str(k, out);
+                    out.push(':');
+                    v.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+fn write_str(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 struct Parser<'a> {
@@ -267,6 +312,12 @@ mod tests {
         assert_eq!(m.get_str("u"), Some("é😀\n"));
         assert_eq!(m.get("t"), Some(&Json::Bool(true)));
         assert_eq!(Json::parse(b"123").unwrap().u64(), Some(123));
+        let mut text = String::new();
+        j.write(&mut text);
+        assert_eq!(Json::parse(text.as_bytes()).unwrap(), j);
+        let mut s = String::new();
+        Json::Str("\"\\\u{1}é".into()).write(&mut s);
+        assert_eq!(s, r#""\"\\\u0001é""#);
     }
 
     #[test]
