@@ -165,9 +165,10 @@ Paths are relative, `/`-separated, NFC-normalized UTF-8. A path MUST be rejected
 - it has an empty component (leading, trailing or doubled `/`) or a `.` or `..` component;
 - a component contains a control character (`< 0x20` or `0x7F`), `\`, `:`, `<`, `>`, `"`, `|`, `?` or `*`;
 - a component ends in `.` or a space;
-- a component's stem (the text before its first `.`) is a reserved Windows device name: `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9` or `LPT0`–`LPT9`, in any case.
+- a component's stem (the text before its first `.`, with trailing spaces removed) is a reserved Windows device name: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9`, `COM¹`–`COM³`, `LPT0`–`LPT9` or `LPT¹`–`LPT³`, in any ASCII case;
+- its first component starts with `.trunc-stage-` (compared with the key below), the prefix of the extractor's staging directory.
 
-Two entries MUST NOT have paths that are equal after lowercasing. No entry may be nested under a non-directory entry.
+Two entries MUST NOT have paths with equal collision keys. The key maps each character to its simple uppercase and that to its simple lowercase, keeping a character whose mapping is not exactly one character. This joins every pair NTFS's upcase table joins (`ı`/`i`, `ſ`/`s`, `ς`/`σ`) and every pair simple Unicode case folding joins (as on APFS). No entry may be nested under a non-directory entry.
 
 These rules are the intersection of what Windows, macOS and Linux accept. They also guarantee that no entry can name a location outside the extraction root.
 

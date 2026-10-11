@@ -90,3 +90,35 @@ fn concatenated_archives_and_garbage_are_refused() {
         "truncated inside an entry"
     );
 }
+
+#[test]
+fn names_ntfs_upper_cases_together_collide_up_front() {
+    // `to_lowercase` keeps these apart; NTFS's upcase table (and macOS case folding) do not.
+    for (a, b) in [
+        ("file", "f\u{131}le"),
+        ("sea.txt", "\u{17f}ea.txt"),
+        ("\u{3b1}\u{3c3}", "\u{3b1}\u{3c2}"),
+        // The Kelvin sign is not NFC: it is normalized to "K" first.
+        ("kelvin", "\u{212a}elvin"),
+    ] {
+        let tar = tarbuild::tar(&[Spec::file(a, b"1"), Spec::file(b, b"2").via(NameVia::Pax)]);
+        assert_eq!(
+            matches!(parse(&tar, 512), Err(TarError::Name { .. })),
+            cfg!(any(windows, target_os = "macos")),
+            "{a:?} vs {b:?}"
+        );
+    }
+}
+
+#[test]
+fn staging_directory_names_are_refused_at_the_top() {
+    for bad in [".trunc-stage-0011", "./.trunc-stage-x/inner.txt"] {
+        let tar = tarbuild::tar(&[Spec::file(bad, b"x")]);
+        assert!(
+            matches!(parse(&tar, 512), Err(TarError::Name { .. })),
+            "{bad:?}"
+        );
+    }
+    let tar = tarbuild::tar(&[Spec::file("dir/.trunc-stage-0011", b"x")]);
+    assert!(parse(&tar, 512).is_ok());
+}

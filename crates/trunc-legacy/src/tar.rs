@@ -15,8 +15,13 @@ pub const BLOCK: u64 = 512;
 const BLOCK_BYTES: usize = 512;
 /// Largest GNU long name/link or PAX header accepted (bounds memory on hostile input).
 const MAX_META: u64 = 1 << 20;
-/// Largest number of entries accepted (bounds memory: each costs about 100 bytes).
+/// Largest number of entries accepted (bounds memory: each costs about 150 bytes plus twice its
+/// name, which [`MAX_NAME_BYTES`] bounds).
 pub const MAX_ENTRIES: usize = 10_000_000;
+/// Largest total of entry name bytes accepted. Names are kept twice (entry list and duplicate
+/// check), and up to 4 KiB each, so without this a small compressed tar of many long names
+/// could need tens of gigabytes.
+pub const MAX_NAME_BYTES: usize = 1 << 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TarError {
@@ -97,6 +102,7 @@ pub struct Reader {
     pending: Pending,
     entries: Vec<Entry>,
     seen: HashSet<String>,
+    name_bytes: usize,
 }
 
 impl Default for Reader {
@@ -115,6 +121,7 @@ impl Reader {
             pending: Pending::default(),
             entries: Vec::new(),
             seen: HashSet::new(),
+            name_bytes: 0,
         }
     }
 
@@ -363,6 +370,12 @@ impl Reader {
         }
         if self.entries.len() >= MAX_ENTRIES {
             return Err(unsupported(format!("more than {MAX_ENTRIES} entries")));
+        }
+        self.name_bytes += name.len();
+        if self.name_bytes > MAX_NAME_BYTES {
+            return Err(unsupported(format!(
+                "entry names total more than {MAX_NAME_BYTES} bytes"
+            )));
         }
         self.entries.push(Entry {
             name,

@@ -1063,3 +1063,43 @@ fn split_part_ids_are_reused_by_later_outputs() {
     run_at(&fs, &parts[0], &opts(16 << 10)).unwrap();
     assert_complete(&fs, &expected(&sp));
 }
+
+/// Names that only clash at the end of a consume (or only on NTFS) are refused before anything
+/// is freed: the staging directory's name, a gap-log sidecar next to the archive, and pairs
+/// NTFS upper-cases to the same name.
+#[test]
+fn late_name_clashes_are_refused_untouched() {
+    let refused = |arc: &str, dest: &str, sp: &[Spec]| {
+        let bytes = tarbuild::gzip(&tarbuild::tar(sp), 6);
+        let fs = fresh_at(CrashModel::WriteThrough, arc, &bytes);
+        let r = streamconsume::consume_stream(
+            &fs,
+            Path::new(arc),
+            Path::new(dest),
+            &opts(16 << 10),
+            &mut |_| {},
+        );
+        let untouched = fs.get_file(Path::new(arc)).as_deref() == Some(&bytes[..]);
+        (r.is_err(), untouched)
+    };
+    let stage = [
+        Spec::file("ok.txt", b"fine"),
+        Spec::file(".trunc-stage-00112233445566778899aabbccddeeff", b"x"),
+    ];
+    assert_eq!(refused(ARC, DEST, &stage), (true, true));
+    let gap = [
+        Spec::file("ok.txt", b"fine"),
+        Spec::file("a.tar.gz.TRNCG", b"x"),
+    ];
+    assert_eq!(refused("/out/a.tar.gz", "/out", &gap), (true, true));
+    assert_eq!(refused("/out/a.tar.gz", "/out", &gap[..1]), (false, false));
+    for (a, b) in [("file", "f\u{131}le"), ("sea", "\u{17f}ea")] {
+        let pair = [Spec::file(a, b"1"), Spec::file(b, b"2")];
+        let insensitive = cfg!(any(windows, target_os = "macos"));
+        assert_eq!(
+            refused(ARC, DEST, &pair),
+            (insensitive, insensitive),
+            "{a:?} vs {b:?}"
+        );
+    }
+}

@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
-use trunc_core::{EntryKind, Manifest};
+use trunc_core::{BlockRecord, EntryKind, Manifest};
 
 use crate::archive::Archive;
 use crate::error::{Error, IoContext, Result, at};
@@ -68,6 +68,27 @@ pub struct VerifySummary {
     pub bytes: u64,
 }
 
+/// Most decoded bytes one round holds (a round always takes at least two blocks). Blocks may
+/// declare up to 1 GiB each, so without this a small archive of zero-filled blocks could make
+/// `2 × threads` such blocks live at once.
+const ROUND_MAX_U: u64 = 512 << 20;
+
+/// End of the round of blocks starting at `start`: at most `per_round` blocks and
+/// [`ROUND_MAX_U`] decoded bytes, but always at least two blocks (when that many remain).
+fn round_end(blocks: &[BlockRecord], start: usize, per_round: usize) -> usize {
+    let mut end = start;
+    let mut bytes = 0u64;
+    while end < blocks.len() && end - start < per_round {
+        let u = blocks[end].u_len;
+        if end - start >= 2 && bytes.saturating_add(u) > ROUND_MAX_U {
+            break;
+        }
+        bytes = bytes.saturating_add(u);
+        end += 1;
+    }
+    end
+}
+
 /// Decode every remaining block in logical order and hand each decoded buffer to `apply`.
 fn for_each_block(
     archive: &Archive,
@@ -82,7 +103,7 @@ fn for_each_block(
     let n = archive.manifest().blocks.len();
     let mut i = archive.consumed();
     while i < n {
-        let end = (i + per_round).min(n);
+        let end = round_end(&archive.manifest().blocks, i, per_round);
         let decoded: Vec<Result<Vec<u8>>> = trunc_prof::time("extract.decode", || {
             pool.install(|| {
                 (i..end)
@@ -454,5 +475,33 @@ mod tests {
         assert!(!symlink_stays_inside("x", "s/../escape", &s_is_link));
         assert!(!symlink_stays_inside("x", "s/inner", &s_is_link));
         assert!(symlink_stays_inside("x", "s", &s_is_link));
+    }
+
+    #[test]
+    fn rounds_cap_decoded_bytes() {
+        let blocks = |u: u64, n: usize| {
+            vec![
+                BlockRecord {
+                    stream_off: 0,
+                    u_len: u,
+                    c_len: 0,
+                    codec: 0,
+                    blake3_c: [0; 32],
+                    blake3_u: [0; 32],
+                };
+                n
+            ]
+        };
+        // Ordinary 8 MiB blocks: the thread count decides.
+        let small = blocks(8 << 20, 100);
+        assert_eq!(round_end(&small, 0, 32), 32);
+        assert_eq!(round_end(&small, 90, 32), 100);
+        // 1 GiB blocks: two at a time, not 2 x threads.
+        let huge = blocks(1 << 30, 100);
+        assert_eq!(round_end(&huge, 0, 32), 2);
+        assert_eq!(round_end(&huge, 99, 32), 100);
+        // 100 MiB blocks: as many as fit in the budget.
+        let mid = blocks(100 << 20, 100);
+        assert_eq!(round_end(&mid, 0, 32), 5);
     }
 }
