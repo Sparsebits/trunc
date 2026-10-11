@@ -718,8 +718,8 @@ fn crash_sweep_every_codec() {
     }
 }
 
-/// Multi-block xz and multi-frame zstd decode their units on worker threads, with safe points
-/// between units only; consuming them survives a crash anywhere.
+/// Multi-block xz, multi-frame zstd and BGZF decode their units on worker threads, with safe
+/// points between units only; consuming them survives a crash anywhere.
 #[test]
 fn crash_sweep_independent_units() {
     let mut rng = Rng::new(43);
@@ -737,6 +737,7 @@ fn crash_sweep_independent_units() {
             tarbuild::xz_with(&tar, 1, tarbuild::XzCheck::Crc64, Some(64 << 10)),
         ),
         ("zst", tarbuild::zstd_frames(&tar, 64 << 10, 3)),
+        ("gz", tarbuild::bgzf(&tar, 16 << 10, 6)),
     ];
     for (ext, bytes) in cases {
         let o = opts(48 << 10);

@@ -56,6 +56,12 @@ consuming them would free nothing until the end.
     blocks only, so a block is always decoded whole and no window needs restoring.
   - zstd frames that declare their size (up to 128 MiB) and are followed by more of the file
     (`pzstd`, `zstd:chunked`). Their only safe point is at the end.
+  - BGZF gzip members (`bgzip`, samtools, htslib): each header gives the member's size, so the
+    members are found by reading one trailer and the next header per member, and workers
+    decode them in batches of about 2 MiB of output. A BGZF member has no safe points inside
+    the size its header gives (one whose data runs past it does from there on), and a
+    member-boundary cursor points at a BGZF member's header so a resume knows it is one. A
+    member that does not match its header is decoded by the loop as ordinary gzip.
 
   Which units are decoded whole depends only on the file, never on the thread count, so the
   scan, the consume pass and a resume see the same safe points. Tests check that one thread
