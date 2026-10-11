@@ -577,11 +577,13 @@ fn decode_block(
     };
     let mut chunk = Vec::new();
     let unpadded = loop {
+        let room = job.uncompressed - blk.out;
         if let Step::End(u) = block_step(
             &mut rd,
             &mut blk,
             &mut chunk,
-            u64::MAX,
+            // No more than the index says: it is untrusted until the loop checks it.
+            room,
             job.check_kind,
             &mut sink,
         )? {
@@ -644,7 +646,7 @@ fn whole_block_streams(
             break;
         }
         let index_size = (u64::from(u32::from_le_bytes(f[4..8].try_into().expect("4"))) + 1) * 4;
-        if index_size > 64 << 20 || index_size + 24 > end {
+        if index_size > 16 << 20 || index_size + 24 > end {
             break;
         }
         let index_start = end - 12 - index_size;

@@ -243,12 +243,15 @@ pub(crate) fn ordered_parallel<T: Send>(
         taken: usize,
         stop: bool,
         done: BTreeMap<usize, Result<T>>,
+        /// A worker's panic, re-raised on the calling thread.
+        panic: Option<Panic>,
     }
     let state = Mutex::new(State {
         claimed: 0,
         taken: 0,
         stop: false,
         done: BTreeMap::new(),
+        panic: None,
     });
     let cv = Condvar::new();
     let ahead = ahead.max(1);
@@ -267,36 +270,57 @@ pub(crate) fn ordered_parallel<T: Send>(
                     let i = st.claimed;
                     st.claimed += 1;
                     drop(st);
-                    let r = work(i);
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(i)));
                     st = lock();
-                    st.done.insert(i, r);
+                    match r {
+                        Ok(r) => {
+                            st.done.insert(i, r);
+                        }
+                        Err(p) => {
+                            st.panic = Some(p);
+                            st.stop = true;
+                        }
+                    }
                     cv.notify_all();
                 }
             });
         }
-        let result = (|| {
-            for i in 0..n {
-                let r = {
-                    let mut st = lock();
-                    loop {
-                        if let Some(r) = st.done.remove(&i) {
-                            st.taken = i + 1;
-                            cv.notify_all();
-                            break r;
-                        }
-                        st = cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+        // Stop the workers however this ends, a panic in `take` included.
+        let _stop = OnDrop(|| {
+            lock().stop = true;
+            cv.notify_all();
+        });
+        for i in 0..n {
+            let r = {
+                let mut st = lock();
+                loop {
+                    if let Some(p) = st.panic.take() {
+                        drop(st);
+                        std::panic::resume_unwind(p);
                     }
-                };
-                take(i, r?)?;
-            }
-            Ok(())
-        })();
-        let mut st = lock();
-        st.stop = true;
-        cv.notify_all();
-        drop(st);
-        result
+                    if let Some(r) = st.done.remove(&i) {
+                        st.taken = i + 1;
+                        cv.notify_all();
+                        break r;
+                    }
+                    st = cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            take(i, r?)?;
+        }
+        Ok(())
     })
+}
+
+type Panic = Box<dyn std::any::Any + Send>;
+
+/// Runs a closure when dropped, also while unwinding.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
 }
 
 /// How a complete decode ended.
@@ -460,6 +484,8 @@ struct AheadState<T> {
     taken: usize,
     stop: bool,
     done: std::collections::BTreeMap<usize, T>,
+    /// A worker's panic, re-raised by [`Ahead::get`].
+    panic: Option<Panic>,
 }
 
 impl<T: Send> Ahead<'_, T> {
@@ -484,10 +510,17 @@ impl<T: Send> Ahead<'_, T> {
             let i = st.claimed.max(st.taken);
             st.claimed = i + 1;
             drop(st);
-            let r = (self.work)(i);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.work)(i)));
             st = self.lock();
-            if i >= st.taken {
-                st.done.insert(i, r);
+            match r {
+                Ok(r) if i >= st.taken => {
+                    st.done.insert(i, r);
+                }
+                Ok(_) => {}
+                Err(p) => {
+                    st.panic = Some(p);
+                    st.stop = true;
+                }
             }
             self.cv.notify_all();
         }
@@ -505,6 +538,10 @@ impl<T: Send> Ahead<'_, T> {
             self.cv.notify_all();
         }
         loop {
+            if let Some(p) = st.panic.take() {
+                drop(st);
+                std::panic::resume_unwind(p);
+            }
             if let Some(r) = st.done.remove(&i) {
                 st.taken = i + 1;
                 self.cv.notify_all();
@@ -544,6 +581,7 @@ pub(crate) fn with_ahead<T: Send, R>(
             taken: 0,
             stop: false,
             done: std::collections::BTreeMap::new(),
+            panic: None,
         }),
         cv: std::sync::Condvar::new(),
         work,
@@ -554,11 +592,11 @@ pub(crate) fn with_ahead<T: Send, R>(
         for _ in 0..threads.min(n) {
             s.spawn(|| a.work());
         }
-        let r = f(Some(&a));
-        let mut st = a.lock();
-        st.stop = true;
-        a.cv.notify_all();
-        drop(st);
-        r
+        // Stop the workers however `f` ends, a panic included.
+        let _stop = OnDrop(|| {
+            a.lock().stop = true;
+            a.cv.notify_all();
+        });
+        f(Some(&a))
     })
 }

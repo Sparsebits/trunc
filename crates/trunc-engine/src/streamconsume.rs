@@ -1785,7 +1785,10 @@ pub fn extract_stream(
         overwrite,
     };
     let open_one = |i: usize| open_output(fs, &open_target, &layout.entries[i].name);
-    let written = with_io_ahead(fs.parallel_io(), &open_one, |ahead| -> Result<u64> {
+    // With --overwrite, opening ahead would truncate existing files before their data is
+    // decoded, losing them if extraction then fails.
+    let ahead_ok = fs.parallel_io() && !overwrite;
+    let written = with_io_ahead(ahead_ok, &open_one, |ahead| -> Result<u64> {
         let router = RefCell::new(
             Router::new(
                 fs,

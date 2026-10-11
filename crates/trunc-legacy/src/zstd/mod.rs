@@ -36,6 +36,8 @@ const READ_CHUNK: usize = 256 * 1024;
 const FLUSH_AT: usize = 1 << 20;
 /// Frames declaring more output than this are decoded a block at a time instead.
 const MAX_WHOLE_FRAME: u64 = 128 << 20;
+/// Frames looked at per walk of the frame headers.
+const MAX_JOBS: usize = 1 << 16;
 /// Output of frames decoded ahead but not yet taken, at most (but always two frames).
 const AHEAD_BYTES: u64 = 512 << 20;
 
@@ -512,6 +514,12 @@ fn whole_frames(
     }
     while rd.pos + 4 <= len {
         let start = rd.pos;
+        if jobs.len() == MAX_JOBS {
+            // Bound memory for files of many tiny frames: walk again from here once decoding
+            // gets here. Each frame's choice depends on that frame alone, so this changes
+            // nothing else.
+            return (jobs, Some(start - 1));
+        }
         let mut m = [0u8; 4];
         if rd.take(&mut m).is_err() {
             break;

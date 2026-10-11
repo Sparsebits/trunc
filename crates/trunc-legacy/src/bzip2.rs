@@ -669,7 +669,8 @@ fn decode_at(src: &dyn FileHandle, len: u64, at: u64) -> stream::Result<Decoded>
 
 /// Bit positions at or after `from_bit` where the block magic appears. Some may be inside
 /// compressed data rather than real block starts; the decoder only uses the one at the position
-/// it expects.
+/// it expects. A file with implausibly many (a crafted one: the magic over and over) gets none,
+/// and is decoded on one thread; candidates never change the output or the safe points.
 fn find_blocks(
     src: &dyn FileHandle,
     len: u64,
@@ -679,6 +680,9 @@ fn find_blocks(
     let _prof = trunc_prof::span("bzip2.find_blocks");
     const CHUNK: u64 = 8 << 20;
     const MASK: u64 = (1 << 48) - 1;
+    /// At most this many candidates in all (32 MiB), and per chunk.
+    const MAX: usize = 1 << 22;
+    const MAX_PER_CHUNK: usize = 1 << 18;
     let first = from_bit / 8;
     let chunks = usize::try_from(len.saturating_sub(first).div_ceil(CHUNK)).unwrap_or(0);
     let mut found = Vec::new();
@@ -696,6 +700,9 @@ fn find_blocks(
                 if (w >> (16 - shift)) & MASK == BLOCK_MAGIC {
                     let bit = (start + i as u64) * 8 + shift;
                     if bit >= from_bit {
+                        if hits.len() == MAX_PER_CHUNK {
+                            return Err(StreamError::Stopped);
+                        }
                         hits.push(bit);
                     }
                 }
@@ -703,11 +710,18 @@ fn find_blocks(
         }
         Ok(hits)
     };
-    stream::ordered_parallel(chunks, threads, threads * 2, &scan, &mut |_, hits| {
+    let r = stream::ordered_parallel(chunks, threads, threads * 2, &scan, &mut |_, hits| {
+        if found.len() + hits.len() > MAX {
+            return Err(StreamError::Stopped);
+        }
         found.extend(hits);
         Ok(())
-    })?;
-    Ok(found)
+    });
+    match r {
+        Ok(()) => Ok(found),
+        Err(StreamError::Stopped) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
 /// True if `[from, len)` of the file is empty or all zeros.
