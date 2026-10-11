@@ -36,3 +36,16 @@ pub use trunc_core::space::{SpaceBound, SpaceParams};
 
 /// Producer string written into new manifests.
 pub const PRODUCER: &str = concat!("trunc/", env!("CARGO_PKG_VERSION"));
+
+/// Entry points for the fuzz targets (`fuzz/`). Not part of the API.
+#[doc(hidden)]
+pub mod fuzz {
+    /// Parse `text` with the image metadata JSON reader; on success, the value written back as
+    /// compact JSON (members in order, numbers as they were written).
+    pub fn json_canonical(text: &[u8]) -> Result<String, String> {
+        let v = crate::json::Json::parse(text)?;
+        let mut out = String::new();
+        v.write(&mut out);
+        Ok(out)
+    }
+}

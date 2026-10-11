@@ -13,6 +13,7 @@ trunc-core = { path = "../crates/trunc-core" }
 trunc-hash = { path = "../crates/trunc-hash" }
 trunc-fs = { path = "../crates/trunc-fs" }
 trunc-legacy = { path = "../crates/trunc-legacy" }
+trunc-engine = { path = "../crates/trunc-engine" }
 trunc-testkit = { path = "../crates/trunc-testkit" }
 # Reference decoders the stream targets compare against.
 bzip2 = "0.6"
@@ -101,6 +102,27 @@ bench = false
 [[bin]]
 name = "resume_equiv"
 path = "fuzz_targets/resume_equiv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iso"
+path = "fuzz_targets/iso.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_json"
+path = "fuzz_targets/image_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_manifest"
+path = "fuzz_targets/image_manifest.rs"
 test = false
 doc = false
 bench = false
