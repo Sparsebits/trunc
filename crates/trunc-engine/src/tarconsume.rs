@@ -64,7 +64,8 @@ fn layout_of(h: &dyn FileHandle, what: &str, case: CaseMode) -> Result<TarFile> 
             }
             tar::Kind::HardLink(_) => {
                 return Err(crate::Error::Refused(format!(
-                    "{what}: hard link {:?}; hard links in uncompressed tar archives are not                      supported yet",
+                    "{what}: hard link {:?}; hard links in uncompressed tar archives are not \
+                     supported yet",
                     e.name
                 )));
             }
