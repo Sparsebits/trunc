@@ -813,8 +813,14 @@ pub fn consume_zip(
         space.extract_extra
     };
 
-    match fs.metadata(&stage)?.map(|m| m.kind) {
-        Some(NodeKind::Dir) => crate::stage::flush_staging_tree(fs, &stage, &dest)?,
+    // Held until the end: every confined call under the staging directory goes through the
+    // directory opened here, not whatever its path names later.
+    let _stage_hold = match fs.metadata(&stage)?.map(|m| m.kind) {
+        Some(NodeKind::Dir) => {
+            let hold = fs.hold_root(&stage, false)?;
+            crate::stage::flush_staging_tree(fs, &stage, &dest)?;
+            hold
+        }
         Some(_) => {
             return Err(Error::Refused(format!(
                 "{} exists and is not a directory",
@@ -831,8 +837,9 @@ pub fn consume_zip(
                 )));
             }
             ensure_dir(fs, &dest)?;
-            fs.create_dir(&stage)?;
+            let hold = fs.hold_root(&stage, true)?;
             fs.flush_dir(&dest)?;
+            hold
         }
         None if len == 0 && all_exist(fs, &dest, &tops)? => {
             // Everything was renamed into place; only cleanup remains.
@@ -847,7 +854,7 @@ pub fn consume_zip(
                 dest.display()
             )));
         }
-    }
+    };
 
     let protected = [handle.file_id()?, journal.file_id().map_err(journal_err)?];
     let guard = StageGuard {

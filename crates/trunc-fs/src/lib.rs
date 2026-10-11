@@ -229,6 +229,9 @@ pub trait FileHandle: Send + Sync + Debug {
     }
 }
 
+/// Keeps a confinement root pinned; see [`FsBackend::hold_root`]. Dropping it releases the root.
+pub type RootHold = Box<dyn std::any::Any + Send + Sync>;
+
 /// Filesystem operations the engine needs. Paths are never followed through links: opening or
 /// creating at a path that is a symlink or junction fails with [`FsError::Link`].
 pub trait FsBackend: Send + Sync + Debug {
@@ -246,6 +249,44 @@ pub trait FsBackend: Send + Sync + Debug {
     ) -> Result<Box<dyn FileHandle>> {
         check_beneath(self, root, path)?;
         self.open(path, mode, share)
+    }
+    /// Pin the directory `dir` as the `root` of later confined calls until the returned value is
+    /// dropped or `dir` is removed with [`remove_dir`](Self::remove_dir). With `create` the
+    /// directory is made first (failing if anything exists there); without, it must already be
+    /// one. Either way a link or junction at `dir` is refused with [`FsError::Link`].
+    ///
+    /// The OS backend opens the directory once, here, and resolves every later
+    /// [`open_beneath`](Self::open_beneath), [`create_dir_beneath`](Self::create_dir_beneath)
+    /// and [`set_mode`](Self::set_mode) under it against that handle, so renaming the directory
+    /// away and putting a link in its place cannot redirect them. On Windows the handle also
+    /// keeps the directory (and its ancestors) from being renamed or deleted while held. The
+    /// default only creates or checks the directory.
+    fn hold_root(&self, dir: &Path, create: bool) -> Result<RootHold> {
+        if create {
+            self.create_dir(dir)?;
+        } else {
+            match self.metadata(dir)?.map(|m| m.kind) {
+                Some(NodeKind::Dir) => {}
+                Some(NodeKind::Link) => {
+                    return Err(FsError::Link {
+                        path: dir.to_path_buf(),
+                    });
+                }
+                Some(_) => {
+                    return Err(FsError::Io {
+                        op: "opening directory",
+                        path: dir.to_path_buf(),
+                        source: io::Error::other("not a directory"),
+                    });
+                }
+                None => {
+                    return Err(FsError::NotFound {
+                        path: dir.to_path_buf(),
+                    });
+                }
+            }
+        }
+        Ok(Box::new(()))
     }
     /// Create one directory; fails if anything already exists at the path.
     fn create_dir(&self, path: &Path) -> Result<()>;
@@ -278,7 +319,7 @@ pub trait FsBackend: Send + Sync + Debug {
     /// Rename without replacing: fails with [`FsError::AlreadyExists`] if `to` exists.
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
-    /// Remove an empty directory.
+    /// Remove an empty directory, first releasing any [`hold_root`](Self::hold_root) on it.
     fn remove_dir(&self, path: &Path) -> Result<()>;
     /// Metadata without following links; `None` if nothing exists at the path.
     fn metadata(&self, path: &Path) -> Result<Option<Meta>>;
@@ -287,7 +328,9 @@ pub trait FsBackend: Send + Sync + Debug {
     /// Describe the volume holding `path` (or its nearest existing ancestor).
     fn probe_volume(&self, path: &Path) -> Result<VolumeInfo>;
     /// Apply Unix permission bits (lower 9 only; Windows honours just the write bits, as the
-    /// read-only attribute). Never follows links.
+    /// read-only attribute). Never follows a link as the final component; under a root pinned
+    /// with [`hold_root`](Self::hold_root) the OS backend confines the whole path like
+    /// [`open_beneath`](Self::open_beneath).
     fn set_mode(&self, path: &Path, mode: u32) -> Result<()>;
 }
 

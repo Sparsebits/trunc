@@ -8,11 +8,12 @@ use std::fs::File;
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{
-    Advice, CWD, FallocateFlags, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags, SeekFrom,
+    Advice, CWD, FallocateFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags,
+    SeekFrom,
 };
 use rustix::io::Errno;
 
@@ -70,8 +71,9 @@ fn confined() -> ResolveFlags {
     ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS
 }
 
-fn open_root(root: &Path) -> io::Result<OwnedFd> {
-    // The root itself may be reached through links: it is the user's choice of destination.
+/// Open the root of confined calls by path. The root itself may be reached through links: it is
+/// the user's choice of destination. Used only for roots not pinned with `hold_root`.
+pub(crate) fn open_root(root: &Path) -> io::Result<OwnedFd> {
     Ok(rustix::fs::open(
         root,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -79,10 +81,28 @@ fn open_root(root: &Path) -> io::Result<OwnedFd> {
     )?)
 }
 
-/// `openat2(root, rel, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`. `Ok(None)` if openat2 is missing
-/// (kernels before 5.6, restrictive sandboxes).
-pub(crate) fn open_beneath(root: &Path, rel: &Path, flags: OFlags) -> io::Result<Option<File>> {
-    let dir = open_root(root)?;
+/// Open the directory `dir` to pin it as a root: the path up to it may go through links (the
+/// user's choice of destination), `dir` itself may not.
+pub(crate) fn open_dir_nofollow(dir: &Path) -> io::Result<OwnedFd> {
+    let fd = rustix::fs::open(
+        dir,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    // O_PATH | O_NOFOLLOW can open a symlink itself; make sure this is the directory.
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::Directory {
+        return Err(Errno::NOTDIR.into());
+    }
+    Ok(fd)
+}
+
+/// `openat2(dir, rel, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, refusing a link as the final
+/// component too. `Ok(None)` if openat2 is missing (kernels before 5.6, restrictive sandboxes).
+pub(crate) fn openat_beneath(
+    dir: BorrowedFd<'_>,
+    rel: &Path,
+    flags: OFlags,
+) -> io::Result<Option<OwnedFd>> {
     // openat2, unlike open, rejects a mode unless the call can create the file.
     let mode = if flags.contains(OFlags::CREATE) {
         Mode::from_raw_mode(0o666)
@@ -90,33 +110,85 @@ pub(crate) fn open_beneath(root: &Path, rel: &Path, flags: OFlags) -> io::Result
         Mode::empty()
     };
     let flags = flags | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    match rustix::fs::openat2(&dir, rel, flags, mode, confined()) {
-        Ok(fd) => Ok(Some(File::from(fd))),
+    match rustix::fs::openat2(dir, rel, flags, mode, confined()) {
+        Ok(fd) => Ok(Some(fd)),
         Err(e) if missing(e) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
+/// [`openat_beneath`] for a file to read or write.
+pub(crate) fn open_beneath(
+    dir: BorrowedFd<'_>,
+    rel: &Path,
+    flags: OFlags,
+) -> io::Result<Option<File>> {
+    Ok(openat_beneath(dir, rel, flags)?.map(File::from))
+}
+
 /// `mkdirat` in the parent of `rel`, the parent resolved as in [`open_beneath`].
-pub(crate) fn mkdir_beneath(root: &Path, rel: &Path) -> io::Result<bool> {
-    let dir = open_root(root)?;
+pub(crate) fn mkdir_beneath(dir: BorrowedFd<'_>, rel: &Path) -> io::Result<bool> {
     let name = rel
         .file_name()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let parent = rel.parent().filter(|p| !p.as_os_str().is_empty());
-    let parent_fd = match parent {
+    let parent_fd;
+    let parent_dir = match parent {
         None => dir,
         Some(p) => {
             let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
-            match rustix::fs::openat2(&dir, p, flags, Mode::empty(), confined()) {
-                Ok(fd) => fd,
+            match rustix::fs::openat2(dir, p, flags, Mode::empty(), confined()) {
+                Ok(fd) => {
+                    parent_fd = fd;
+                    parent_fd.as_fd()
+                }
                 Err(e) if missing(e) => return Ok(false),
                 Err(e) => return Err(e.into()),
             }
         }
     };
-    rustix::fs::mkdirat(&parent_fd, name, Mode::from_raw_mode(0o777))?;
+    rustix::fs::mkdirat(parent_dir, name, Mode::from_raw_mode(0o777))?;
     Ok(true)
+}
+
+/// Change the mode of what an `O_PATH` descriptor refers to, through its `/proc/self/fd` link
+/// (`fchmod` refuses `O_PATH` descriptors). A symlink is refused with ELOOP: going through the
+/// link would change its target. `Ok(false)` if `/proc` is not mounted.
+pub(crate) fn chmod_path_fd(fd: &OwnedFd, mode: u32) -> io::Result<bool> {
+    if FileType::from_raw_mode(rustix::fs::fstat(fd)?.st_mode) == FileType::Symlink {
+        return Err(Errno::LOOP.into());
+    }
+    let link = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    match rustix::fs::chmod(link.as_str(), Mode::from_raw_mode(mode & 0o777)) {
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) if std::fs::symlink_metadata("/proc/self/fd").is_err() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `fchmod` on `f`, a second, readable descriptor for what `path_fd` refers to, after checking
+/// that both really are the same file (the fallback without `/proc`).
+pub(crate) fn fchmod_same(path_fd: &OwnedFd, f: &OwnedFd, mode: u32) -> io::Result<()> {
+    let (a, b) = (rustix::fs::fstat(path_fd)?, rustix::fs::fstat(f)?);
+    if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) {
+        return Err(io::Error::other("replaced while setting its mode"));
+    }
+    Ok(rustix::fs::fchmod(f, Mode::from_raw_mode(mode & 0o777))?)
+}
+
+/// `renameat2(from_dir, from_name, CWD, to, RENAME_NOREPLACE)`: move an entry out of a pinned
+/// directory without resolving the directory's path again. `Ok(false)` if the kernel or
+/// filesystem lacks the flag.
+pub(crate) fn rename_noreplace_from(
+    from_dir: BorrowedFd<'_>,
+    from_name: &Path,
+    to: &Path,
+) -> io::Result<bool> {
+    match rustix::fs::renameat_with(from_dir, from_name, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(true),
+        Err(e) if missing(e) || e == Errno::INVAL => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// `renameat2(RENAME_NOREPLACE)`. `Ok(false)` if the kernel or filesystem lacks the flag.

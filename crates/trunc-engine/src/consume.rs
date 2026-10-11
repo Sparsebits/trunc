@@ -278,10 +278,14 @@ pub fn consume(
         findings,
         ..ConsumeSummary::default()
     };
-    match stage_kind {
+    // Held until the end: every confined call under the staging directory goes through the
+    // directory opened here, not whatever its path names later.
+    let _stage_hold = match stage_kind {
         Some(NodeKind::Dir) => {
             summary.resumed = true;
+            let hold = fs.hold_root(&stage, false)?;
             crate::stage::flush_staging_tree(fs, &stage, &dest)?;
+            hold
         }
         Some(_) => {
             return Err(Error::Refused(format!(
@@ -326,8 +330,9 @@ pub fn consume(
                 },
             )?;
             ensure_dir(fs, &dest)?;
-            fs.create_dir(&stage)?;
+            let hold = fs.hold_root(&stage, true)?;
             fs.flush_dir(&dest)?;
+            hold
         }
         None => {
             let hint = note
@@ -341,7 +346,7 @@ pub fn consume(
                 dest.display()
             )));
         }
-    }
+    };
     progress(Progress::Started {
         resumed: summary.resumed,
         blocks_done: archive.consumed(),
