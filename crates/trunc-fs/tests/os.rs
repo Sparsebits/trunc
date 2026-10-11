@@ -614,6 +614,19 @@ fn hard_links_name_the_same_file() {
 }
 
 #[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "mklink /J needs no privileges");
+}
+
+#[cfg(windows)]
 #[test]
 fn confined_hard_links_refuse_junctions_on_the_way() {
     let d = tempfile::tempdir().unwrap();
@@ -623,15 +636,7 @@ fn confined_hard_links_refuse_junctions_on_the_way() {
     std::fs::create_dir(&outside).unwrap();
     write_file(&root.join("f"), b"mine");
     write_file(&outside.join("victim"), b"keep");
-    let ok = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(root.join("j"))
-        .arg(&outside)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "mklink /J needs no privileges");
+    junction(&root.join("j"), &outside);
     let e = fs()
         .hard_link_beneath(&root, &root.join("f"), &root.join("j").join("new"))
         .unwrap_err();
@@ -642,6 +647,47 @@ fn confined_hard_links_refuse_junctions_on_the_way() {
         .unwrap_err();
     assert!(matches!(e, FsError::Link { .. }), "{e}");
     assert!(!root.join("g").exists());
+}
+
+/// Under a held root, a hard link made through a junction is refused against the location
+/// captured when the root was pinned, and the stray name is taken back through its own handle:
+/// a same-named file elsewhere survives, and so does the source.
+#[cfg(windows)]
+#[test]
+fn held_root_hard_link_through_junction_is_taken_back_by_handle() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    let other = d.path().join("other");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let hold = fs().hold_root(&root, true).unwrap();
+    write_file(&root.join("f"), b"mine");
+    write_file(&root.join("new"), b"keep");
+    write_file(&other.join("new"), b"keep");
+    write_file(&outside.join("victim"), b"keep");
+    junction(&root.join("j"), &outside);
+    let e = fs()
+        .hard_link_beneath(&root, &root.join("f"), &root.join("j").join("new"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!outside.join("new").exists(), "taken back");
+    assert_eq!(std::fs::read(root.join("f")).unwrap(), b"mine");
+    assert_eq!(std::fs::read(root.join("new")).unwrap(), b"keep");
+    assert_eq!(std::fs::read(other.join("new")).unwrap(), b"keep");
+    // A source reached through the junction is refused too, leaving no name behind.
+    let e = fs()
+        .hard_link_beneath(&root, &root.join("j").join("victim"), &root.join("g"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!root.join("g").exists());
+    assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"keep");
+    // Inside the held root, linking works.
+    std::fs::create_dir(root.join("sub")).unwrap();
+    fs().hard_link_beneath(&root, &root.join("f"), &root.join("sub").join("f2"))
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("sub").join("f2")).unwrap(), b"mine");
+    drop(hold);
 }
 
 /// What sparse-file extraction relies on: deallocating past the end of a new file marks it
@@ -677,4 +723,230 @@ fn writes_past_a_deallocated_end_leave_holes() {
             .sum();
         assert!(allocated <= 1 << 20, "{allocated} bytes allocated");
     }
+}
+
+/// A staging root swapped for a junction between its creation and its pinning is refused; once
+/// pinned it cannot be renamed away or replaced, and removing it through the backend releases it.
+#[cfg(windows)]
+#[test]
+fn held_root_cannot_be_swapped_for_a_junction() {
+    let d = tempfile::tempdir().unwrap();
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+
+    // Swapped before it was pinned (the race right after mkdir).
+    let root = d.path().join("stage");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::rename(&root, d.path().join("moved")).unwrap();
+    junction(&root, &outside);
+    let e = fs().hold_root(&root, false).unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+
+    // Pinned: renaming it away (to put a junction in its place) fails while held.
+    let root = d.path().join("stage2");
+    let hold = fs().hold_root(&root, true).unwrap();
+    assert!(std::fs::rename(&root, d.path().join("moved2")).is_err());
+    assert!(std::fs::remove_dir(&root).is_err());
+    fs().create_dir_beneath(&root, &root.join("a")).unwrap();
+    let f = fs()
+        .open_beneath(
+            &root,
+            &root.join("a").join("f"),
+            OpenMode::CreateNew,
+            Share::Exclusive,
+        )
+        .unwrap();
+    drop(f);
+    // Moving entries out of it still works.
+    fs().rename(&root.join("a"), &d.path().join("a")).unwrap();
+    assert!(d.path().join("a").join("f").exists());
+    // Removing it through the backend releases the pin first.
+    fs().remove_dir(&root).unwrap();
+    drop(hold);
+
+    // Dropping the hold releases it too.
+    let root = d.path().join("stage3");
+    let hold = fs().hold_root(&root, true).unwrap();
+    drop(hold);
+    std::fs::rename(&root, d.path().join("moved3")).unwrap();
+}
+
+/// A file created through a junction is deleted through its own handle: the file the junction
+/// led to goes, and same-named files elsewhere survive.
+#[cfg(windows)]
+#[test]
+fn confined_create_through_junction_is_taken_back_by_handle() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    let other = d.path().join("other");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let _hold = fs().hold_root(&root, true).unwrap();
+    write_file(&other.join("new"), b"keep");
+    write_file(&root.join("new"), b"keep");
+    junction(&root.join("j"), &outside);
+    for share in [Share::Shared, Share::Exclusive] {
+        let e = fs()
+            .open_beneath(
+                &root,
+                &root.join("j").join("new"),
+                OpenMode::CreateNew,
+                share,
+            )
+            .unwrap_err();
+        assert!(matches!(e, FsError::Link { .. }), "{share:?}: {e}");
+        assert!(!outside.join("new").exists(), "{share:?}: taken back");
+    }
+    let e = fs()
+        .create_dir_beneath(&root, &root.join("j").join("newdir"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!outside.join("newdir").exists());
+    assert_eq!(std::fs::read(other.join("new")).unwrap(), b"keep");
+    assert_eq!(std::fs::read(root.join("new")).unwrap(), b"keep");
+}
+
+/// set_mode through a junction under a held root is refused (Windows applies only modes without
+/// write bits, as the read-only attribute).
+#[cfg(windows)]
+#[test]
+fn set_mode_refuses_junctions_under_a_held_root() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    write_file(&outside.join("victim"), b"keep");
+    let _hold = fs().hold_root(&root, true).unwrap();
+    junction(&root.join("j"), &outside);
+    let e = fs()
+        .set_mode(&root.join("j").join("victim"), 0o444)
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    let e = fs().set_mode(&root.join("j"), 0o444).unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    let readonly = |p: &Path| std::fs::metadata(p).unwrap().permissions().readonly();
+    assert!(!readonly(&outside.join("victim")));
+    write_file(&root.join("f"), b"x");
+    fs().set_mode(&root.join("f"), 0o444).unwrap();
+    assert!(readonly(&root.join("f")));
+    assert!(matches!(
+        fs().set_mode(&root.join("missing"), 0o444),
+        Err(FsError::NotFound { .. })
+    ));
+}
+
+/// A held root renamed away and replaced by a symlink: confined calls keep going to the pinned
+/// directory, never to where the symlink points; a symlink is refused as a root.
+#[cfg(target_os = "linux")]
+#[test]
+fn held_root_swapped_for_a_symlink_is_not_followed() {
+    use std::os::unix::fs::symlink;
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let moved = d.path().join("moved");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let hold = fs().hold_root(&root, true).unwrap();
+    std::fs::rename(&root, &moved).unwrap();
+    symlink(&outside, &root).unwrap();
+
+    fs().create_dir_beneath(&root, &root.join("a")).unwrap();
+    let f = fs()
+        .open_beneath(
+            &root,
+            &root.join("a").join("f"),
+            OpenMode::CreateNew,
+            Share::Exclusive,
+        )
+        .unwrap();
+    drop(f);
+    fs().set_mode(&root.join("a").join("f"), 0o600).unwrap();
+    assert!(moved.join("a").join("f").exists());
+    assert!(!outside.join("a").exists());
+    // Renames out of the root name the pinned directory's entry too.
+    fs().rename(&root.join("a"), &d.path().join("a")).unwrap();
+    assert!(d.path().join("a").join("f").exists());
+    drop(hold);
+
+    let e = fs().hold_root(&root, false).unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+}
+
+/// set_mode never changes a symlink's target, as the final component or on the way.
+#[cfg(target_os = "linux")]
+#[test]
+fn set_mode_does_not_follow_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let victim = outside.join("victim");
+    write_file(&victim, b"keep");
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    // Without a held root: a link as the final component.
+    std::fs::create_dir(d.path().join("plain")).unwrap();
+    symlink(&victim, d.path().join("plain").join("link")).unwrap();
+    let e = fs()
+        .set_mode(&d.path().join("plain").join("link"), 0o777)
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+
+    // Under a held root: also a link on the way.
+    let _hold = fs().hold_root(&root, true).unwrap();
+    symlink(&victim, root.join("link")).unwrap();
+    symlink(&outside, root.join("dir-link")).unwrap();
+    for p in [root.join("link"), root.join("dir-link").join("victim")] {
+        let e = fs().set_mode(&p, 0o777).unwrap_err();
+        assert!(matches!(e, FsError::Link { .. }), "{}: {e}", p.display());
+    }
+    assert_eq!(mode_of(&victim), 0o644);
+
+    write_file(&root.join("f"), b"x");
+    fs().set_mode(&root.join("f"), 0o600).unwrap();
+    assert_eq!(mode_of(&root.join("f")), 0o600);
+    // Applies even to a file its owner cannot read (a resumed run applying modes again).
+    fs().set_mode(&root.join("f"), 0o200).unwrap();
+    fs().set_mode(&root.join("f"), 0o640).unwrap();
+    assert_eq!(mode_of(&root.join("f")), 0o640);
+}
+
+/// A held root renamed away and replaced by a symlink: hard links still resolve both names
+/// against the pinned directory, so neither the source nor the new name leaves it.
+#[cfg(target_os = "linux")]
+#[test]
+fn held_root_hard_links_ignore_a_swapped_symlink() {
+    use std::os::unix::fs::symlink;
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("stage");
+    let moved = d.path().join("moved");
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    write_file(&outside.join("f"), b"victim");
+    let hold = fs().hold_root(&root, true).unwrap();
+    write_file(&root.join("f"), b"mine");
+    std::fs::rename(&root, &moved).unwrap();
+    symlink(&outside, &root).unwrap();
+
+    fs().hard_link_beneath(&root, &root.join("f"), &root.join("g"))
+        .unwrap();
+    assert_eq!(std::fs::read(moved.join("g")).unwrap(), b"mine");
+    assert!(!outside.join("g").exists());
+    // A symlink inside the pinned root, as either name or on the way, is refused.
+    symlink(outside.join("f"), moved.join("link")).unwrap();
+    symlink(&outside, moved.join("dir-link")).unwrap();
+    let e = fs()
+        .hard_link_beneath(&root, &root.join("link"), &root.join("h"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!moved.join("h").exists());
+    let e = fs()
+        .hard_link_beneath(&root, &root.join("f"), &root.join("dir-link").join("h"))
+        .unwrap_err();
+    assert!(matches!(e, FsError::Link { .. }), "{e}");
+    assert!(!outside.join("h").exists());
+    drop(hold);
 }

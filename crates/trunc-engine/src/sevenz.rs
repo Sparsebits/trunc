@@ -358,7 +358,9 @@ pub fn extract_7z(
         protected: &protected,
     };
     remove_tree(fs, &stage)?;
-    fs.create_dir(&stage)?;
+    // Held until the end: every confined call under the staging directory goes through the
+    // directory opened here, not whatever its path names later.
+    let _stage_hold = fs.hold_root(&stage, true)?;
     let run = || -> Result<u64> {
         let written = stage_all(fs, h.as_ref(), archive, &layout, &stage, &guard)?;
         move_into_place(fs, &layout, &stage, dest, overwrite)?;

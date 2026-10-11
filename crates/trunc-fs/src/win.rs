@@ -13,11 +13,13 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALLOCATION_INFO, FILE_ID_INFO, FileAllocationInfo, FileIdInfo, GetDiskFreeSpaceExW,
-    GetDiskFreeSpaceW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetVolumeInformationByHandleW, GetVolumePathNameW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    FILE_ALLOCATION_INFO, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_ID_INFO, FileAllocationInfo,
+    FileDispositionInfo, FileDispositionInfoEx, FileIdInfo, GetDiskFreeSpaceExW, GetDiskFreeSpaceW,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    GetVolumePathNameW, MOVEFILE_WRITE_THROUGH, MoveFileExW, ReOpenFile,
     SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -31,6 +33,14 @@ pub(crate) const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 /// `FILE_FLAG_OPEN_REPARSE_POINT`: open the link itself rather than its target.
 pub(crate) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 pub(crate) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+/// Access rights for `OpenOptions::access_mode` and [`reopen`].
+pub(crate) const GENERIC_READ: u32 = 0x8000_0000;
+pub(crate) const DELETE: u32 = 0x0001_0000;
+pub(crate) const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+pub(crate) const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+/// `FILE_SHARE_*` flags for `OpenOptions::share_mode`.
+pub(crate) const FILE_SHARE_READ: u32 = 1;
+pub(crate) const FILE_SHARE_WRITE: u32 = 2;
 /// `FILE_SUPPORTS_SPARSE_FILES` volume flag.
 const FILE_SUPPORTS_SPARSE_FILES: u32 = 0x0040;
 /// Cloud Files placeholder attributes (OneDrive and other sync providers).
@@ -272,6 +282,52 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let (f, t) = (wide(from.as_os_str()), wide(to.as_os_str()));
     // SAFETY: both strings are NUL-terminated and outlive the call.
     let ok = unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    check(ok)
+}
+
+/// A new handle on the very file `f` refers to, with other access and sharing (`ReOpenFile`: a
+/// relative open of the file itself, not of its path).
+pub(crate) fn reopen(f: &File, access: u32, share: u32, flags: u32) -> io::Result<File> {
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: valid handle; the call takes no pointers.
+    let h = unsafe { ReOpenFile(handle(f), access, share, flags) };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `h` is a fresh, valid handle that nothing else owns.
+    Ok(unsafe { File::from_raw_handle(h) })
+}
+
+/// Delete the file or empty directory an open handle refers to, by the handle rather than by a
+/// path that could have been redirected since. The handle needs `DELETE` access. POSIX semantics
+/// remove the name at once; older Windows (and filesystems without them) fall back to the
+/// classic delete-on-close.
+pub(crate) fn delete_by_handle(f: &File) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: valid handle; input pointer/size describe `info`, which outlives the call.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle(f),
+            FileDispositionInfoEx,
+            (&raw const info).cast::<c_void>(),
+            u32_len::<FILE_DISPOSITION_INFO_EX>(),
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: as above, for `info`.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle(f),
+            FileDispositionInfo,
+            (&raw const info).cast::<c_void>(),
+            u32_len::<FILE_DISPOSITION_INFO>(),
+        )
+    };
     check(ok)
 }
 

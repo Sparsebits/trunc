@@ -3,6 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::ops::Range;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -19,10 +21,36 @@ impl OsFs {
     pub fn new() -> Self {
         OsFs
     }
-}
 
-#[cfg(windows)]
-const FILE_SHARE_READ: u32 = 1;
+    /// [`FsBackend::open`] for callers that want a plain [`File`]: a link as the final component
+    /// is refused with [`FsError::Link`], and anything but a regular file is refused.
+    pub fn open_file(&self, path: &Path, mode: OpenMode, share: Share) -> Result<File> {
+        let _prof = trunc_prof::span("fs.open");
+        let file = self.open_unchecked(path, mode, share)?;
+        check_opened(&file, path, mode, share)?;
+        Ok(file)
+    }
+
+    fn open_unchecked(&self, path: &Path, mode: OpenMode, share: Share) -> Result<File> {
+        match open_options(mode, share).open(path) {
+            Ok(f) => Ok(f),
+            // Opening a directory junction as a file fails with a generic access error; report
+            // what is actually there.
+            Err(e) => {
+                if let Ok(Some(Meta {
+                    kind: NodeKind::Link,
+                    ..
+                })) = self.metadata(path)
+                {
+                    return Err(FsError::Link {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(FsError::from_io("opening", path, e))
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct OsFile {
@@ -82,7 +110,7 @@ fn open_options(mode: OpenMode, share: Share) -> OpenOptions {
         use std::os::windows::fs::OpenOptionsExt;
         oo.custom_flags(crate::win::FILE_FLAG_OPEN_REPARSE_POINT);
         if share == Share::Exclusive {
-            oo.share_mode(FILE_SHARE_READ);
+            oo.share_mode(crate::win::FILE_SHARE_READ);
         }
     }
     #[cfg(unix)]
@@ -104,6 +132,18 @@ fn finish_open(
     mode: OpenMode,
     share: Share,
 ) -> Result<Box<dyn FileHandle>> {
+    check_opened(&file, path, mode, share)?;
+    Ok(Box::new(OsFile {
+        file,
+        path: path.to_path_buf(),
+        #[cfg(windows)]
+        sparse: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(any(windows, target_os = "linux"))]
+        uncached: std::sync::Mutex::new(Uncached::Untried),
+    }))
+}
+
+fn check_opened(file: &File, path: &Path, mode: OpenMode, share: Share) -> Result<()> {
     let md = file.metadata().map_err(err("reading metadata of", path))?;
     #[cfg(windows)]
     {
@@ -123,7 +163,7 @@ fn finish_open(
     }
     #[cfg(target_os = "linux")]
     if share == Share::Exclusive
-        && !crate::linux::lock(&file, mode.writes()).map_err(err("locking", path))?
+        && !crate::linux::lock(file, mode.writes()).map_err(err("locking", path))?
     {
         return Err(FsError::Busy {
             path: path.to_path_buf(),
@@ -131,14 +171,7 @@ fn finish_open(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (mode, share);
-    Ok(Box::new(OsFile {
-        file,
-        path: path.to_path_buf(),
-        #[cfg(windows)]
-        sparse: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(any(windows, target_os = "linux"))]
-        uncached: std::sync::Mutex::new(Uncached::Untried),
-    }))
+    Ok(())
 }
 
 /// Errors from the confined Linux calls: EXDEV means the path tried to leave the root.
@@ -219,7 +252,78 @@ fn link_err(path: &Path, e: io::Error) -> FsError {
     }
 }
 
-/// Real locations of confinement roots, so each check costs one query on the opened handle.
+/// A confinement root opened once by `hold_root`. Confined calls under it resolve against this
+/// handle (Linux) or check against the location captured from it (Windows), never against
+/// whatever the root's path names later.
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Debug)]
+struct Pinned {
+    #[cfg(target_os = "linux")]
+    dir: std::os::fd::OwnedFd,
+    /// Opened without `FILE_SHARE_DELETE`: while it exists the directory cannot be renamed or
+    /// deleted, so its path keeps naming it.
+    #[cfg(windows)]
+    _dir: File,
+    /// Volume serial and in-volume path of the directory.
+    #[cfg(windows)]
+    real: (u64, PathBuf),
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+type PinMap = std::collections::HashMap<PathBuf, std::sync::Arc<Pinned>>;
+/// Held roots by path. The map owns the handles; a [`Hold`] only removes its own entry.
+#[cfg(any(windows, target_os = "linux"))]
+static PINNED: std::sync::Mutex<Option<PinMap>> = std::sync::Mutex::new(None);
+
+#[cfg(any(windows, target_os = "linux"))]
+fn pins() -> std::sync::MutexGuard<'static, Option<PinMap>> {
+    PINNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The pin on `root`, if it is held.
+#[cfg(any(windows, target_os = "linux"))]
+fn pinned(root: &Path) -> Option<std::sync::Arc<Pinned>> {
+    pins().as_ref()?.get(root).cloned()
+}
+
+/// The held root that `path` lies beneath, if any.
+#[cfg(any(windows, target_os = "linux"))]
+fn pinned_above(path: &Path) -> Option<(PathBuf, std::sync::Arc<Pinned>)> {
+    let guard = pins();
+    let map = guard.as_ref()?;
+    path.ancestors()
+        .skip(1)
+        .find_map(|a| map.get_key_value(a))
+        .map(|(k, v)| (k.clone(), v.clone()))
+}
+
+/// Returned by `hold_root`: releases the pin when dropped (unless `remove_dir` already did).
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Debug)]
+struct Hold {
+    root: PathBuf,
+    pin: std::sync::Weak<Pinned>,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut guard = pins();
+        if let Some(map) = guard.as_mut() {
+            if map
+                .get(&self.root)
+                .is_some_and(|p| std::ptr::eq(std::sync::Arc::as_ptr(p), self.pin.as_ptr()))
+            {
+                map.remove(&self.root);
+            }
+        }
+    }
+}
+
+/// Real locations of roots used without `hold_root`, resolved at first use, so each check costs
+/// one query on the opened handle.
 #[cfg(windows)]
 type RootMap = std::collections::HashMap<PathBuf, (u64, PathBuf)>;
 #[cfg(windows)]
@@ -227,52 +331,113 @@ static ROOTS: std::sync::Mutex<Option<RootMap>> = std::sync::Mutex::new(None);
 
 /// Whether `opened` (at `path`) is really somewhere outside `root`: a junction on the way led
 /// elsewhere. One query on the handle instead of checking every component before the open, and
-/// it checks the very handle that will be written through.
+/// it checks the very handle that will be written through. A held root is compared with the
+/// location captured when it was pinned.
 #[cfg(windows)]
 fn outside_root(opened: &File, root: &Path, path: &Path) -> Result<bool> {
     use std::os::windows::fs::OpenOptionsExt;
     let real = crate::win::final_path(opened).map_err(err("resolving", path))?;
-    let mut roots = ROOTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = roots.get_or_insert_with(RootMap::new);
-    let root_real = match map.get(root) {
-        Some(r) => r.clone(),
+    let root_real = match pinned(root) {
+        Some(p) => p.real.clone(),
         None => {
-            let d = OpenOptions::new()
-                .read(true)
-                .custom_flags(crate::win::FILE_FLAG_BACKUP_SEMANTICS)
-                .open(root)
-                .map_err(err("opening directory", root))?;
-            let r = crate::win::final_path(&d).map_err(err("resolving", root))?;
-            map.insert(root.to_path_buf(), r.clone());
-            r
+            let mut roots = ROOTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = roots.get_or_insert_with(RootMap::new);
+            match map.get(root) {
+                Some(r) => r.clone(),
+                None => {
+                    let d = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(crate::win::FILE_FLAG_BACKUP_SEMANTICS)
+                        .open(root)
+                        .map_err(err("opening directory", root))?;
+                    let r = crate::win::final_path(&d).map_err(err("resolving", root))?;
+                    map.insert(root.to_path_buf(), r.clone());
+                    r
+                }
+            }
         }
     };
     let inside = real.0 == root_real.0 && real.1 != root_real.1 && real.1.starts_with(&root_real.1);
     Ok(!inside)
 }
 
+/// Take back something just created through a junction, through its own handle: deleting by
+/// path could be redirected to something else by then.
+#[cfg(windows)]
+fn take_back(opened: File) {
+    use crate::win::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES};
+    const SHARE_ALL: u32 = 7;
+    // The handle may deny sharing deletion (Share::Exclusive): keep the file by an attributes-only
+    // handle, which takes no part in sharing checks, close the original, then reopen the file
+    // itself for deletion.
+    let Ok(attrs) = crate::win::reopen(
+        &opened,
+        FILE_READ_ATTRIBUTES,
+        SHARE_ALL,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    ) else {
+        return;
+    };
+    drop(opened);
+    if let Ok(d) = crate::win::reopen(&attrs, DELETE, SHARE_ALL, FILE_FLAG_OPEN_REPARSE_POINT) {
+        let _ = crate::win::delete_by_handle(&d);
+    }
+}
+
+/// Open the directory `dir` itself (not a link there) and pin it.
+#[cfg(any(windows, target_os = "linux"))]
+fn pin_dir(dir: &Path) -> Result<Pinned> {
+    let refuse_link = |e: io::Error| {
+        if fs::symlink_metadata(dir).is_ok_and(|md| md.file_type().is_symlink()) {
+            FsError::Link {
+                path: dir.to_path_buf(),
+            }
+        } else {
+            FsError::from_io("opening directory", dir, e)
+        }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let fd = crate::linux::open_dir_nofollow(dir).map_err(refuse_link)?;
+        Ok(Pinned { dir: fd })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        // Read access, not just attributes: a handle without data access takes no part in
+        // sharing checks, and would not stop the rename.
+        let d = OpenOptions::new()
+            .read(true)
+            .share_mode(crate::win::FILE_SHARE_READ | crate::win::FILE_SHARE_WRITE)
+            .custom_flags(
+                crate::win::FILE_FLAG_BACKUP_SEMANTICS | crate::win::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(dir)
+            .map_err(refuse_link)?;
+        let md = d.metadata().map_err(err("reading metadata of", dir))?;
+        if md.file_attributes() & crate::win::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FsError::Link {
+                path: dir.to_path_buf(),
+            });
+        }
+        if !md.is_dir() {
+            return Err(FsError::Io {
+                op: "opening directory",
+                path: dir.to_path_buf(),
+                source: io::Error::other("not a directory"),
+            });
+        }
+        let real = crate::win::final_path(&d).map_err(err("resolving", dir))?;
+        Ok(Pinned { _dir: d, real })
+    }
+}
+
 impl FsBackend for OsFs {
     fn open(&self, path: &Path, mode: OpenMode, share: Share) -> Result<Box<dyn FileHandle>> {
         let _prof = trunc_prof::span("fs.open");
-        let file = match open_options(mode, share).open(path) {
-            Ok(f) => f,
-            // Opening a directory junction as a file fails with a generic access error; report
-            // what is actually there.
-            Err(e) => {
-                if let Ok(Some(Meta {
-                    kind: NodeKind::Link,
-                    ..
-                })) = self.metadata(path)
-                {
-                    return Err(FsError::Link {
-                        path: path.to_path_buf(),
-                    });
-                }
-                return Err(FsError::from_io("opening", path, e));
-            }
-        };
+        let file = self.open_unchecked(path, mode, share)?;
         finish_open(file, path, mode, share)
     }
 
@@ -302,10 +467,9 @@ impl FsBackend for OsFs {
             }
         };
         if outside_root(&file, root, path)? {
-            drop(file);
             if mode == OpenMode::CreateNew {
                 // Created through a junction: it is ours and new, so take it back.
-                let _ = fs::remove_file(path);
+                take_back(file);
             }
             return Err(FsError::Link {
                 path: path.to_path_buf(),
@@ -331,7 +495,12 @@ impl FsBackend for OsFs {
             OpenMode::CreateNew => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
             OpenMode::CreateOrTruncate => OFlags::RDWR | OFlags::CREATE | OFlags::TRUNC,
         };
-        match crate::linux::open_beneath(root, rel, flags) {
+        let opened = match pinned(root) {
+            Some(pin) => crate::linux::open_beneath(pin.dir.as_fd(), rel, flags),
+            None => crate::linux::open_root(root)
+                .and_then(|dir| crate::linux::open_beneath(dir.as_fd(), rel, flags)),
+        };
+        match opened {
             Ok(Some(file)) => finish_open(file, path, mode, share),
             Ok(None) => {
                 crate::check_beneath(self, root, path)?;
@@ -339,6 +508,24 @@ impl FsBackend for OsFs {
             }
             Err(e) => Err(beneath_err("opening", path, e)),
         }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn hold_root(&self, dir: &Path, create: bool) -> Result<crate::RootHold> {
+        if create {
+            self.create_dir(dir)?;
+        }
+        // Opened right after the mkdir, refusing a link or junction put in its place; from here
+        // on confined calls go through this handle, not the path.
+        let pin = std::sync::Arc::new(pin_dir(dir)?);
+        let hold = Hold {
+            root: dir.to_path_buf(),
+            pin: std::sync::Arc::downgrade(&pin),
+        };
+        pins()
+            .get_or_insert_with(PinMap::new)
+            .insert(dir.to_path_buf(), pin);
+        Ok(Box::new(hold))
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
@@ -352,16 +539,26 @@ impl FsBackend for OsFs {
         let _prof = trunc_prof::span("fs.create_dir");
         crate::relative_beneath(root, path)?;
         fs::create_dir(path).map_err(err("creating directory", path))?;
-        let d = OpenOptions::new()
-            .read(true)
-            .custom_flags(
-                crate::win::FILE_FLAG_BACKUP_SEMANTICS | crate::win::FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-            .open(path)
-            .map_err(err("opening directory", path))?;
+        let mut oo = OpenOptions::new();
+        oo.custom_flags(
+            crate::win::FILE_FLAG_BACKUP_SEMANTICS | crate::win::FILE_FLAG_OPEN_REPARSE_POINT,
+        );
+        // With DELETE access, so a directory made through a junction can be taken back by this
+        // handle. (Directories cannot be reopened by handle the way `take_back` does for files.)
+        let all = crate::win::GENERIC_READ | crate::win::DELETE;
+        let d = match oo.clone().access_mode(all).open(path) {
+            Ok(d) => d,
+            // A directory we may create but not delete (unusual ACLs): check without.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => oo
+                .read(true)
+                .open(path)
+                .map_err(err("opening directory", path))?,
+            Err(e) => return Err(FsError::from_io("opening directory", path, e)),
+        };
         if outside_root(&d, root, path)? {
-            drop(d);
-            let _ = fs::remove_dir(path);
+            // Created through a junction: take it back by the handle that was checked, never
+            // by its path, which a swapped junction could send somewhere else.
+            let _ = crate::win::delete_by_handle(&d);
             return Err(FsError::Link {
                 path: path.to_path_buf(),
             });
@@ -373,7 +570,12 @@ impl FsBackend for OsFs {
     fn create_dir_beneath(&self, root: &Path, path: &Path) -> Result<()> {
         let _prof = trunc_prof::span("fs.create_dir");
         let rel = crate::relative_beneath(root, path)?;
-        match crate::linux::mkdir_beneath(root, rel) {
+        let made = match pinned(root) {
+            Some(pin) => crate::linux::mkdir_beneath(pin.dir.as_fd(), rel),
+            None => crate::linux::open_root(root)
+                .and_then(|dir| crate::linux::mkdir_beneath(dir.as_fd(), rel)),
+        };
+        match made {
             Ok(true) => Ok(()),
             Ok(false) => {
                 crate::check_beneath(self, root, path)?;
@@ -423,8 +625,19 @@ impl FsBackend for OsFs {
         #[cfg(not(windows))]
         {
             #[cfg(target_os = "linux")]
-            if crate::linux::rename_noreplace(from, to).map_err(err("renaming", from))? {
-                return Ok(());
+            {
+                // Out of a held root: name the entry relative to the pinned directory, so a link
+                // put in the root's place cannot change what is moved.
+                let pin = from.parent().and_then(pinned);
+                if let (Some(pin), Some(name)) = (pin, from.file_name()) {
+                    if crate::linux::rename_noreplace_from(pin.dir.as_fd(), Path::new(name), to)
+                        .map_err(err("renaming", from))?
+                    {
+                        return Ok(());
+                    }
+                } else if crate::linux::rename_noreplace(from, to).map_err(err("renaming", from))? {
+                    return Ok(());
+                }
             }
             // Without renameat2 support, checking and renaming are two steps.
             if fs::symlink_metadata(to).is_ok() {
@@ -448,33 +661,81 @@ impl FsBackend for OsFs {
             crate::relative_beneath(root, src)?,
             crate::relative_beneath(root, dst)?,
         );
-        match crate::linux::link_beneath(root, s, d) {
-            Ok(true) => {}
+        // Under a held root both parents resolve against the pinned descriptor, so a link put
+        // in the root's place cannot redirect either name.
+        let linked = match pinned(root) {
+            Some(pin) => crate::linux::link_beneath(pin.dir.as_fd(), s, d),
+            None => crate::linux::open_root(root)
+                .and_then(|dir| crate::linux::link_beneath(dir.as_fd(), s, d)),
+        };
+        match linked {
+            Ok(true) => Ok(()),
             Ok(false) => {
                 crate::check_beneath(self, root, src)?;
                 crate::check_beneath(self, root, dst)?;
                 self.hard_link(src, dst)?;
+                // linkat does not follow a symlink at `src`: it would link the symlink itself.
+                match self.metadata(dst)? {
+                    Some(Meta {
+                        kind: NodeKind::File,
+                        ..
+                    }) => Ok(()),
+                    _ => {
+                        let _ = fs::remove_file(dst);
+                        Err(FsError::Link {
+                            path: src.to_path_buf(),
+                        })
+                    }
+                }
             }
-            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error()) => {
-                return Err(FsError::Link {
-                    path: dst.to_path_buf(),
-                });
-            }
-            Err(e) => return Err(link_err(dst, e)),
-        }
-        // linkat does not follow a symlink at `src`: it would link the symlink itself.
-        match self.metadata(dst)? {
-            Some(Meta {
-                kind: NodeKind::File,
-                ..
-            }) => Ok(()),
-            _ => {
-                let _ = fs::remove_file(dst);
+            Err(e)
+                if e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error())
+                    || e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+            {
                 Err(FsError::Link {
-                    path: src.to_path_buf(),
+                    path: dst.to_path_buf(),
                 })
             }
+            Err(e) => Err(link_err(dst, e)),
         }
+    }
+
+    #[cfg(windows)]
+    fn hard_link_beneath(&self, root: &Path, src: &Path, dst: &Path) -> Result<()> {
+        use crate::win::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES};
+        use std::os::windows::fs::OpenOptionsExt;
+        const SHARE_ALL: u32 = 7;
+        let _prof = trunc_prof::span("fs.hard_link");
+        // The source through a confined open (its location checked against the root, pinned or
+        // not), so the new name can be compared with the very file meant.
+        let sid = self
+            .open_beneath(root, src, OpenMode::Read, Share::Shared)?
+            .file_id()?;
+        crate::check_beneath(self, root, dst)?;
+        fs::hard_link(src, dst).map_err(|e| link_err(dst, e))?;
+        // CreateHardLinkW follows junctions in both paths. Open the new name itself, with DELETE
+        // access, and check where it really is and what it is: a stray is taken back through
+        // this handle, never by a path that a swapped junction could send elsewhere.
+        let d = OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dst)
+            .map_err(err("opening", dst))?;
+        let id = crate::win::file_id(&d).map_err(err("reading file id of", dst))?;
+        let same = id == (sid.volume, sid.file);
+        let outside = outside_root(&d, root, dst)?;
+        // Outside the root only a name for the source itself is surely the one just made (a
+        // different file there may be someone else's); inside it, any stray name is ours.
+        if outside && same || !outside && !same {
+            let _ = crate::win::delete_by_handle(&d);
+        }
+        if outside || !same {
+            return Err(FsError::Link {
+                path: dst.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
@@ -484,6 +745,11 @@ impl FsBackend for OsFs {
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
         let _prof = trunc_prof::span("fs.remove");
+        // A held root's handle would stop its own removal on Windows.
+        #[cfg(any(windows, target_os = "linux"))]
+        if let Some(map) = pins().as_mut() {
+            map.remove(path);
+        }
         fs::remove_dir(path).map_err(err("removing directory", path))
     }
 
@@ -535,28 +801,89 @@ impl FsBackend for OsFs {
         // Windows keeps only a read-only flag. Files trunc writes are writable already, so a
         // mode with any write bit changes nothing and needs no calls.
         #[cfg(windows)]
-        if mode & 0o222 != 0 {
-            return Ok(());
+        {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            if mode & 0o222 != 0 {
+                return Ok(());
+            }
+            // Change the attribute through a handle on the node itself, never a link's target.
+            let f = OpenOptions::new()
+                .access_mode(crate::win::FILE_READ_ATTRIBUTES | crate::win::FILE_WRITE_ATTRIBUTES)
+                .custom_flags(
+                    crate::win::FILE_FLAG_OPEN_REPARSE_POINT
+                        | crate::win::FILE_FLAG_BACKUP_SEMANTICS,
+                )
+                .open(path)
+                .map_err(err("opening", path))?;
+            let md = f.metadata().map_err(err("reading metadata of", path))?;
+            let link = md.file_attributes() & crate::win::FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            let outside = match pinned_above(path) {
+                Some((root, _)) => outside_root(&f, &root, path)?,
+                None => false,
+            };
+            if link || outside {
+                return Err(FsError::Link {
+                    path: path.to_path_buf(),
+                });
+            }
+            let mut p = md.permissions();
+            p.set_readonly(true);
+            f.set_permissions(p)
+                .map_err(err("setting permissions of", path))
         }
-        if self.metadata(path)?.map(|m| m.kind) == Some(NodeKind::Link) {
-            return Err(FsError::Link {
-                path: path.to_path_buf(),
-            });
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::OFlags;
+            // Under a held root, every component is confined; otherwise only the final one is
+            // never followed, as for `open`.
+            let pin = pinned_above(path);
+            let open = |flags: OFlags| -> Result<std::os::fd::OwnedFd> {
+                let flags = flags | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                if let Some((root, pin)) = &pin {
+                    let rel = crate::relative_beneath(root, path)?;
+                    match crate::linux::openat_beneath(pin.dir.as_fd(), rel, flags) {
+                        Ok(Some(fd)) => return Ok(fd),
+                        Ok(None) => crate::check_beneath(self, root, path)?,
+                        Err(e) => return Err(beneath_err("opening", path, e)),
+                    }
+                }
+                rustix::fs::open(path, flags, rustix::fs::Mode::empty())
+                    .map_err(|e| err("opening", path)(e.into()))
+            };
+            let fd = open(OFlags::PATH)?;
+            if !crate::linux::chmod_path_fd(&fd, mode)
+                .map_err(err("setting permissions of", path))?
+            {
+                // No /proc: a readable descriptor can be fchmod-ed, once it is known to be the
+                // same file.
+                let rd = open(OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?;
+                crate::linux::fchmod_same(&fd, &rd, mode)
+                    .map_err(err("setting permissions of", path))?;
+            }
+            Ok(())
         }
-        #[cfg(unix)]
-        let perms = {
-            use std::os::unix::fs::PermissionsExt;
-            fs::Permissions::from_mode(mode & 0o777)
-        };
-        #[cfg(not(unix))]
-        let perms = {
-            let mut p = fs::metadata(path)
-                .map_err(err("reading metadata of", path))?
-                .permissions();
-            p.set_readonly(mode & 0o222 == 0);
-            p
-        };
-        fs::set_permissions(path, perms).map_err(err("setting permissions of", path))
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            if self.metadata(path)?.map(|m| m.kind) == Some(NodeKind::Link) {
+                return Err(FsError::Link {
+                    path: path.to_path_buf(),
+                });
+            }
+            #[cfg(unix)]
+            let perms = {
+                use std::os::unix::fs::PermissionsExt;
+                fs::Permissions::from_mode(mode & 0o777)
+            };
+            #[cfg(not(unix))]
+            let perms = {
+                let mut p = fs::metadata(path)
+                    .map_err(err("reading metadata of", path))?
+                    .permissions();
+                p.set_readonly(mode & 0o222 == 0);
+                p
+            };
+            fs::set_permissions(path, perms).map_err(err("setting permissions of", path))
+        }
     }
 
     fn probe_volume(&self, path: &Path) -> Result<VolumeInfo> {

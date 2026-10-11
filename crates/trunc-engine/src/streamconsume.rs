@@ -1791,8 +1791,14 @@ pub fn consume_stream(
         ),
     };
 
-    match fs.metadata(&stage)?.map(|m| m.kind) {
-        Some(NodeKind::Dir) => crate::stage::flush_staging_tree(fs, &stage, &dest)?,
+    // Held until the end: every confined call under the staging directory goes through the
+    // directory opened here, not whatever its path names later.
+    let _stage_hold = match fs.metadata(&stage)?.map(|m| m.kind) {
+        Some(NodeKind::Dir) => {
+            let hold = fs.hold_root(&stage, false)?;
+            crate::stage::flush_staging_tree(fs, &stage, &dest)?;
+            hold
+        }
         Some(_) => {
             return Err(Error::Refused(format!(
                 "{} exists and is not a directory",
@@ -1813,8 +1819,9 @@ pub fn consume_stream(
                 fs.flush_dir(&parent_of(archive_path))?;
             }
             ensure_dir(fs, &dest)?;
-            fs.create_dir(&stage)?;
+            let hold = fs.hold_root(&stage, true)?;
             fs.flush_dir(&dest)?;
+            hold
         }
         None if decoded && all_exist(fs, &dest, &tops)? => {
             // Everything was renamed into place; only cleanup remains.
@@ -1830,7 +1837,7 @@ pub fn consume_stream(
                 dest.display()
             )));
         }
-    }
+    };
 
     let total = layout.ckpts.len() + 1;
     trunc_prof::time("stage.build", || {

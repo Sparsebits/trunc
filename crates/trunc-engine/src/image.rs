@@ -1903,11 +1903,14 @@ pub fn extract_image(
             )));
         }
         let stage = dest.join(format!(".trunc-stage-{}", random_hex()));
-        fs.create_dir(&stage)?;
+        // Held until the tree is renamed into place (or cleaned up): every confined call under
+        // the staging directory goes through the directory opened here.
+        let stage_hold = fs.hold_root(&stage, true)?;
         let r = write_tree(fs, outer, &scan, &items, dest, &stage, opts);
         if r.is_err() {
             remove_tree(fs, &stage);
         }
+        drop(stage_hold);
         r
     })
 }

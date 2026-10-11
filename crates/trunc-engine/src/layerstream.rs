@@ -437,7 +437,7 @@ impl Merger<'_> {
                 Some(_) => self.remove_all(&key)?,
                 None => {}
             }
-            self.fs.create_dir(&self.path(a))?;
+            self.fs.create_dir_beneath(self.stage, &self.path(a))?;
             self.tree.insert(
                 key,
                 Node {
@@ -463,7 +463,9 @@ impl Merger<'_> {
             }
         }
         match e.kind {
-            Kind::Dir if !dir_exists => self.fs.create_dir(&self.path(&e.name))?,
+            Kind::Dir if !dir_exists => self
+                .fs
+                .create_dir_beneath(self.stage, &self.path(&e.name))?,
             _ => {}
         }
         self.tree.insert(
@@ -504,13 +506,16 @@ pub fn extract_layer_streams(
     let created_dest = fs.metadata(dest)?.is_none();
     ensure_dir(fs, dest)?;
     let stage = dest.join(format!(".layerless-stage-{}", random_hex()));
-    fs.create_dir(&stage)?;
+    // Held until the tree is renamed into place (or cleaned up): every confined call under the
+    // staging directory goes through the directory opened here.
+    let stage_hold = fs.hold_root(&stage, true)?;
     let r = run(fs, dest, &stage, layers, opts, open, on_layer);
     if r.is_err() {
         remove_tree(fs, &stage);
-        if created_dest {
-            let _ = fs.remove_dir(dest);
-        }
+    }
+    drop(stage_hold);
+    if r.is_err() && created_dest {
+        let _ = fs.remove_dir(dest);
     }
     r
 }
