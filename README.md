@@ -227,19 +227,9 @@ a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `
 | `crates/trunc-cli` | The `trunc` command |
 | `crates/trunc-prof` | The span profiler behind `--profile` |
 | `crates/trunc-testkit` | A simulated filesystem that can crash on demand, plus test fixtures |
-| `crates/flavors/`, `flavors/` | Tools built on trunc: weightdrop, layerless, ci-restore |
 | `fuzz/` | Fuzz targets |
 
 </details>
-
-## Built on trunc
-
-- [weightdrop](crates/flavors/weightdrop/): unpack sharded model weights and datasets on GPU
-  boxes with small disks.
-- [layerless](crates/flavors/layerless/): pull a container image straight to a root filesystem,
-  with no tarball and no daemon.
-- [ci-restore](flavors/ci-restore/): restore big CI caches and artifacts without doubling runner
-  disk.
 
 ## License
 

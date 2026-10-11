@@ -138,12 +138,4 @@ The first release.
 - Releases are built with a pinned toolchain into reproducible archives, with a CycloneDX SBOM
   per target.
 
-### Built on trunc
-- [ci-restore](flavors/ci-restore/): a GitHub Action and script that restore big CI caches and
-  artifacts without doubling runner disk.
-- [weightdrop](crates/flavors/weightdrop/): unpacks sharded model weights and datasets (WebDataset,
-  `-00001-of-00042` sets) one shard after another, planning the whole set's space first.
-- [layerless](crates/flavors/layerless/): pulls a container image straight from a registry into a
-  root filesystem, with no tarball and no daemon.
-
 [0.1.0]: https://github.com/Sparsebits/trunc/releases/tag/v0.1.0

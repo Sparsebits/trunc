@@ -25,9 +25,6 @@ allow = [
     # libbz2-rs-sys, behind the bzip2 encoder the test kit uses for fixtures; BSD-style, and it
     # is a dev-dependency only (never in the trunc binary).
     "bzip2-1.0.6",
-    # webpki-roots (Mozilla's CA certificate list, via ureq/rustls in the layerless flavor):
-    # a permissive data licence.
-    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
