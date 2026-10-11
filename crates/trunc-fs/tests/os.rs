@@ -1017,3 +1017,25 @@ fn case_folding_probe() {
     assert!(fs().read_dir(d.path()).unwrap().is_empty());
     assert!(fs().folds_case(&d.path().join("missing")).is_err());
 }
+
+/// An exclusive overwrite that is refused because another handle holds the file must not have
+/// emptied it first (on Linux the lock is taken after `open`, so truncation waits for it).
+#[test]
+fn refused_exclusive_overwrite_leaves_the_file_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("held.bin");
+    std::fs::write(&p, b"keep me").unwrap();
+    let fs = OsFs::new();
+    let held = fs.open(&p, OpenMode::ReadWrite, Share::Exclusive).unwrap();
+    assert!(matches!(
+        fs.open(&p, OpenMode::CreateOrTruncate, Share::Exclusive),
+        Err(FsError::Busy { .. } | FsError::Io { .. })
+    ));
+    assert_eq!(std::fs::read(&p).unwrap(), b"keep me");
+    drop(held);
+    // Once free, the overwrite truncates as before.
+    let h = fs
+        .open(&p, OpenMode::CreateOrTruncate, Share::Exclusive)
+        .unwrap();
+    assert_eq!(h.size().unwrap(), 0);
+}

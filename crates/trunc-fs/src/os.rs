@@ -122,7 +122,9 @@ fn open_options(mode: OpenMode, share: Share) -> OpenOptions {
             oo.write(true).create_new(true);
         }
         OpenMode::CreateOrTruncate => {
-            oo.write(true).create(true).truncate(true);
+            // On Unix the file is truncated in `check_opened`, after the advisory lock is taken,
+            // so an open refused as busy leaves another process's file alone.
+            oo.write(true).create(true).truncate(cfg!(not(unix)));
         }
     }
     #[cfg(windows)]
@@ -193,6 +195,10 @@ fn check_opened(file: &File, path: &Path, mode: OpenMode, share: Share) -> Resul
         return Err(FsError::Busy {
             path: path.to_path_buf(),
         });
+    }
+    #[cfg(unix)]
+    if mode == OpenMode::CreateOrTruncate {
+        file.set_len(0).map_err(err("truncating", path))?;
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (mode, share);
@@ -518,7 +524,8 @@ impl FsBackend for OsFs {
             OpenMode::Read => OFlags::RDONLY,
             OpenMode::ReadWrite => OFlags::RDWR,
             OpenMode::CreateNew => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
-            OpenMode::CreateOrTruncate => OFlags::RDWR | OFlags::CREATE | OFlags::TRUNC,
+            // Truncated in `check_opened`, once the lock is held.
+            OpenMode::CreateOrTruncate => OFlags::RDWR | OFlags::CREATE,
         };
         let opened = match pinned(root) {
             Some(pin) => crate::linux::open_beneath(pin.dir.as_fd(), rel, flags),
