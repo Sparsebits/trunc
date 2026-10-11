@@ -89,6 +89,7 @@ impl<'a> Rc<'a> {
         }
     }
 
+    #[inline(always)]
     fn tree(&mut self, probs: &mut [u16], bits: u32) -> u32 {
         let mut m = 1usize;
         for _ in 0..bits {
@@ -97,6 +98,7 @@ impl<'a> Rc<'a> {
         m as u32 - (1 << bits)
     }
 
+    #[inline(always)]
     fn reverse_tree(&mut self, probs: &mut [u16], bits: u32) -> u32 {
         let mut m = 1usize;
         let mut sym = 0u32;
@@ -108,6 +110,7 @@ impl<'a> Rc<'a> {
         sym
     }
 
+    #[inline(always)]
     fn direct(&mut self, bits: u32) -> u32 {
         let mut v = 0u32;
         for _ in 0..bits {
@@ -277,101 +280,25 @@ impl Lzma2 {
     }
 
     fn lzma(&mut self, data: &[u8], unpacked: usize) -> stream::Result<()> {
-        let mut rc = Rc::new(data)?;
-        let pb_mask = (1u64 << self.pb) - 1;
-        let lp_mask = (1u64 << self.lp) - 1;
-        let lc = self.lc;
-        let end = self.win.len() + unpacked;
-        self.win.reserve(unpacked);
-        let dict = u64::from(self.dict_size);
-        while self.win.len() < end {
-            let pos_state = (self.pos & pb_mask) as usize;
-            let s = self.state;
-            if rc.bit(&mut self.probs[IS_MATCH + s * 16 + pos_state]) == 0 {
-                // Literal.
-                let prev = if self.pos > 0 {
-                    u32::from(*self.win.last().expect("pos > 0"))
-                } else {
-                    0
-                };
-                let base = LITERAL
-                    + 0x300
-                        * ((((self.pos & lp_mask) as usize) << lc) + (prev >> (8 - lc)) as usize);
-                // A fixed-size view: indexes below 0x100 need no check.
-                let probs: &mut [u16; 0x300] = (&mut self.probs[base..base + 0x300])
-                    .try_into()
-                    .expect("0x300 literal probabilities");
-                let mut sym = 1usize;
-                if s >= 7 {
-                    let d = self.reps[0] as usize + 1;
-                    let mut mb = u32::from(self.win[self.win.len() - d]);
-                    loop {
-                        let mbit = ((mb >> 7) & 1) as usize;
-                        mb <<= 1;
-                        let b = rc.bit(&mut probs[((1 + mbit) << 8) + sym]) as usize;
-                        sym = (sym << 1) | b;
-                        if mbit != b || sym >= 0x100 {
-                            break;
-                        }
-                    }
-                }
-                while sym < 0x100 {
-                    sym = (sym << 1) | rc.bit(&mut probs[sym & 0xFF]) as usize;
-                }
-                self.win.push(sym as u8);
-                self.pos += 1;
-                self.state = if s < 4 {
-                    0
-                } else if s < 10 {
-                    s - 3
-                } else {
-                    s - 6
-                };
-                continue;
-            }
-            let len;
-            if rc.bit(&mut self.probs[IS_REP + s]) == 0 {
-                // A new match.
-                len = self.length(&mut rc, LEN, pos_state);
-                self.state = if s < 7 { 7 } else { 10 };
-                let dist = self.distance(&mut rc, len);
-                if dist == u32::MAX {
-                    return Err(corrupt("end marker inside a chunk"));
-                }
-                self.reps = [dist, self.reps[0], self.reps[1], self.reps[2]];
-            } else if rc.bit(&mut self.probs[IS_REP_G0 + s]) == 0 {
-                if rc.bit(&mut self.probs[IS_REP0_LONG + s * 16 + pos_state]) == 0 {
-                    // Short rep: one byte at rep0.
-                    self.state = if s < 7 { 9 } else { 11 };
-                    self.copy(1, dict)?;
-                    continue;
-                }
-                len = self.length(&mut rc, REP_LEN, pos_state);
-                self.state = if s < 7 { 8 } else { 11 };
-            } else {
-                let d;
-                if rc.bit(&mut self.probs[IS_REP_G1 + s]) == 0 {
-                    d = self.reps[1];
-                } else {
-                    if rc.bit(&mut self.probs[IS_REP_G2 + s]) == 0 {
-                        d = self.reps[2];
-                    } else {
-                        d = self.reps[3];
-                        self.reps[3] = self.reps[2];
-                    }
-                    self.reps[2] = self.reps[1];
-                }
-                self.reps[1] = self.reps[0];
-                self.reps[0] = d;
-                len = self.length(&mut rc, REP_LEN, pos_state);
-                self.state = if s < 7 { 8 } else { 11 };
-            }
-            let n = len as usize + 2;
-            if self.win.len() + n > end {
-                return Err(corrupt("match runs past the end of the chunk"));
-            }
-            self.copy(n, dict)?;
-        }
+        let rc = Rc::new(data)?;
+        let start = self.win.len();
+        let end = start + unpacked;
+        // Decode into a buffer sized for the whole chunk plus slack, then cut it to length:
+        // matches can then be copied in fixed 16-byte chunks that may overshoot into the slack.
+        self.win.resize(end + SLACK, 0);
+        let mut at = At {
+            op: start,
+            pos: self.pos,
+            state: self.state,
+            reps: self.reps,
+        };
+        let (mut rc, r) = self.run(rc, &mut at, end);
+        // Keep what was produced, on error too.
+        self.win.truncate(at.op);
+        self.pos = at.pos;
+        self.state = at.state;
+        self.reps = at.reps;
+        r?;
         // Normalization is lazy (before each bit), so the last byte may still be pending.
         rc.normalize();
         if rc.overrun || rc.ip != data.len() || rc.code != 0 {
@@ -380,59 +307,148 @@ impl Lzma2 {
         Ok(())
     }
 
-    fn copy(&mut self, n: usize, dict: u64) -> stream::Result<()> {
-        let d = self.reps[0] as usize + 1;
-        if d as u64 > self.pos || d as u64 > dict || d > self.win.len() {
-            return Err(corrupt("distance too far back"));
-        }
-        let start = self.win.len() - d;
-        if d >= n {
-            self.win.extend_from_within(start..start + n);
-        } else {
-            // Overlapping: copy whole periods of `d` bytes, doubling.
-            let mut left = n;
-            while left > 0 {
-                let k = left.min(self.win.len() - start);
-                self.win.extend_from_within(start..start + k);
-                left -= k;
+    /// The decoding loop of [`Lzma2::lzma`]: fills `win[at.op..end]`. The state is kept in
+    /// locals while it runs and written back to `at` when it stops.
+    fn run<'d>(&mut self, mut rc: Rc<'d>, at: &mut At, end: usize) -> (Rc<'d>, stream::Result<()>) {
+        let pb_mask = (1u64 << self.pb) - 1;
+        let lp_mask = (1u64 << self.lp) - 1;
+        let lc = self.lc;
+        let dict = u64::from(self.dict_size);
+        let probs = self.probs.as_mut_slice();
+        let buf = self.win.as_mut_slice();
+        let At {
+            mut op,
+            mut pos,
+            mut state,
+            mut reps,
+        } = *at;
+        let mut err = None;
+        while op < end {
+            let pos_state = (pos & pb_mask) as usize;
+            let s = state;
+            if rc.bit(&mut probs[IS_MATCH + s * 16 + pos_state]) == 0 {
+                // Literal.
+                let prev = if pos > 0 { u32::from(buf[op - 1]) } else { 0 };
+                let base = LITERAL
+                    + 0x300 * ((((pos & lp_mask) as usize) << lc) + (prev >> (8 - lc)) as usize);
+                // A fixed-size view: indexes below 0x300 need no check.
+                let p: &mut [u16; 0x300] = (&mut probs[base..base + 0x300])
+                    .try_into()
+                    .expect("0x300 literal probabilities");
+                let mut sym = 1usize;
+                if s >= 7 {
+                    // Matched literal: bits use the probabilities chosen by the byte at rep0
+                    // until one differs from it, then the plain ones. `off` is 0x100 while they
+                    // agree and 0 after, which picks the probabilities without a branch.
+                    let d = reps[0] as usize + 1;
+                    let mut mb = usize::from(buf[op - d]);
+                    let mut off = 0x100usize;
+                    for _ in 0..8 {
+                        mb <<= 1;
+                        let mbit = mb & off;
+                        let b = rc.bit(&mut p[off + mbit + sym]) as usize;
+                        sym = (sym << 1) | b;
+                        off &= if b != 0 { mbit } else { !mbit };
+                    }
+                } else {
+                    for _ in 0..8 {
+                        sym = (sym << 1) | rc.bit(&mut p[sym & 0xFF]) as usize;
+                    }
+                }
+                buf[op] = sym as u8;
+                op += 1;
+                pos += 1;
+                state = if s < 4 {
+                    0
+                } else if s < 10 {
+                    s - 3
+                } else {
+                    s - 6
+                };
+                continue;
             }
+            let n;
+            if rc.bit(&mut probs[IS_REP + s]) == 0 {
+                // A new match.
+                let len = length(&mut rc, &mut probs[LEN..LEN + LEN_PROBS], pos_state);
+                state = if s < 7 { 7 } else { 10 };
+                let dist = distance(&mut rc, probs, len);
+                if dist == u32::MAX {
+                    err = Some("end marker inside a chunk");
+                    break;
+                }
+                reps = [dist, reps[0], reps[1], reps[2]];
+                n = len as usize + 2;
+            } else if rc.bit(&mut probs[IS_REP_G0 + s]) == 0 {
+                if rc.bit(&mut probs[IS_REP0_LONG + s * 16 + pos_state]) == 0 {
+                    // Short rep: one byte at rep0.
+                    state = if s < 7 { 9 } else { 11 };
+                    n = 1;
+                } else {
+                    let len = length(&mut rc, &mut probs[REP_LEN..REP_LEN + LEN_PROBS], pos_state);
+                    state = if s < 7 { 8 } else { 11 };
+                    n = len as usize + 2;
+                }
+            } else {
+                let d;
+                if rc.bit(&mut probs[IS_REP_G1 + s]) == 0 {
+                    d = reps[1];
+                } else {
+                    if rc.bit(&mut probs[IS_REP_G2 + s]) == 0 {
+                        d = reps[2];
+                    } else {
+                        d = reps[3];
+                        reps[3] = reps[2];
+                    }
+                    reps[2] = reps[1];
+                }
+                reps[1] = reps[0];
+                reps[0] = d;
+                let len = length(&mut rc, &mut probs[REP_LEN..REP_LEN + LEN_PROBS], pos_state);
+                state = if s < 7 { 8 } else { 11 };
+                n = len as usize + 2;
+            }
+            if op + n > end {
+                err = Some("match runs past the end of the chunk");
+                break;
+            }
+            let d = reps[0] as usize + 1;
+            if d as u64 > pos || d as u64 > dict || d > op {
+                err = Some("distance too far back");
+                break;
+            }
+            let src = op - d;
+            if d >= 16 {
+                // Each chunk reads only bytes already written; the last may run into the slack.
+                let mut k = 0;
+                while k < n {
+                    let t: [u8; 16] = buf[src + k..src + k + 16].try_into().expect("16");
+                    buf[op + k..op + k + 16].copy_from_slice(&t);
+                    k += 16;
+                }
+            } else {
+                // A short period: copy whole periods from the start of the match, doubling.
+                let mut done = 0;
+                while done < n {
+                    let k = (n - done).min(d + done);
+                    buf.copy_within(src..src + k, op + done);
+                    done += k;
+                }
+            }
+            op += n;
+            pos += n as u64;
         }
-        self.pos += n as u64;
-        Ok(())
-    }
-
-    fn length(&mut self, rc: &mut Rc<'_>, base: usize, pos_state: usize) -> u32 {
-        let p = &mut self.probs[base..base + LEN_PROBS];
-        if rc.bit(&mut p[0]) == 0 {
-            let o = 2 + pos_state * 8;
-            return rc.tree(&mut p[o..o + 8], 3);
-        }
-        if rc.bit(&mut p[1]) == 0 {
-            let o = 2 + 128 + pos_state * 8;
-            return 8 + rc.tree(&mut p[o..o + 8], 3);
-        }
-        16 + rc.tree(&mut p[2 + 256..2 + 256 + 256], 8)
-    }
-
-    fn distance(&mut self, rc: &mut Rc<'_>, len: u32) -> u32 {
-        let ls = len.min(3) as usize;
-        let o = POS_SLOT + ls * 64;
-        let slot = rc.tree(&mut self.probs[o..o + 64], 6);
-        if slot < 4 {
-            return slot;
-        }
-        let nbits = (slot >> 1) - 1;
-        let mut dist = (2 | (slot & 1)) << nbits;
-        if slot < 14 {
-            // Reverse bit tree over SPEC_POS, offset so that its index 1 lands at
-            // `dist - slot`.
-            let base = SPEC_POS + (dist - slot) as usize - 1;
-            dist += rc.reverse_tree(&mut self.probs[base..base + (1 << nbits)], nbits);
-        } else {
-            dist += rc.direct(nbits - 4) << 4;
-            dist += rc.reverse_tree(&mut self.probs[ALIGN..ALIGN + 16], 4);
-        }
-        dist
+        *at = At {
+            op,
+            pos,
+            state,
+            reps,
+        };
+        let r = match err {
+            Some(why) => Err(corrupt(why)),
+            None => Ok(()),
+        };
+        (rc, r)
     }
 
     /// State at a chunk boundary: `dict u32 | lc lp pb state u8 | reps 4×u32 | need_props u8 |
@@ -510,4 +526,55 @@ impl Lzma2 {
         self.flushed = window.len();
         self.win = window;
     }
+}
+
+/// Decoder state carried through [`Lzma2::run`]: the output position in the window, the
+/// position since the dictionary reset, the state machine and the repeat distances.
+#[derive(Clone, Copy)]
+struct At {
+    op: usize,
+    pos: u64,
+    state: usize,
+    reps: [u32; 4],
+}
+
+/// Window slack for match copies made in fixed 16-byte chunks.
+const SLACK: usize = 16;
+
+/// A match length (minus 2) from the length coder `p` (`LEN_PROBS` probabilities).
+#[inline(always)]
+fn length(rc: &mut Rc<'_>, p: &mut [u16], pos_state: usize) -> u32 {
+    if rc.bit(&mut p[0]) == 0 {
+        let o = 2 + pos_state * 8;
+        return rc.tree(&mut p[o..o + 8], 3);
+    }
+    if rc.bit(&mut p[1]) == 0 {
+        let o = 2 + 128 + pos_state * 8;
+        return 8 + rc.tree(&mut p[o..o + 8], 3);
+    }
+    16 + rc.tree(&mut p[2 + 256..2 + 256 + 256], 8)
+}
+
+/// A match distance (minus 1) for a match of length `len` (minus 2); `u32::MAX` is the end
+/// marker.
+#[inline(always)]
+fn distance(rc: &mut Rc<'_>, probs: &mut [u16], len: u32) -> u32 {
+    let ls = len.min(3) as usize;
+    let o = POS_SLOT + ls * 64;
+    let slot = rc.tree(&mut probs[o..o + 64], 6);
+    if slot < 4 {
+        return slot;
+    }
+    let nbits = (slot >> 1) - 1;
+    let mut dist = (2 | (slot & 1)) << nbits;
+    if slot < 14 {
+        // Reverse bit tree over SPEC_POS, offset so that its index 1 lands at
+        // `dist - slot`.
+        let base = SPEC_POS + (dist - slot) as usize - 1;
+        dist += rc.reverse_tree(&mut probs[base..base + (1 << nbits)], nbits);
+    } else {
+        dist += rc.direct(nbits - 4) << 4;
+        dist += rc.reverse_tree(&mut probs[ALIGN..ALIGN + 16], 4);
+    }
+    dist
 }
