@@ -18,23 +18,28 @@ fuzz_target!(|data: &[u8]| {
     let threads = |bit: u8| if case.extra & bit != 0 { 4 } else { 1 };
     let first = units::decode(codec, &case.input, None, &mut NoHistory, threads(1), every);
     units::check_points(codec, &first.points, case.input.len(), first.out.len());
-    if first.points.is_empty() {
+    // Only points whose cursor the run kept can be resumed from (all of them unless there are
+    // very many; see `units::Point`).
+    let kept: Vec<usize> = (0..first.points.len())
+        .filter(|&i| first.points[i].cursor.is_some())
+        .collect();
+    if kept.is_empty() {
         return;
     }
-    let pick = usize::from(case.extra >> 2) % first.points.len();
-    let (cursor, at, free_below) = &first.points[pick];
-    let at = usize::try_from(*at).unwrap();
+    let pick = kept[usize::from(case.extra >> 2) % kept.len()];
+    let point = &first.points[pick];
+    let at = usize::try_from(point.out).unwrap();
     let mut punched = case.input.clone();
-    punched[..usize::try_from(*free_below).unwrap()].fill(0);
+    punched[..usize::try_from(point.free_below).unwrap()].fill(0);
     let rest = units::decode(
         codec,
         &punched,
-        Some(cursor),
+        point.cursor.as_deref(),
         &mut units::VecHistory(&first.out[..at]),
         threads(2),
         every,
     );
-    let later: units::Points = first.points[pick + 1..].to_vec();
+    let later = &first.points[pick + 1..];
     match (&first.end, &rest.end) {
         (Ok(a), Ok(b)) => {
             assert!(
@@ -46,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
                 "{codec:?}: resume at {at} ends elsewhere"
             );
             assert!(
-                rest.points == later,
+                rest.points[..] == *later,
                 "{codec:?}: resume at {at} meets other safe points"
             );
         }
@@ -56,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
                 "{codec:?}: resume at {at} gives other output before the error"
             );
             assert!(
-                units::prefix_consistent(&rest.points, &later),
+                units::prefix_consistent(&rest.points, later),
                 "{codec:?}: resume at {at} meets other safe points before the error"
             );
         }
