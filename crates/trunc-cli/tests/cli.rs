@@ -881,4 +881,18 @@ fn container_images() {
     // --raw still gives the outer tar of a compressed image.
     ok(&trunc(&["x", "img.tar.gz", "--raw", "-C", "rawout"], w));
     assert_eq!(std::fs::read(w.join("rawout/img.tar")).unwrap(), raw);
+
+    // A web bundle with root index.json and manifest.json is an ordinary tarball.
+    let bundle = tarbuild::tar(&[
+        Spec::file("index.json", br#"{"pages":[]}"#),
+        Spec::file("manifest.json", br#"{"name":"pwa"}"#),
+        Spec::file("app.js", b"js"),
+    ]);
+    std::fs::write(w.join("site.tar.gz"), tarbuild::gzip(&bundle, 6)).unwrap();
+    ok(&trunc(&["x", "site.tar.gz", "-C", "site"], w));
+    assert_eq!(std::fs::read(w.join("site/app.js")).unwrap(), b"js");
+    assert_eq!(
+        std::fs::read(w.join("site/manifest.json")).unwrap(),
+        br#"{"name":"pwa"}"#
+    );
 }

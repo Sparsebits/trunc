@@ -29,12 +29,13 @@ pub struct ImageArgs {
 }
 
 impl ImageArgs {
-    fn options(&self, stream: &StreamArgs, threads: usize) -> ImageOptions {
+    fn options(&self, stream: &StreamArgs, threads: usize, ignore_space: bool) -> ImageOptions {
         ImageOptions {
             platform: self.platform.clone(),
             image: self.image.clone(),
             max_window: stream.max_window.max(1),
             threads,
+            ignore_space,
         }
     }
 }
@@ -45,11 +46,45 @@ pub fn detect(archive: &Path, stream: &StreamArgs) -> bool {
     !stream.raw && image::detect(&OsFs::new(), archive)
 }
 
+/// Whether an image command failed only because the archive, once decompressed, turned out
+/// not to be a container image: the caller then handles it as an ordinary tarball.
+pub fn not_an_image(e: &anyhow::Error, archive: &Path) -> bool {
+    let yes = e
+        .downcast_ref::<trunc_engine::Error>()
+        .is_some_and(image::is_not_an_image);
+    if yes {
+        eprintln!(
+            "note: {} looked like a container image but is not one; reading it as a tarball",
+            archive.display()
+        );
+    }
+    yes
+}
+
+/// Remove (or point out) temporary copies a crashed run left in `dir`.
+fn clean_stale_temps(dir: &Path) {
+    for (p, removed) in image::stale_temp_files(&OsFs::new(), dir) {
+        if removed {
+            eprintln!(
+                "note: removed {}, left behind by an interrupted run",
+                p.display()
+            );
+        } else {
+            eprintln!(
+                "note: {} looks left behind by an interrupted run; delete it if no trunc is \
+                 running",
+                p.display()
+            );
+        }
+    }
+}
+
 /// Flags that do not apply to container images must not be silently ignored.
 pub fn refuse_flags(trust: &TrustPolicy, allow_symlinks: bool) -> Result<()> {
     if trust.require_signed || !trust.trusted_keys.is_empty() {
         anyhow::bail!(
-            "this is a container image, which cannot be signed; --require-signed and              --trust-key apply only to .trnc archives"
+            "this is a container image, which cannot be signed; --require-signed and \
+             --trust-key apply only to .trnc archives"
         );
     }
     if allow_symlinks {
@@ -59,11 +94,43 @@ pub fn refuse_flags(trust: &TrustPolicy, allow_symlinks: bool) -> Result<()> {
 }
 
 /// Where a compressed outer tar is decompressed while it is inspected or verified: next to the
-/// archive.
+/// archive, or in the system's temporary directory when the archive's folder is not writable.
 fn temp_dir(archive: &Path) -> PathBuf {
-    match archive.parent() {
+    let next_to = match archive.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
+    };
+    let dir = if !compressed(archive) || writable(&next_to) {
+        next_to
+    } else {
+        std::env::temp_dir()
+    };
+    clean_stale_temps(&dir);
+    dir
+}
+
+fn compressed(archive: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    let n = std::fs::File::open(archive)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    trunc_legacy::stream::Codec::sniff(&head[..n]).is_some()
+}
+
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".trunc-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(f) => {
+            drop(f);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -117,7 +184,10 @@ pub fn extract(
     }
     let fs = OsFs::new();
     let t = Instant::now();
-    let opts = args.options(stream, threads);
+    let opts = args.options(stream, threads, ignore_space);
+    if dest.is_dir() {
+        clean_stale_temps(dest);
+    }
     let mut check_space = |scan: &ImageScan| -> trunc_engine::Result<()> {
         if ignore_space {
             return Ok(());
@@ -173,7 +243,7 @@ pub fn verify(
     threads: usize,
 ) -> Result<ExitCode> {
     let t = Instant::now();
-    let opts = args.options(stream, threads);
+    let opts = args.options(stream, threads, false);
     let scan = image::verify_image(&OsFs::new(), archive, &temp_dir(archive), &opts)?;
     let files = scan
         .tree
@@ -204,7 +274,7 @@ pub fn inspect(
     stream: &StreamArgs,
 ) -> Result<ExitCode> {
     let fs = OsFs::new();
-    let opts = args.options(stream, 0);
+    let opts = args.options(stream, 0, false);
     let (info, scan) = if list {
         let s = image::verify_image(&fs, archive, &temp_dir(archive), &opts)?;
         (s.info.clone(), Some(s))

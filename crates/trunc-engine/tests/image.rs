@@ -446,3 +446,130 @@ fn media_type_must_match_the_blob() {
     ls[0].media_type = "application/vnd.oci.image.layer.v1.tar+gzip+encrypted".into();
     refused(&ib::oci_archive(&[("linux/amd64", ls)]), "not supported");
 }
+
+#[test]
+fn web_bundles_with_root_metadata_are_not_images() {
+    let t = tempfile::tempdir().unwrap();
+    let fs = OsFs::new();
+    let bundle = tarbuild::tar(&[
+        Spec::file("index.json", br#"{"name":"site","pages":["a.html"]}"#),
+        Spec::file("manifest.json", br#"{"name":"app","icons":[]}"#),
+        Spec::file("repositories", b"x"),
+        Spec::file("a.html", b"<p>"),
+    ]);
+    assert!(!image::detect(&fs, &write(t.path(), "b.tar", &bundle)));
+    assert!(!image::detect(
+        &fs,
+        &write(t.path(), "b.tar.gz", &tarbuild::gzip(&bundle, 6))
+    ));
+    // Image-like blob names but no image structure: detected, then found not to be one, and
+    // the temporary copy is removed.
+    let fake = tarbuild::tar(&[Spec::file(
+        &format!("blobs/sha256/{}", "a".repeat(64)),
+        b"x",
+    )]);
+    let arc = write(t.path(), "fake.tar.gz", &tarbuild::gzip(&fake, 6));
+    assert!(image::detect(&fs, &arc));
+    let tmp = tempfile::tempdir().unwrap();
+    let e = image::inspect_image(&fs, &arc, tmp.path(), &opts()).unwrap_err();
+    assert!(image::is_not_an_image(&e), "{e}");
+    assert_empty(tmp.path());
+}
+
+#[test]
+fn repeated_descriptors_are_one_candidate_and_capped() {
+    let t = tempfile::tempdir().unwrap();
+    let mut o = Outer::default();
+    o.add("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#);
+    let m = o.image("linux/amd64", &one_file_layer(b"x"));
+    let d = descriptor(MANIFEST, &m, &platform("linux/amd64"));
+    let mut o2 = o.clone();
+    o.add("index.json", &ib::index(&[d.clone(), d.clone()]));
+    let arc = write(t.path(), "dup.tar", &o.tar());
+    image::inspect_image(&OsFs::new(), &arc, t.path(), &opts()).unwrap();
+    o2.add("index.json", &ib::index(&vec![d; 5000]));
+    let arc = write(t.path(), "many.tar", &o2.tar());
+    let e = image::inspect_image(&OsFs::new(), &arc, t.path(), &opts()).unwrap_err();
+    assert!(e.to_string().contains("4096"), "{e}");
+}
+
+#[test]
+fn docker_platforms_come_from_configs() {
+    let t = tempfile::tempdir().unwrap();
+    let arc = write(
+        t.path(),
+        "two.tar",
+        &ib::docker_archive(&[
+            (&["a:1"], "linux/riscv64", one_file_layer(b"riscv")),
+            (&["a:1"], "linux/s390x", one_file_layer(b"s390x")),
+        ]),
+    );
+    let o = ImageOptions {
+        platform: Some("linux/s390x".into()),
+        ..opts()
+    };
+    let dest = t.path().join("root");
+    extract(&arc, &dest, &o).unwrap();
+    assert_eq!(std::fs::read(dest.join("which")).unwrap(), b"s390x");
+}
+
+#[test]
+fn aufs_and_merged_usr_layers() {
+    let aufs = vec![ib::layer(
+        &[
+            Spec::dir(".wh..wh.plnk"),
+            Spec::file(".wh..wh.plnk/1.2", b"x"),
+            Spec::dir(".wh..wh.orph"),
+            Spec::file(".wh..wh.aufs", b""),
+            Spec::file("etc/hostname", b"h"),
+        ],
+        Compression::Gzip,
+    )];
+    let t = tempfile::tempdir().unwrap();
+    let arc = write(
+        t.path(),
+        "aufs.tar",
+        &ib::oci_archive(&[("linux/amd64", aufs)]),
+    );
+    let dest = t.path().join("root");
+    extract(&arc, &dest, &opts()).unwrap();
+    assert_eq!(std::fs::read(dest.join("etc/hostname")).unwrap(), b"h");
+    assert!(!dest.join(".wh..wh.plnk").exists());
+
+    let usr = vec![
+        ib::layer(
+            &[
+                Spec::file("usr/lib/libc.so", b"c"),
+                Spec::symlink("lib", "usr/lib"),
+            ],
+            Compression::None,
+        ),
+        ib::layer(&[Spec::file("lib/extra.so", b"e")], Compression::Gzip),
+    ];
+    refused(&ib::oci_archive(&[("linux/amd64", usr)]), "symlink");
+}
+
+#[test]
+fn stale_temp_copies_are_removed_unless_in_use() {
+    let t = tempfile::tempdir().unwrap();
+    let stale = t.path().join(".trunc-image-0123456789abcdef.tar");
+    std::fs::write(&stale, b"left").unwrap();
+    let fs = OsFs::new();
+    let found = image::stale_temp_files(&fs, t.path());
+    assert_eq!(found.len(), 1);
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(found[0].1);
+        assert!(!stale.exists());
+        let busy = t.path().join(".trunc-image-fedcba9876543210.tar");
+        let h = trunc_fs::FsBackend::open(
+            &fs,
+            &busy,
+            trunc_fs::OpenMode::CreateNew,
+            trunc_fs::Share::Exclusive,
+        )
+        .unwrap();
+        let found = image::stale_temp_files(&fs, t.path());
+        assert_eq!(found, vec![(busy.clone(), false)]);
+        drop(h);
+    }
+}

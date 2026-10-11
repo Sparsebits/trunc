@@ -61,6 +61,25 @@ again and needs deletes, which a crash can leave half done.
   contributes, which in general is after all layers are applied, so consuming saves no peak
   space over extracting and deleting. `--consume` is refused with that explanation.
 
+- **Review fixes (2026-10-11).** Detection confirms structure: a valid `manifest.json`
+  (array of objects with `Config` and `Layers`) or `oci-layout` plus an `index.json` with a
+  `manifests` list; for compressed archives these files are checked when among the first
+  entries, else `blobs/sha256/<hex>` / `<hex>/layer.tar` names suffice and an archive that
+  then has no structure falls back to ordinary tarball handling. Archives with a consume
+  journal are never images (resume wins). JSON is strict (numbers per RFC 8259; duplicate
+  keys found with a set). Index walks memoize blobs by digest, dedupe candidates and stop
+  after 4096 descriptors. Candidates without a descriptor platform take it from their config
+  before choosing. aufs bookkeeping (anything under a `.wh..wh.*` component other than the
+  opaque marker file) is skipped whatever its type. Entries and whiteouts reached through a
+  symlink in the merged tree (`lib/x` with `lib -> usr/lib`) are refused rather than merged
+  wrongly; resolving them is future work. Whiteouts must match names exactly (case-only
+  matches are refused on case-folding systems). The temporary copy of a compressed outer tar
+  is space-checked (refused up front when the archive's size does not fit, stopped when the
+  copy outgrows free space minus 64 MiB; `x --ignore-space` skips this), removed by a drop
+  guard on errors and panics, placed in the system temp dir when the archive's folder is not
+  writable (`inspect`/`verify`), and stale copies from crashed runs are removed when not in
+  use (Windows/Linux) or reported.
+
 ## Consequences
 - Peak extra space is the merged root filesystem (plus the decompressed outer tar when that
   is compressed).
