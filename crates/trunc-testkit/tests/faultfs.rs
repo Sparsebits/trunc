@@ -338,3 +338,35 @@ fn read_back_returns_only_durable_bytes() {
     h.read_back(&mut buf, 0).unwrap();
     assert_eq!(&buf, b"bbaa");
 }
+
+#[test]
+fn case_insensitive_mode_folds_names_and_keeps_their_case() {
+    let fs = FaultFs::new(CrashModel::WriteThrough);
+    fs.set_case_insensitive(true);
+    fs.create_dir(p("/Dir")).unwrap();
+    drop(create(&fs, "/dir/A.txt", b"upper"));
+    assert_eq!(fs.read_dir(p("/DIR")).unwrap(), vec!["A.txt".to_owned()]);
+    assert!(matches!(
+        fs.open(p("/DIR/a.TXT"), OpenMode::CreateNew, Share::Shared),
+        Err(FsError::AlreadyExists { .. })
+    ));
+    assert_eq!(fs.metadata(p("/dir/a.txt")).unwrap().unwrap().len, 5);
+    assert!(fs.folds_case(p("/dir")).unwrap());
+    assert!(trunc_fs::probe_case_folding(&fs, p("/dir")).unwrap());
+    assert_eq!(fs.read_dir(p("/dir")).unwrap(), vec!["A.txt".to_owned()]);
+
+    let exact = FaultFs::new(CrashModel::WriteThrough);
+    exact.create_dir(p("/dir")).unwrap();
+    drop(create(&exact, "/dir/A.txt", b"upper"));
+    assert!(exact.metadata(p("/dir/a.txt")).unwrap().is_none());
+    assert!(!exact.folds_case(p("/dir")).unwrap());
+    assert!(!trunc_fs::probe_case_folding(&exact, p("/dir")).unwrap());
+    // A probe file left behind by a crash is judged, then removed.
+    drop(create(
+        &exact,
+        &format!("/dir/{}", trunc_fs::CASE_PROBE_NAME),
+        b"",
+    ));
+    assert!(!trunc_fs::probe_case_folding(&exact, p("/dir")).unwrap());
+    assert_eq!(exact.read_dir(p("/dir")).unwrap(), vec!["A.txt".to_owned()]);
+}

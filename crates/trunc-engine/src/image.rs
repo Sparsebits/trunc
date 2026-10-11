@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{Dealloc, FileHandle, FileId, FsBackend, FsError, NodeKind, OpenMode, Share};
 use trunc_hash::Sha256Hasher;
 use trunc_legacy::stream::{self, Codec, Input, Limits, NoHistory, StreamError};
@@ -1134,8 +1135,8 @@ fn remove_children(tree: &mut BTreeMap<String, Node>, key: &str) -> Vec<Node> {
 
 fn case_clash(a: &str, b: &str) -> Error {
     Error::Refused(format!(
-        "layers name the same path as {a:?} and {b:?}, which differ only in case on this \
-         computer; refusing to merge them"
+        "layers name the same path as {a:?} and {b:?}, which differ only in case in the \
+         destination; refusing to merge them"
     ))
 }
 
@@ -1148,6 +1149,14 @@ fn case_clash(a: &str, b: &str) -> Error {
 /// anything else replaces the whole subtree). A path through a lower non-directory replaces it
 /// with a directory. Whiteout files themselves are never part of the tree.
 pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeStats)> {
+    merge_layers_with(layers, CaseMode::host())
+}
+
+/// [`merge_layers`] for a destination that compares names as `case` says.
+pub fn merge_layers_with(
+    layers: &[Vec<tar::Entry>],
+    case: CaseMode,
+) -> Result<(Vec<Winner>, MergeStats)> {
     let mut tree: BTreeMap<String, Node> = BTreeMap::new();
     let mut stats = MergeStats::default();
     let size_of = |n: &Node| -> u64 {
@@ -1212,12 +1221,12 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             }
         }
         for d in &opaque {
-            let gone = remove_children(&mut tree, &trunc_core::path::host_key(d));
+            let gone = remove_children(&mut tree, &case.key(d));
             shadow(gone, &mut stats);
             stats.opaques += 1;
         }
         for d in &deleted {
-            let gone = remove_subtree(&mut tree, &trunc_core::path::host_key(d));
+            let gone = remove_subtree(&mut tree, &case.key(d));
             shadow(gone, &mut stats);
             stats.whiteouts += 1;
         }
@@ -1228,7 +1237,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             while let Some(i) = e.name[end..].find('/') {
                 let a = &e.name[..end + i];
                 end += i + 1;
-                let key = trunc_core::path::host_key(a);
+                let key = case.key(a);
                 match tree.get(&key) {
                     Some(n) if n.name != a => return Err(case_clash(&n.name, a)),
                     Some(n) if n.kind == Kind::Dir => continue,
@@ -1248,7 +1257,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                     },
                 );
             }
-            let key = trunc_core::path::host_key(&e.name);
+            let key = case.key(&e.name);
             if let Some(n) = tree.get(&key) {
                 if n.name != e.name {
                     return Err(case_clash(&n.name, &e.name));
@@ -1388,14 +1397,14 @@ pub fn inspect_image(
     with_outer(fs, archive, temp_dir, opts, |outer| metadata(outer, opts))
 }
 
-fn scan_outer(outer: &Outer, opts: &ImageOptions) -> Result<ImageScan> {
+fn scan_outer(outer: &Outer, opts: &ImageOptions, case: CaseMode) -> Result<ImageScan> {
     let _prof = trunc_prof::span("image.scan");
     let info = metadata(outer, opts)?;
     let mut all = Vec::with_capacity(info.layers.len());
     let mut lens = Vec::with_capacity(info.layers.len());
     for (i, layer) in info.layers.iter().enumerate() {
         let what = format!("layer {} ({})", i + 1, layer.path);
-        let mut reader = tar::Reader::new();
+        let mut reader = tar::Reader::with_case(case);
         let len = read_layer(outer, i, layer, opts, &mut |b| {
             reader.feed(b).map_err(tar_err(&what))
         })?;
@@ -1403,7 +1412,7 @@ fn scan_outer(outer: &Outer, opts: &ImageOptions) -> Result<ImageScan> {
         lens.push(len);
         all.push(entries);
     }
-    let (tree, stats) = merge_layers(&all)?;
+    let (tree, stats) = merge_layers_with(&all, case)?;
     Ok(ImageScan {
         layer_entries: all.iter().map(Vec::len).collect(),
         info,
@@ -1422,7 +1431,9 @@ pub fn verify_image(
     temp_dir: &Path,
     opts: &ImageOptions,
 ) -> Result<ImageScan> {
-    with_outer(fs, archive, temp_dir, opts, |outer| scan_outer(outer, opts))
+    with_outer(fs, archive, temp_dir, opts, |outer| {
+        scan_outer(outer, opts, CaseMode::host())
+    })
 }
 
 /// Remove a staging tree left by a failed extraction (best effort; links are removed, never
@@ -1458,8 +1469,9 @@ pub fn extract_image(
 ) -> Result<ImageSummary> {
     let _prof = trunc_prof::span("image.extract");
     ensure_dir(fs, dest)?;
+    let case = crate::stage::dest_case(fs, dest)?;
     with_outer(fs, archive, dest, opts, |outer| {
-        let scan = scan_outer(outer, opts)?;
+        let scan = scan_outer(outer, opts, case)?;
         before_write(&scan)?;
         let items: Vec<Item> = scan
             .tree

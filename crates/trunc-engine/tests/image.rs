@@ -15,6 +15,7 @@ use trunc_testkit::imagebuild::{
 };
 use trunc_testkit::tarbuild::{self, Spec};
 use trunc_testkit::tree::{Node, snapshot};
+use trunc_testkit::{CrashModel, FaultFs};
 
 fn opts() -> ImageOptions {
     ImageOptions::default()
@@ -445,4 +446,44 @@ fn media_type_must_match_the_blob() {
     let mut ls = one_file_layer(b"x");
     ls[0].media_type = "application/vnd.oci.image.layer.v1.tar+gzip+encrypted".into();
     refused(&ib::oci_archive(&[("linux/amd64", ls)]), "not supported");
+}
+
+/// Paths that differ only in case, in one layer or across layers, are refused before anything
+/// is written when the destination folds case (a `casefold` or NTFS folder on Linux), and
+/// extracted where it does not (on Linux; Windows and macOS always compare case-insensitively).
+#[test]
+fn case_insensitive_destinations_are_found_up_front() {
+    let one = vec![ib::layer(
+        &[
+            Spec::file("etc/A.txt", b"upper"),
+            Spec::file("etc/a.txt", b"lower"),
+        ],
+        Compression::None,
+    )];
+    let two = vec![
+        ib::layer(&[Spec::file("etc/A.txt", b"upper")], Compression::None),
+        ib::layer(&[Spec::file("etc/a.txt", b"lower")], Compression::Gzip),
+    ];
+    for ls in [one, two] {
+        let bytes = ib::oci_archive(&[("linux/amd64", ls)]);
+        for folds in [true, false] {
+            let refused = folds || cfg!(any(windows, target_os = "macos"));
+            let fs = FaultFs::new(CrashModel::WriteThrough);
+            fs.set_case_insensitive(folds);
+            fs.put_file(Path::new("/img.tar"), &bytes);
+            let r = image::extract_image(
+                &fs,
+                Path::new("/img.tar"),
+                Path::new("/root"),
+                &opts(),
+                &mut |_| Ok(()),
+            );
+            assert_eq!(r.is_err(), refused, "folds={folds}: {r:?}");
+            let mut want = vec!["img.tar", "root"];
+            if !refused {
+                want.extend(["root/etc", "root/etc/A.txt", "root/etc/a.txt"]);
+            }
+            assert_eq!(fs.snapshot().keys().collect::<Vec<_>>(), want);
+        }
+    }
 }

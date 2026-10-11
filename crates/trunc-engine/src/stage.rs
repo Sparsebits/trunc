@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use trunc_core::path::CaseMode;
 use trunc_fs::{FileHandle, FsBackend, FsError, NodeKind, OpenMode, Share};
 
 use crate::consume::{ConsumeSummary, RetryPolicy};
@@ -169,6 +170,34 @@ pub(crate) fn check_exact_name(fs: &dyn FsBackend, p: &Path) -> Result<()> {
          short name); refusing to merge them",
         p.display()
     )))
+}
+
+/// How the destination compares names, for the up-front duplicate checks. Outputs are created
+/// in a staging directory inside `dest`, so `dest` is probed; if it does not exist yet, its
+/// nearest existing ancestor is (a new directory inherits `casefold` from its parent, and a
+/// mounted case-insensitive filesystem is case-insensitive throughout). On Windows and macOS
+/// names always compare case-insensitively and nothing is probed. Without this, two entries
+/// that differ only in case would pass the checks on a case-insensitive Linux folder and clash
+/// only when the second is created, after a consume had freed part of the archive.
+pub(crate) fn dest_case(fs: &dyn FsBackend, dest: &Path) -> Result<CaseMode> {
+    if CaseMode::host() == CaseMode::Insensitive {
+        return Ok(CaseMode::Insensitive);
+    }
+    let mut dir = dest.to_path_buf();
+    loop {
+        match fs.metadata(&dir)?.map(|m| m.kind) {
+            Some(NodeKind::Dir) => break,
+            // Not a directory: creating the destination is refused later, with a clear message.
+            Some(_) => return Ok(CaseMode::host()),
+            None => {}
+        }
+        let parent = parent_of(&dir);
+        if parent == dir {
+            return Ok(CaseMode::host());
+        }
+        dir = parent;
+    }
+    Ok(CaseMode::for_destination(fs.folds_case(&dir)?))
 }
 
 /// Flush every directory under `stage`, then `stage` and `dest`. Run when resuming: an

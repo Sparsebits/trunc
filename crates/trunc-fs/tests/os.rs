@@ -578,3 +578,15 @@ fn confined_opens_refuse_junctions_on_the_way() {
         .unwrap();
     assert_eq!(f.size().unwrap(), 2);
 }
+
+/// NTFS and APFS fold case; the probe finds that out and leaves nothing behind.
+#[test]
+fn case_folding_probe() {
+    let d = tempfile::tempdir().unwrap();
+    let folds = fs().folds_case(d.path()).unwrap();
+    if cfg!(any(windows, target_os = "macos")) {
+        assert!(folds);
+    }
+    assert!(fs().read_dir(d.path()).unwrap().is_empty());
+    assert!(fs().folds_case(&d.path().join("missing")).is_err());
+}

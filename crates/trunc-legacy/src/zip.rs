@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use trunc_core::path::CaseMode;
 use trunc_fs::FileHandle;
 use unicode_normalization::UnicodeNormalization;
 
@@ -236,8 +237,14 @@ fn find_eocd(src: &dyn FileHandle, len: u64) -> Result<Eocd> {
     }
 }
 
-/// Parse a ZIP archive and validate it for extraction.
+/// Parse a ZIP archive and validate it for extraction on this computer.
 pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
+    parse_with(src, CaseMode::host())
+}
+
+/// Parse a ZIP archive and validate it for extraction into a destination that compares names
+/// as `case` says.
+pub fn parse_with(src: &dyn FileHandle, case: CaseMode) -> Result<Layout> {
     let file_len = src.size()?;
     let eocd = find_eocd(src, file_len)?;
     if eocd.cd_size > MAX_CD || eocd.cd_size > eocd.pos {
@@ -333,10 +340,10 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
         if is_dir && usize_ != 0 {
             return Err(corrupt(format!("directory {name:?} has content")));
         }
-        if !seen.insert(trunc_core::path::host_key(&name)) {
+        if !seen.insert(case.key(&name)) {
             return Err(ZipError::Name {
                 name,
-                reason: if cfg!(any(windows, target_os = "macos")) {
+                reason: if case == CaseMode::Insensitive {
                     "duplicate entry (names differ only in case)"
                 } else {
                     "duplicate entry"
@@ -443,12 +450,12 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| trunc_core::path::host_key(&e.name))
+        .map(|e| case.key(&e.name))
         .collect();
     for e in &entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&trunc_core::path::host_key(pp)) {
+            if files.contains(&case.key(pp)) {
                 return Err(ZipError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),

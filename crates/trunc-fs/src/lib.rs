@@ -289,6 +289,48 @@ pub trait FsBackend: Send + Sync + Debug {
     /// Apply Unix permission bits (lower 9 only; Windows honours just the write bits, as the
     /// read-only attribute). Never follows links.
     fn set_mode(&self, path: &Path, mode: u32) -> Result<()>;
+    /// Whether the directory `dir` treats names that differ only in letter case as the same
+    /// file. The default asks the filesystem, with [`probe_case_folding`].
+    fn folds_case(&self, dir: &Path) -> Result<bool> {
+        probe_case_folding(self, dir)
+    }
+}
+
+/// Name of the file [`probe_case_folding`] creates. It starts with the prefix of trunc's staging
+/// directories, which archive entries may not use at the top level, so one left behind by a
+/// crash can never clash with an entry (and the next probe removes it).
+pub const CASE_PROBE_NAME: &str = ".trunc-stage-case-probe";
+
+/// Find out whether `dir` folds case by experiment: create [`CASE_PROBE_NAME`] there, look it up
+/// with its letters upper-cased, and remove it again. A Linux directory can fold case (ext4 or
+/// f2fs with `casefold`, NTFS, FAT, exFAT, SMB, ZFS with `casesensitivity=insensitive`), and
+/// nothing short of trying says so for every one of them.
+pub fn probe_case_folding<F: FsBackend + ?Sized>(fs: &F, dir: &Path) -> Result<bool> {
+    let lower = dir.join(CASE_PROBE_NAME);
+    let upper = dir.join(CASE_PROBE_NAME.to_ascii_uppercase());
+    // Another probe (a concurrent run, or one interrupted by a crash) may own the file; it is
+    // judged all the same, and a concurrent removal only means trying again.
+    for _ in 0..8 {
+        match fs.open(&lower, OpenMode::CreateNew, Share::Shared) {
+            Ok(h) => drop(h),
+            Err(FsError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        let folds = fs.metadata(&upper)?.is_some();
+        let present = folds || fs.metadata(&lower)?.is_some();
+        match fs.remove_file(&lower) {
+            Ok(()) | Err(FsError::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        if present {
+            return Ok(folds);
+        }
+    }
+    Err(FsError::Io {
+        op: "probing case sensitivity",
+        path: lower,
+        source: io::Error::other("the probe file kept disappearing"),
+    })
 }
 
 /// `path` relative to `root`, refusing paths outside it and `..` components.

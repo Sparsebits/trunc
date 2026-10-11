@@ -17,6 +17,7 @@
 
 use std::collections::HashSet;
 
+use trunc_core::path::CaseMode;
 use trunc_fs::FileHandle;
 use unicode_normalization::UnicodeNormalization;
 
@@ -418,8 +419,14 @@ const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFLNK: u32 = 0o120_000;
 
-/// Parse an ISO 9660 image and validate it for extraction.
+/// Parse an ISO 9660 image and validate it for extraction on this computer.
 pub fn parse(src: &dyn FileHandle) -> Result<Image> {
+    parse_with(src, CaseMode::host())
+}
+
+/// Parse an ISO 9660 image and validate it for extraction into a destination that compares
+/// names as `case` says.
+pub fn parse_with(src: &dyn FileHandle, case: CaseMode) -> Result<Image> {
     let file_len = src.size()?;
     let vds = read_descriptors(src, file_len)?;
     let pvd = &vds.primary;
@@ -572,10 +579,10 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
             };
             let comp = decode_name(&r, names, su.name.as_deref(), is_dir)?;
             let name = full_name(&dir.path, &comp)?;
-            if !seen_names.insert(trunc_core::path::host_key(&name)) {
+            if !seen_names.insert(case.key(&name)) {
                 return Err(IsoError::Name {
                     name,
-                    reason: if cfg!(any(windows, target_os = "macos")) {
+                    reason: if case == CaseMode::Insensitive {
                         "duplicate entry (names differ only in case)"
                     } else {
                         "duplicate entry"

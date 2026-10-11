@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 
+use trunc_core::path::CaseMode;
 use unicode_normalization::UnicodeNormalization;
 
 pub const BLOCK: u64 = 512;
@@ -103,6 +104,7 @@ pub struct Reader {
     entries: Vec<Entry>,
     seen: HashSet<String>,
     name_bytes: usize,
+    case: CaseMode,
 }
 
 impl Default for Reader {
@@ -112,7 +114,13 @@ impl Default for Reader {
 }
 
 impl Reader {
+    /// A reader that validates names for extraction on this computer.
     pub fn new() -> Self {
+        Self::with_case(CaseMode::host())
+    }
+
+    /// A reader that validates names for a destination that compares them as `case` says.
+    pub fn with_case(case: CaseMode) -> Self {
         Self {
             pos: 0,
             state: State::Header,
@@ -122,6 +130,7 @@ impl Reader {
             entries: Vec::new(),
             seen: HashSet::new(),
             name_bytes: 0,
+            case,
         }
     }
 
@@ -226,7 +235,7 @@ impl Reader {
         if self.pos == 0 {
             return Err(TarError::NotTar);
         }
-        check_nesting(&self.entries)?;
+        check_nesting(&self.entries, self.case)?;
         Ok(self.entries)
     }
 
@@ -362,10 +371,10 @@ impl Reader {
             return Ok(());
         };
         self.state = body(None, kind == Kind::File, size);
-        if !self.seen.insert(trunc_core::path::host_key(&name)) {
+        if !self.seen.insert(self.case.key(&name)) {
             return Err(TarError::Name {
                 name,
-                reason: DUPLICATE.into(),
+                reason: duplicate(self.case).into(),
             });
         }
         if self.entries.len() >= MAX_ENTRIES {
@@ -480,12 +489,13 @@ fn number(f: &[u8]) -> Option<u64> {
 }
 
 /// Bytes up to the first NUL.
-/// Why a second entry with the same name (as this computer compares names) is refused.
-const DUPLICATE: &str = if cfg!(any(windows, target_os = "macos")) {
-    "duplicate entry (names differ only in case)"
-} else {
-    "duplicate entry"
-};
+/// Why a second entry with the same name (as the destination compares names) is refused.
+fn duplicate(case: CaseMode) -> &'static str {
+    match case {
+        CaseMode::Insensitive => "duplicate entry (names differ only in case)",
+        CaseMode::Sensitive => "duplicate entry",
+    }
+}
 
 fn cstr(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
@@ -557,16 +567,16 @@ fn parse_pax_time(v: &str) -> Option<(i64, u32)> {
 }
 
 /// No entry may live under a file entry ("a" plus "a/b").
-fn check_nesting(entries: &[Entry]) -> Result<()> {
+fn check_nesting(entries: &[Entry], case: CaseMode) -> Result<()> {
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| trunc_core::path::host_key(&e.name))
+        .map(|e| case.key(&e.name))
         .collect();
     for e in entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&trunc_core::path::host_key(pp)) {
+            if files.contains(&case.key(pp)) {
                 return Err(TarError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),
