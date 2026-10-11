@@ -1,7 +1,7 @@
 //! A small ISO 9660 writer for tests: a primary volume, an optional Joliet supplementary volume,
-//! optional Rock Ridge fields (`SP`, `ER`, `PX`, `NM`, `SL`, and `CE` continuation areas for
-//! names), nested directories, multi-extent files, and hidden or associated files. Path tables
-//! are left empty (trunc never reads them).
+//! optional Rock Ridge fields (`SP`, `ER`, `PX`, `NM`, `SL`, `CE` continuation areas for names,
+//! and `CL`/`RE` deep-directory relocation), nested directories, multi-extent files, and hidden or
+//! associated files. Path tables are left empty (trunc never reads them).
 //!
 //! [`Built`] remembers where every directory record was written, so tests can corrupt extents
 //! and sizes to build hostile images.
@@ -89,6 +89,8 @@ pub struct IsoBuilder {
     pad_sectors: usize,
     /// UDF volume recognition sequence instead of ISO 9660 descriptors.
     udf_only: bool,
+    /// Rock Ridge relocations: (directory, top-level directory listing it with `RE`).
+    relocations: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,7 +163,12 @@ struct Node {
 #[derive(Debug, Clone)]
 enum Target {
     Dir(String),
-    Data { file: String, section: usize },
+    /// A relocated directory's placeholder: its extent, with size 0.
+    Link(String),
+    Data {
+        file: String,
+        section: usize,
+    },
     Empty,
 }
 
@@ -173,6 +180,8 @@ struct Rec {
     /// System use bytes, with a CE field (to be patched) at `ce_at` if `ce` is set.
     su: Vec<u8>,
     ce: Option<(usize, Vec<u8>)>,
+    /// A `CL` field (to be patched with the extent of this directory) at this offset in `su`.
+    cl: Option<(usize, String)>,
     /// (tree, path) this record is reported under in `Built::records`.
     key: Option<String>,
 }
@@ -208,6 +217,7 @@ fn nm(name: &str) -> Vec<u8> {
 }
 
 const CE_LEN: usize = 28;
+const CL_LEN: usize = 12;
 
 impl IsoBuilder {
     pub fn new() -> Self {
@@ -238,6 +248,15 @@ impl IsoBuilder {
     #[must_use]
     pub fn udf_only(mut self) -> Self {
         self.udf_only = true;
+        self
+    }
+    /// Relocate directory `dir` the Rock Ridge way: its parent lists a `CL` placeholder (a
+    /// zero-length non-directory record) and the top-level directory `into` (created if needed)
+    /// lists it with an `RE` field. Only the primary tree of a Rock Ridge image is affected.
+    #[must_use]
+    pub fn relocate(mut self, dir: &str, into: &str) -> Self {
+        assert!(!into.contains('/'), "relocation target must be top-level");
+        self.relocations.push((dir.to_owned(), into.to_owned()));
         self
     }
     pub fn add(&mut self, s: Spec) -> &mut Self {
@@ -278,6 +297,18 @@ impl IsoBuilder {
                     nodes.get_mut(&path).unwrap().spec = s.clone();
                 }
                 parent = path;
+            }
+        }
+        for (_, into) in &self.relocations {
+            if !nodes.contains_key(into) {
+                nodes.insert(
+                    into.clone(),
+                    Node {
+                        spec: Spec::dir(into),
+                        children: Vec::new(),
+                    },
+                );
+                nodes.get_mut("").unwrap().children.push(into.clone());
             }
         }
         nodes
@@ -363,6 +394,7 @@ impl IsoBuilder {
                     target: Target::Dir(child.clone()),
                     su,
                     ce,
+                    cl: None,
                     key: Some(child.clone()),
                 }),
                 SpecKind::Symlink(_) => out.push(Rec {
@@ -371,6 +403,7 @@ impl IsoBuilder {
                     target: Target::Empty,
                     su,
                     ce,
+                    cl: None,
                     key: Some(child.clone()),
                 }),
                 SpecKind::File(data) => {
@@ -392,10 +425,41 @@ impl IsoBuilder {
                             },
                             su: su.clone(),
                             ce: ce.clone(),
+                            cl: None,
                             key: Some(child.clone()),
                         });
                     }
                 }
+            }
+            if rr && self.relocations.iter().any(|(d, _)| d == child) {
+                // The placeholder: not a directory, size 0, CL pointing at the directory.
+                let r = out.last_mut().unwrap();
+                r.flags &= !2;
+                r.target = Target::Link(child.clone());
+                r.cl = Some((r.su.len(), child.clone()));
+                r.su.extend(vec![0u8; CL_LEN]);
+            }
+        }
+        if rr {
+            for (j, (moved, _)) in self
+                .relocations
+                .iter()
+                .filter(|(_, into)| into == dir)
+                .enumerate()
+            {
+                let comp = moved.rsplit('/').next().unwrap();
+                let mut su = px(0o040_755);
+                su.extend(nm(comp));
+                su.extend(susp(b"RE", &[]));
+                out.push(Rec {
+                    name: format!("R{j:04}").into_bytes(),
+                    flags: 2,
+                    target: Target::Dir(moved.clone()),
+                    su,
+                    ce: None,
+                    cl: None,
+                    key: Some(format!("RE:{moved}")),
+                });
             }
         }
         out
@@ -451,6 +515,7 @@ impl IsoBuilder {
                         target: Target::Dir(d.clone()),
                         su: dot_su,
                         ce: None,
+                        cl: None,
                         key: None,
                     },
                     Rec {
@@ -459,6 +524,7 @@ impl IsoBuilder {
                         target: Target::Dir(parent),
                         su: Vec::new(),
                         ce: None,
+                        cl: None,
                         key: None,
                     },
                 ];
@@ -516,6 +582,7 @@ impl IsoBuilder {
         let target_extent = |t: Tree, target: &Target| -> (usize, usize) {
             match target {
                 Target::Dir(d) => dir_at[&(t, d.clone())],
+                Target::Link(d) => (dir_at[&(t, d.clone())].0, 0),
                 Target::Empty => (0, 0),
                 Target::Data { file, section } => {
                     let SpecKind::File(data) = &nodes[file].spec.kind else {
@@ -562,6 +629,11 @@ impl IsoBuilder {
                     bytes[su_at + ce_off..su_at + ce_off + CE_LEN].copy_from_slice(&field);
                     bytes[area..area + payload.len()].copy_from_slice(payload);
                 }
+                if let Some((cl_off, d)) = &r.cl {
+                    let field = susp(b"CL", &both32(lba_of(dir_at[&(k.0, d.clone())].0)));
+                    let su_at = at + 33 + r.name.len() + usize::from(r.name.len() % 2 == 0);
+                    bytes[su_at + cl_off..su_at + cl_off + CL_LEN].copy_from_slice(&field);
+                }
                 if let Some(key) = &r.key {
                     records.entry((k.0, key.clone())).or_default().push(at);
                 }
@@ -599,6 +671,7 @@ impl IsoBuilder {
                 target: Target::Dir(String::new()),
                 su: Vec::new(),
                 ce: None,
+                cl: None,
                 key: None,
             };
             let ext = dir_at[&(t, String::new())];

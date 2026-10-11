@@ -15,7 +15,7 @@
 //! absurd entry counts or depths are refused. Names are validated exactly as for ZIP and tar
 //! ([`trunc_core::path::validate_host`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use trunc_fs::FileHandle;
 use unicode_normalization::UnicodeNormalization;
@@ -41,6 +41,8 @@ const MAX_CONTINUATIONS: usize = 16;
 const MAX_CE_TOTAL: usize = 64 << 20;
 /// Raw bytes in one Rock Ridge name.
 const MAX_NM: usize = 4096;
+/// Bytes of full entry names in one image (bounds memory: every name is a full path).
+const MAX_NAME_BYTES: usize = 512 << 20;
 
 const FLAG_HIDDEN: u8 = 1;
 const FLAG_DIR: u8 = 2;
@@ -230,13 +232,43 @@ fn record(b: &[u8]) -> Result<Record<'_>> {
 }
 
 /// Recording date (years since 1900, month, day, hour, minute, second, GMT offset in 15-minute
-/// units) to Unix seconds.
-fn record_time(d: &[u8]) -> i64 {
-    let y = 1900 + i64::from(d[0]);
-    let m = i64::from(d[1]).clamp(1, 12);
-    let day = i64::from(d[2]).clamp(1, 31);
-    let (hh, mm, ss) = (i64::from(d[3]), i64::from(d[4]), i64::from(d[5]));
-    let offset = i64::from(i8::from_le_bytes([d[6]])) * 900;
+/// units) to Unix seconds; `None` when all zero ("not specified").
+fn record_time(d: &[u8]) -> Option<i64> {
+    if d.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(civil_seconds(
+        1900 + i64::from(d[0]),
+        [d[1], d[2], d[3], d[4], d[5]].map(i64::from),
+        i8::from_le_bytes([d[6]]),
+    ))
+}
+
+/// A volume descriptor date ("YYYYMMDDHHMMSScc" in ASCII digits, then the GMT offset in
+/// 15-minute units) to Unix seconds; `None` when unset (all zero digits or bytes) or malformed.
+fn descriptor_time(d: &[u8]) -> Option<i64> {
+    let digits = &d[..16];
+    if !digits.iter().all(u8::is_ascii_digit) || digits.iter().all(|&c| c == b'0') {
+        return None;
+    }
+    let num = |i: usize, n: usize| -> i64 {
+        digits[i..i + n]
+            .iter()
+            .fold(0, |acc, &c| acc * 10 + i64::from(c - b'0'))
+    };
+    Some(civil_seconds(
+        num(0, 4),
+        [num(4, 2), num(6, 2), num(8, 2), num(10, 2), num(12, 2)],
+        i8::from_le_bytes([d[16]]),
+    ))
+}
+
+/// Calendar date and time (month, day, hour, minute, second) at a GMT offset in 15-minute units
+/// to Unix seconds.
+fn civil_seconds(y: i64, [m, day, hh, mm, ss]: [i64; 5], gmt_offset: i8) -> i64 {
+    let m = m.clamp(1, 12);
+    let day = day.clamp(1, 31);
+    let offset = i64::from(gmt_offset) * 900;
     // Days from civil (Howard Hinnant's algorithm).
     let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
     let era = y.div_euclid(400);
@@ -407,9 +439,13 @@ struct Pending {
 
 struct Dir {
     lba: u32,
+    /// Extended attribute record length in blocks: the records start after it.
+    xa_len: u8,
     size: u32,
     path: String,
     depth: usize,
+    /// This directory's own entry in the layout (none for the root).
+    entry: Option<usize>,
 }
 
 /// Mode type bits.
@@ -420,6 +456,10 @@ const S_IFLNK: u32 = 0o120_000;
 
 /// Parse an ISO 9660 image and validate it for extraction.
 pub fn parse(src: &dyn FileHandle) -> Result<Image> {
+    parse_with(src, MAX_NAME_BYTES)
+}
+
+fn parse_with(src: &dyn FileHandle, max_name_bytes: usize) -> Result<Image> {
     let file_len = src.size()?;
     let vds = read_descriptors(src, file_len)?;
     let pvd = &vds.primary;
@@ -433,13 +473,23 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
         return Err(IsoError::Unsupported("multi-volume set".into()));
     }
     let volume_id = String::from_utf8_lossy(&pvd[40..72]).trim_end().to_owned();
+    // Records with no recording date get the volume's creation date (or the epoch).
+    let default_time = descriptor_time(&pvd[813..830]).unwrap_or(0);
     let root = record(&pvd[156..190])?;
 
     // Rock Ridge lives in the primary tree; its SUSP indicator is in the root's "." record.
     let rr_skip = rock_ridge(src, file_len, &root)?;
     let (root_rec, names) = match (&rr_skip, &vds.joliet) {
         (Some(_), _) => (root, Names::RockRidge),
-        (None, Some(j)) => (record(&j[156..190])?, Names::Joliet),
+        (None, Some(j)) => {
+            if u64::from(le16(j, 128)) != SECTOR {
+                return Err(IsoError::Unsupported(format!(
+                    "Joliet logical block size {}",
+                    le16(j, 128)
+                )));
+            }
+            (record(&j[156..190])?, Names::Joliet)
+        }
         (None, None) => (root, Names::Iso9660),
     };
     let skip = rr_skip.unwrap_or(0);
@@ -459,25 +509,34 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
         specials_skipped: 0,
         hidden: 0,
     };
-    let mut seen_names: HashSet<String> = HashSet::new();
-    let mut visited: HashSet<u32> = HashSet::new();
+    // Directories by the offset of their records.
+    let mut visited: HashSet<u64> = HashSet::new();
     let mut dir_ranges: Vec<(u64, u64)> = Vec::new();
     let mut dir_bytes = 0u64;
     let mut ce_budget = MAX_CE_TOTAL;
+    let mut name_bytes = 0usize;
+    // Rock Ridge relocated directories (`RE`) by extent, with the directory listing them, and the
+    // extents `CL` placeholders link to: every relocated directory must be linked.
+    let mut relocated: HashMap<u32, String> = HashMap::new();
+    let mut linked: HashSet<u32> = HashSet::new();
+    // Top-level directories holding nothing but relocated directories (`rr_moved`).
+    let mut moved_only: Vec<usize> = Vec::new();
     let mut stack = vec![Dir {
         lba: root_rec.lba,
+        xa_len: root_rec.xa_len,
         size: root_rec.size,
         path: String::new(),
         depth: 0,
+        entry: None,
     }];
     while let Some(dir) = stack.pop() {
-        if !visited.insert(dir.lba) {
+        let start = block_offset(dir.lba) + u64::from(dir.xa_len) * SECTOR;
+        if !visited.insert(start) {
             return Err(corrupt(format!(
                 "directory loop: {:?} reuses the records of another directory",
-                if dir.path.is_empty() { "/" } else { &dir.path }
+                display_path(&dir.path)
             )));
         }
-        let start = block_offset(dir.lba);
         let size = u64::from(dir.size);
         dir_bytes += size;
         if dir_bytes > MAX_DIR_BYTES {
@@ -489,12 +548,15 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
         if size == 0 || !in_bounds(start, size, file_len) {
             return Err(corrupt(format!(
                 "directory {:?} lies outside the image",
-                if dir.path.is_empty() { "/" } else { &dir.path }
+                display_path(&dir.path)
             )));
         }
         dir_ranges.push((start, start + size));
         let buf = read(src, start, usize::try_from(size).expect("<= 4 GiB"))?;
         let mut children = Vec::new();
+        // Names in this directory: duplicates can only be siblings.
+        let mut seen: HashSet<String> = HashSet::new();
+        let (mut listed, mut moved) = (0usize, 0usize);
         let mut pending: Option<Pending> = None;
         let mut p = 0usize;
         while p < buf.len() {
@@ -508,13 +570,25 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
             if r.name == [0] || r.name == [1] {
                 continue; // "." and ".."
             }
+            listed += 1;
             let su = if names == Names::RockRidge {
                 parse_susp(src, file_len, r.system_use, skip, &mut ce_budget)?
             } else {
                 Susp::default()
             };
             if su.relocated {
-                continue; // listed where its CL placeholder is
+                // Listed where its CL placeholder is; checked to be linked after the walk.
+                if r.flags & FLAG_DIR == 0 || su.child_link.is_some() {
+                    return Err(corrupt(format!(
+                        "Rock Ridge relocated entry in {:?} is not a directory",
+                        display_path(&dir.path)
+                    )));
+                }
+                if relocated.insert(r.lba, dir.path.clone()).is_some() {
+                    return Err(corrupt("Rock Ridge directory relocated twice"));
+                }
+                moved += 1;
+                continue;
             }
             if r.interleaved {
                 return Err(IsoError::Unsupported("interleaved files".into()));
@@ -571,8 +645,16 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
                 Kind::File
             };
             let comp = decode_name(&r, names, su.name.as_deref(), is_dir)?;
+            name_bytes += dir.path.len() + 1 + comp.len();
+            if name_bytes > max_name_bytes {
+                return Err(IsoError::Unsupported(format!(
+                    "more than {} MiB of entry names",
+                    max_name_bytes >> 20
+                )));
+            }
             let name = full_name(&dir.path, &comp)?;
-            if !seen_names.insert(trunc_core::path::host_key(&name)) {
+            let last = name.rsplit('/').next().unwrap_or(&name);
+            if !seen.insert(trunc_core::path::host_key(last)) {
                 return Err(IsoError::Name {
                     name,
                     reason: if cfg!(any(windows, target_os = "macos")) {
@@ -592,21 +674,26 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
                 img.hidden += 1;
             }
             let mode = su.mode.map(|m| m & 0o7777);
-            let mtime_unix = record_time(r.date);
+            let mtime_unix = record_time(r.date).unwrap_or(default_time);
             match kind {
                 Kind::Dir => {
                     if dir.depth + 1 >= trunc_core::path::MAX_DEPTH {
                         return Err(corrupt("directory tree too deep"));
                     }
-                    let (lba, size) = match su.child_link {
-                        Some(lba) => (lba, relocated_size(src, file_len, lba)?),
-                        None => (r.lba, r.size),
+                    let (lba, xa_len, size) = match su.child_link {
+                        Some(lba) => {
+                            linked.insert(lba);
+                            (lba, 0, relocated_size(src, file_len, lba)?)
+                        }
+                        None => (r.lba, r.xa_len, r.size),
                     };
                     children.push(Dir {
                         lba,
+                        xa_len,
                         size,
                         path: name.clone(),
                         depth: dir.depth + 1,
+                        entry: Some(img.layout.entries.len()),
                     });
                     img.layout
                         .entries
@@ -645,20 +732,49 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
         if pending.is_some() {
             return Err(corrupt("multi-extent file without its final section"));
         }
+        if dir.depth == 1 && listed > 0 && moved == listed {
+            moved_only.extend(dir.entry);
+        }
         // Depth-first, in directory order.
         stack.extend(children.into_iter().rev());
+    }
+    if let Some(parent) = relocated
+        .iter()
+        .filter(|(lba, _)| !linked.contains(lba))
+        .map(|(_, parent)| parent)
+        .min()
+    {
+        return Err(corrupt(format!(
+            "Rock Ridge relocated directory in {:?} is not linked from any CL entry",
+            display_path(parent)
+        )));
+    }
+    if !moved_only.is_empty() {
+        // An `rr_moved` directory is an artifact of relocation, not content.
+        moved_only.sort_unstable();
+        let mut i = 0usize;
+        img.layout.entries.retain(|_| {
+            i += 1;
+            moved_only.binary_search(&(i - 1)).is_err()
+        });
     }
     check_extents(&mut img, &mut dir_ranges)?;
     Ok(img)
 }
 
-/// The size of a relocated directory, from its own "." record.
+fn display_path(path: &str) -> &str {
+    if path.is_empty() { "/" } else { path }
+}
+
+/// The size of a relocated directory, from its own "." record (which carries Rock Ridge fields,
+/// so it is longer than a bare record: read its whole sector).
 fn relocated_size(src: &dyn FileHandle, file_len: u64, lba: u32) -> Result<u32> {
     let off = block_offset(lba);
     if !in_bounds(off, 34, file_len) {
         return Err(corrupt("relocated directory outside the image"));
     }
-    let b = read(src, off, 34)?;
+    let len = (file_len - off).min(SECTOR);
+    let b = read(src, off, usize::try_from(len).expect("<= 2048"))?;
     let r = record(&b)?;
     if r.name != [0] || r.lba != lba {
         return Err(corrupt(
@@ -670,7 +786,7 @@ fn relocated_size(src: &dyn FileHandle, file_len: u64, lba: u32) -> Result<u32> 
 
 /// Whether the root's "." record announces Rock Ridge; returns the SUSP skip length.
 fn rock_ridge(src: &dyn FileHandle, file_len: u64, root: &Record<'_>) -> Result<Option<usize>> {
-    let off = block_offset(root.lba);
+    let off = block_offset(root.lba) + u64::from(root.xa_len) * SECTOR;
     if !in_bounds(off, SECTOR, file_len) || root.size < 34 {
         return Err(corrupt("root directory lies outside the image"));
     }
@@ -770,11 +886,46 @@ mod tests {
     }
 
     #[test]
+    fn total_name_bytes_are_bounded() {
+        use trunc_fs::{FsBackend, OpenMode, Share};
+        use trunc_testkit::isobuild::{IsoBuilder, Spec};
+        use trunc_testkit::{CrashModel, FaultFs};
+
+        let mut b = IsoBuilder::new().rock_ridge(true);
+        let dir = "d".repeat(100);
+        for i in 0..20 {
+            b.add(Spec::file(&format!("{dir}/{i:03}"), b"x"));
+        }
+        let fs = FaultFs::new(CrashModel::WriteThrough);
+        fs.put_file(std::path::Path::new("/i.iso"), &b.build().bytes);
+        let h = fs
+            .open(
+                std::path::Path::new("/i.iso"),
+                OpenMode::Read,
+                Share::Shared,
+            )
+            .expect("open");
+        // 101 bytes for the directory, then 104 per file (its full path and a separator).
+        let need = 101 + 20 * 104;
+        assert!(parse_with(h.as_ref(), need).is_ok());
+        match parse_with(h.as_ref(), need - 1) {
+            Err(IsoError::Unsupported(m)) => assert!(m.contains("entry names"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn times() {
         // 2024-02-29 13:45:58 UTC, then the same wall time at GMT+1.
         let d = [124, 2, 29, 13, 45, 58, 0];
-        assert_eq!(record_time(&d), 1_709_214_358);
+        assert_eq!(record_time(&d), Some(1_709_214_358));
         let d = [124, 2, 29, 13, 45, 58, 4];
-        assert_eq!(record_time(&d), 1_709_214_358 - 3600);
+        assert_eq!(record_time(&d), Some(1_709_214_358 - 3600));
+        assert_eq!(record_time(&[0; 7]), None);
+        let mut d = *b"2024022913455800\x04";
+        assert_eq!(descriptor_time(&d), Some(1_709_214_358 - 3600));
+        d[..16].fill(b'0');
+        assert_eq!(descriptor_time(&d), None);
+        assert_eq!(descriptor_time(&[0; 17]), None);
     }
 }

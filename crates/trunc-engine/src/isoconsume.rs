@@ -10,6 +10,7 @@
 //! unchanged: a file whose bytes change between the scan and its extraction (or a resume) is
 //! detected before its source is released, and `--verify-media` has a value to compare against.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use trunc_fs::{FileHandle, FsBackend};
@@ -81,24 +82,79 @@ fn overlap_refusal(n: usize) -> String {
     )
 }
 
+/// Entries an image holds that extraction never creates, as a refusal message for `--consume`
+/// (which destroys them with the image), or `None` if there are none.
+pub fn skipped_refusal(img: &Image) -> Option<String> {
+    let mut what = Vec::new();
+    if img.associated_skipped > 0 {
+        what.push(format!(
+            "{} associated files (resource forks)",
+            img.associated_skipped
+        ));
+    }
+    if img.specials_skipped > 0 {
+        what.push(format!(
+            "{} devices, FIFOs or sockets",
+            img.specials_skipped
+        ));
+    }
+    (!what.is_empty()).then(|| {
+        format!(
+            "the image holds {} that are not extracted and would be destroyed with it; \
+             extract without --consume, or pass --allow-skipped to lose them",
+            what.join(" and ")
+        )
+    })
+}
+
+/// The image's skipped and hidden entry counts, in a summary.
+fn add_counts(s: &mut ConsumeSummary, img: &Image) {
+    s.specials_skipped = img.specials_skipped;
+    s.associated_skipped = img.associated_skipped;
+    s.hidden = img.hidden;
+}
+
+/// (specials, associated, hidden) of an image.
+type Counts = (usize, usize, usize);
+
 /// Consume an ISO image into `dest`. Safe to call again after any crash or pause.
+///
+/// Associated files and devices are never extracted, so they would be lost with the image: a
+/// fresh consumption refuses such an image unless `allow_skipped`.
 pub fn consume_iso(
     fs: &dyn FsBackend,
     archive_path: &Path,
     dest: &Path,
     opts: &ConsumeOptions,
+    allow_skipped: bool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ConsumeSummary> {
     let parallel = fs.parallel_io();
+    // What the scan (fresh starts only) found that the summary should report.
+    let scanned: Cell<Option<Counts>> = Cell::new(None);
     let format = Format {
         magic: PREAMBLE_MAGIC,
         scan: &|h| {
             let img = iso::parse(h).map_err(|e| parse_err(archive_path, e))?;
+            if let Some(why) = skipped_refusal(&img).filter(|_| !allow_skipped) {
+                return Err(Error::Refused(why));
+            }
+            scanned.set(Some((
+                img.specials_skipped,
+                img.associated_skipped,
+                img.hidden,
+            )));
             checksummed(h, img.layout, parallel)
         },
         overlap_refusal: &overlap_refusal,
     };
-    zipconsume::consume_layout(fs, archive_path, dest, opts, progress, &format)
+    let mut s = zipconsume::consume_layout(fs, archive_path, dest, opts, progress, &format)?;
+    if let Some((specials, associated, hidden)) = scanned.get() {
+        s.specials_skipped = specials;
+        s.associated_skipped = associated;
+        s.hidden = hidden;
+    }
+    Ok(s)
 }
 
 /// Non-destructive extraction of an ISO image into `dest`. Files sharing their data (hard
@@ -120,7 +176,7 @@ pub fn extract_iso(
         )));
     }
     let mut s = zipconsume::extract_layout(fs, h.as_ref(), &img.layout, dest, overwrite, false)?;
-    s.specials_skipped = img.specials_skipped;
+    add_counts(&mut s, &img);
     Ok(s)
 }
 

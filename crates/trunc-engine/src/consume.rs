@@ -125,6 +125,10 @@ pub struct ConsumeSummary {
     pub symlinks_skipped: usize,
     /// Device and FIFO entries (tar), which are never created.
     pub specials_skipped: usize,
+    /// ISO associated files (e.g. Mac resource forks), which are never created.
+    pub associated_skipped: usize,
+    /// ISO files flagged hidden (extracted like any other).
+    pub hidden: usize,
     pub receipt: Option<PathBuf>,
     /// Non-blocking preflight findings (warnings and notes).
     pub findings: Vec<Finding>,
