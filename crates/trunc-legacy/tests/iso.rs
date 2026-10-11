@@ -340,3 +340,23 @@ fn corrupt_images_never_panic() {
         }
     }
 }
+
+#[test]
+fn looping_continuation_areas_are_refused() {
+    let name = "a-long-file-name-for-a-continuation-loop.txt";
+    let built = build(
+        IsoBuilder::new().rock_ridge(true).ce_names(true),
+        &[Spec::file(name, b"x")],
+    );
+    let img = parse(&built.bytes).unwrap();
+    assert_eq!(img.layout.entries[0].name, name);
+    // Make the name's continuation area a CE field pointing at itself.
+    let mut bytes = built.bytes.clone();
+    let ce = bytes.windows(4).position(|w| w == b"CE\x1c\x01").unwrap();
+    let field = bytes[ce..ce + 28].to_vec();
+    let lba = u32::from_le_bytes(field[4..8].try_into().unwrap()) as usize;
+    let off = u32::from_le_bytes(field[12..16].try_into().unwrap()) as usize;
+    let area = lba * 2048 + off;
+    bytes[area..area + 28].copy_from_slice(&field);
+    refused(&bytes, "CE loop");
+}

@@ -47,7 +47,7 @@ ancestor directory.
   sharing records), overlapping directory extents, file data overlapping directory records and
   extents past the end of the file are refused. So are more than 2^21 entries, 512 MiB of
   directory records, 256 levels, 16 chained continuation areas or 64 KiB of system-use data per
-  record. A random-corruption test parses thousands of damaged images without a panic.
+  record, and 64 MiB of continuation areas in all. A random-corruption test parses thousands of damaged images without a panic.
 - **What is refused.** UDF-only images (a UDF recognition sequence and no ISO 9660
   descriptors) get a clear "UDF is not supported" message; hybrid ISO/UDF images use the ISO
   9660 side. Also refused: logical blocks other than 2048 bytes, multi-volume sets and

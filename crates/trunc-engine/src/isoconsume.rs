@@ -155,7 +155,16 @@ pub fn is_iso(fs: &dyn FsBackend, path: &Path) -> bool {
     if let Ok((_, pre, _)) = Journal::open(fs, &journal_path(path)) {
         return pre.starts_with(PREAMBLE_MAGIC);
     }
-    crate::source::open_read(fs, path).is_ok_and(|h| iso::looks_like_image(h.as_ref()))
+    let Ok(h) = crate::source::open_read(fs, path) else {
+        return false;
+    };
+    // A stored `.trnc` could hold "CD001" at the descriptor offset by chance; its own magic
+    // comes first.
+    let mut magic = [0u8; 6];
+    if h.read_exact_at(&mut magic, 0).is_ok() && magic == trunc_core::header::HEADER_MAGIC {
+        return false;
+    }
+    iso::looks_like_image(h.as_ref())
 }
 
 /// Destination recorded in the journal of an ISO image being consumed.

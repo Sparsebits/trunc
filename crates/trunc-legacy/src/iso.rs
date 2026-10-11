@@ -37,6 +37,8 @@ const MAX_ENTRIES: usize = 1 << 21;
 const MAX_SUSP: usize = 64 << 10;
 /// Continuation areas chained from one record.
 const MAX_CONTINUATIONS: usize = 16;
+/// Continuation-area bytes read for the whole image (bounds time on hostile input).
+const MAX_CE_TOTAL: usize = 64 << 20;
 /// Raw bytes in one Rock Ridge name.
 const MAX_NM: usize = 4096;
 
@@ -262,7 +264,13 @@ struct Susp {
 }
 
 /// Parse a record's system use fields, following continuation areas (bounded).
-fn parse_susp(src: &dyn FileHandle, file_len: u64, area: &[u8], skip: usize) -> Result<Susp> {
+fn parse_susp(
+    src: &dyn FileHandle,
+    file_len: u64,
+    area: &[u8],
+    skip: usize,
+    budget: &mut usize,
+) -> Result<Susp> {
     let mut out = Susp::default();
     let mut name = Vec::new();
     let mut name_done = false;
@@ -321,6 +329,12 @@ fn parse_susp(src: &dyn FileHandle, file_len: u64, area: &[u8], skip: usize) -> 
         let start = block_offset(lba) + u64::from(off);
         let len = len as usize;
         total += len;
+        *budget = budget.checked_sub(len).ok_or_else(|| {
+            IsoError::Unsupported(format!(
+                "more than {} MiB of Rock Ridge continuation areas",
+                MAX_CE_TOTAL >> 20
+            ))
+        })?;
         if hops > MAX_CONTINUATIONS || total > MAX_SUSP {
             return Err(corrupt("Rock Ridge continuation areas too long or looping"));
         }
@@ -449,6 +463,7 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
     let mut visited: HashSet<u32> = HashSet::new();
     let mut dir_ranges: Vec<(u64, u64)> = Vec::new();
     let mut dir_bytes = 0u64;
+    let mut ce_budget = MAX_CE_TOTAL;
     let mut stack = vec![Dir {
         lba: root_rec.lba,
         size: root_rec.size,
@@ -494,7 +509,7 @@ pub fn parse(src: &dyn FileHandle) -> Result<Image> {
                 continue; // "." and ".."
             }
             let su = if names == Names::RockRidge {
-                parse_susp(src, file_len, r.system_use, skip)?
+                parse_susp(src, file_len, r.system_use, skip, &mut ce_budget)?
             } else {
                 Susp::default()
             };
@@ -664,7 +679,8 @@ fn rock_ridge(src: &dyn FileHandle, file_len: u64, root: &Record<'_>) -> Result<
     if dot.name != [0] {
         return Ok(None);
     }
-    let su = parse_susp(src, file_len, dot.system_use, 0)?;
+    let mut budget = MAX_CE_TOTAL;
+    let su = parse_susp(src, file_len, dot.system_use, 0, &mut budget)?;
     Ok(match su.sp_skip {
         Some(skip) if su.rock_ridge => Some(skip),
         _ => None,
