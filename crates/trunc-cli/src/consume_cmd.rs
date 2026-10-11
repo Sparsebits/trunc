@@ -14,6 +14,7 @@ use trunc_engine::extract::TrustPolicy;
 use trunc_engine::isoconsume;
 use trunc_engine::preflight::{Finding, Severity};
 use trunc_engine::streamconsume::{self, StreamOptions};
+use trunc_engine::tarconsume;
 use trunc_engine::zipconsume::{self, PunchPolicy, ZipOptions};
 use trunc_engine::{Error, PauseReason};
 use trunc_fs::OsFs;
@@ -146,7 +147,7 @@ pub fn run(
     let opts = flags.options(*stream, trust, threads);
     let unit = match kind {
         Kind::Zip => "entries",
-        Kind::Iso => "files",
+        Kind::Iso | Kind::Tar => "files",
         Kind::Stream(..) => "checkpoints",
         Kind::Trnc => "blocks",
     };
@@ -185,6 +186,7 @@ pub fn run(
     let result = match kind {
         Kind::Zip => zipconsume::consume_zip(&fs, archive, dest, &opts, &mut progress),
         Kind::Iso => isoconsume::consume_iso(&fs, archive, dest, &opts, &mut progress),
+        Kind::Tar => tarconsume::consume_tar(&fs, archive, dest, &opts, &mut progress),
         Kind::Stream(..) => streamconsume::consume_stream(&fs, archive, dest, &opts, &mut progress),
         Kind::Trnc => consume::consume(&fs, archive, dest, &opts, &mut progress),
     };

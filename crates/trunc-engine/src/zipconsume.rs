@@ -116,7 +116,10 @@ impl Preamble {
 
     fn decode(b: &[u8]) -> Option<Self> {
         let magic: [u8; 5] = b.get(..5)?.try_into().ok()?;
-        if magic != *PREAMBLE_MAGIC && magic != *crate::isoconsume::PREAMBLE_MAGIC {
+        if magic != *PREAMBLE_MAGIC
+            && magic != *crate::isoconsume::PREAMBLE_MAGIC
+            && magic != *crate::tarconsume::PREAMBLE_MAGIC
+        {
             return None;
         }
         let archive_id = b.get(5..21)?.try_into().ok()?;

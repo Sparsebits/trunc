@@ -20,6 +20,7 @@ mod fmt;
 mod image_cmd;
 mod iso_cmd;
 mod stream_cmd;
+mod tar_cmd;
 mod zip_cmd;
 use fmt::{bytes, parse_size};
 
@@ -402,6 +403,14 @@ fn extract(a: ExtractArgs) -> Result<ExitCode> {
                 a.consume_flags.allow_overlap,
             );
         }
+        Kind::Tar => {
+            return tar_cmd::extract(
+                &a.archive,
+                &a.dest,
+                a.overwrite,
+                a.consume_flags.ignore_space,
+            );
+        }
         Kind::Trnc => {}
     }
     if a.stream.raw {
@@ -463,6 +472,7 @@ pub(crate) enum Kind {
     Trnc,
     Zip,
     Iso,
+    Tar,
     Stream(Codec, Mode),
 }
 
@@ -474,6 +484,9 @@ impl Kind {
         } else if iso_cmd::is_iso(archive) {
             // Before ZIP: a ZIP stored as an image's last file would also parse as a ZIP.
             Kind::Iso
+        } else if tar_cmd::is_tar(archive) {
+            // Before ZIP too: a ZIP stored as the last file of a tar could also parse as a ZIP.
+            Kind::Tar
         } else if zip_cmd::is_zip(archive) {
             Kind::Zip
         } else {
@@ -488,6 +501,7 @@ impl std::fmt::Display for Kind {
             Kind::Trnc => f.write_str(".trnc"),
             Kind::Zip => f.write_str("ZIP"),
             Kind::Iso => f.write_str("ISO"),
+            Kind::Tar => f.write_str("tar"),
             Kind::Stream(c, m) => f.write_str(&stream_cmd::label(*c, *m)),
         }
     }
@@ -522,6 +536,7 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
         }
         Kind::Zip => return zip_cmd::inspect(&a.archive, a.entries),
         Kind::Iso => return iso_cmd::inspect(&a.archive, a.entries),
+        Kind::Tar => return tar_cmd::inspect(&a.archive, a.entries),
         Kind::Trnc => {}
     }
     let archive = Archive::open(&a.archive)?;
@@ -620,6 +635,7 @@ fn verify(a: VerifyArgs) -> Result<ExitCode> {
         Kind::Stream(..) => return stream_cmd::verify(&a.archive, &a.stream.options()),
         Kind::Zip => return zip_cmd::verify(&a.archive),
         Kind::Iso => return iso_cmd::verify(&a.archive),
+        Kind::Tar => return tar_cmd::verify(&a.archive),
         Kind::Trnc => {}
     }
     let archive = Archive::open(&a.archive)?;
@@ -680,6 +696,7 @@ fn plan(a: PlanArgs) -> Result<ExitCode> {
         }
         Kind::Zip => return zip_cmd::plan(&a.archive, &a.dest, true),
         Kind::Iso => return iso_cmd::plan(&a.archive, &a.dest),
+        Kind::Tar => return tar_cmd::plan(&a.archive, &a.dest),
         Kind::Trnc => {}
     }
     use trunc_engine::preflight::{self, Severity};

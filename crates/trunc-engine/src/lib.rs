@@ -12,6 +12,7 @@
 //! - [`image`] extracts container image tarballs (`docker save`, OCI archives) to their merged
 //!   root filesystem.
 //! - [`isoconsume`] extracts, verifies and consumes ISO 9660 images through the ZIP machinery.
+//! - [`tarconsume`] does the same for uncompressed tar archives.
 
 pub mod archive;
 pub mod consume;
@@ -27,6 +28,7 @@ pub mod producer;
 pub mod source;
 mod stage;
 pub mod streamconsume;
+pub mod tarconsume;
 mod walk;
 pub mod zipconsume;
 

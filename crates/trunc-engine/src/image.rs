@@ -320,7 +320,7 @@ fn decode(
 
 /// Index an uncompressed tar by reading its headers only: file contents are skipped (fed to
 /// the parser as zeros) rather than read.
-fn index_tar(h: &dyn FileHandle, len: u64, what: &str) -> Result<Vec<tar::Entry>> {
+pub(crate) fn index_tar(h: &dyn FileHandle, len: u64, what: &str) -> Result<Vec<tar::Entry>> {
     let mut r = tar::Reader::new();
     let zeros = vec![0u8; 64 << 10];
     let mut block = [0u8; 512];
