@@ -51,8 +51,69 @@ pub fn host(bytes: &[u8]) -> (FaultFs, Box<dyn FileHandle>) {
     (fs, h)
 }
 
-/// Safe points as (cursor, out, free_below).
-pub type Points = Vec<(Vec<u8>, u64, u64)>;
+/// Cursor bytes one run keeps (see [`Point`]).
+const KEPT_CURSOR_BYTES: usize = 4 << 20;
+
+/// A safe point as a run keeps it.
+///
+/// Cursors can be large (a gzip cursor carries the 32 KiB inflate window, an xz one the LZMA
+/// probabilities), and with `every` of 1 there is one per DEFLATE block: an expanded payload
+/// deflated with a flush every 8 bytes has about 49 000, which is 1.5 GiB of cursors per run.
+/// So points compare by the cursor's length and hash, and the bytes are kept for a thinned
+/// sample only: every point while the kept bytes fit [`KEPT_CURSOR_BYTES`], then every 2nd,
+/// 4th, ... point.
+#[derive(Clone, Debug)]
+pub struct Point {
+    pub out: u64,
+    pub free_below: u64,
+    pub cursor_len: usize,
+    pub cursor_hash: u64,
+    pub cursor: Option<Vec<u8>>,
+}
+
+impl PartialEq for Point {
+    fn eq(&self, o: &Self) -> bool {
+        (self.out, self.free_below, self.cursor_len, self.cursor_hash)
+            == (o.out, o.free_below, o.cursor_len, o.cursor_hash)
+    }
+}
+
+pub type Points = Vec<Point>;
+
+/// Collects points, keeping the cursors of every `stride`-th one within the byte budget.
+struct Collector {
+    points: Points,
+    stride: usize,
+    kept: usize,
+}
+
+impl Collector {
+    fn push(&mut self, cursor: &[u8], out: u64, free_below: u64) {
+        let mut h = std::hash::DefaultHasher::new();
+        std::hash::Hasher::write(&mut h, cursor);
+        let keep = self.points.len().is_multiple_of(self.stride);
+        if keep {
+            self.kept += cursor.len();
+        }
+        self.points.push(Point {
+            out,
+            free_below,
+            cursor_len: cursor.len(),
+            cursor_hash: std::hash::Hasher::finish(&h),
+            cursor: keep.then(|| cursor.to_vec()),
+        });
+        while self.kept > KEPT_CURSOR_BYTES {
+            self.stride *= 2;
+            self.kept = 0;
+            for (i, p) in self.points.iter_mut().enumerate() {
+                if !i.is_multiple_of(self.stride) {
+                    p.cursor = None;
+                }
+                self.kept += p.cursor.as_ref().map_or(0, Vec::len);
+            }
+        }
+    }
+}
 
 /// Everything a decode produced, up to where it stopped.
 pub struct Run {
@@ -71,7 +132,11 @@ pub fn decode(
 ) -> Run {
     let (_fs, h) = host(input);
     let mut out = Vec::new();
-    let mut points = Vec::new();
+    let mut points = Collector {
+        points: Vec::new(),
+        stride: 1,
+        kept: 0,
+    };
     let end = stream::decode(
         codec,
         Input {
@@ -91,7 +156,7 @@ pub fn decode(
             Ok(())
         },
         &mut |p| {
-            points.push((p.cursor.to_vec(), p.out, p.free_below));
+            points.push(p.cursor, p.out, p.free_below);
             Ok(())
         },
     )
@@ -100,7 +165,11 @@ pub fn decode(
         out.len() as u64 <= MAX_OUT,
         "{codec:?}: output over the limit"
     );
-    Run { out, points, end }
+    Run {
+        out,
+        points: points.points,
+        end,
+    }
 }
 
 /// One of `a` and `b` is a prefix of the other.
@@ -113,25 +182,26 @@ pub fn prefix_consistent<T: PartialEq>(a: &[T], b: &[T]) -> bool {
 /// cursor bound.
 pub fn check_points(codec: Codec, points: &Points, input_len: usize, out_len: usize) {
     let mut prev = (0u64, 0u64);
-    for (cursor, at, free_below) in points {
+    for p in points {
+        let (at, free_below) = (p.out, p.free_below);
         assert!(
-            *at > prev.0 && *free_below >= prev.1,
+            at > prev.0 && free_below >= prev.1,
             "{codec:?}: safe points go backwards at {at}"
         );
         assert!(
-            *free_below <= input_len as u64,
+            free_below <= input_len as u64,
             "{codec:?}: free_below {free_below} past the input"
         );
         assert!(
-            *at <= out_len as u64,
+            at <= out_len as u64,
             "{codec:?}: safe point at {at} past the {out_len} bytes written"
         );
         assert!(
-            cursor.len() <= codec.max_cursor(),
+            p.cursor_len <= codec.max_cursor(),
             "{codec:?}: cursor of {} bytes, over max_cursor",
-            cursor.len()
+            p.cursor_len
         );
-        prev = (*at, *free_below);
+        prev = (at, free_below);
     }
 }
 
