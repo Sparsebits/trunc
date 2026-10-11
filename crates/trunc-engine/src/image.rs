@@ -1495,13 +1495,13 @@ fn through_symlink(li: usize, path: &str, link: &str, link_layer: usize) -> Erro
 /// apply first, so they never affect entries of the same layer; then its entries are added,
 /// replacing what is at their path (a directory over a directory keeps the contents below,
 /// anything else replaces the whole subtree). A path through a lower file replaces it with a
-/// directory; a path (or whiteout) through a symlink is refused (see [`check_ancestors`]), as
+/// directory; a path (or whiteout) through a symlink is refused (see `check_ancestors`), as
 /// is a whiteout that names a path only up to case. Whiteout files themselves are never part
 /// of the tree, and aufs bookkeeping (any name under a `.wh..wh.` component, other than the
 /// opaque marker) is skipped.
 ///
 /// Paths this computer cannot create are then left out of the tree and returned (see
-/// [`leave_out`]); whiteouts and opaque markers have applied to them as to any path. Names are
+/// `leave_out`); whiteouts and opaque markers have applied to them as to any path. Names are
 /// compared as this computer usually does ([`CaseMode::host`]); see [`merge_layers_with`].
 pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeStats, Vec<Skipped>)> {
     merge_layers_with(layers, CaseMode::host())

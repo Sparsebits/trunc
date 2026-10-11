@@ -4,7 +4,7 @@
 //!
 //! BGZF files (`bgzip`, samtools, htslib) are made of small members whose headers give their
 //! size. Those members are decoded whole, several at a time on worker threads; see
-//! [`bgzf_walk`].
+//! `bgzf_walk`.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
