@@ -82,7 +82,7 @@ or run `cargo install --git https://github.com/Sparsebits/trunc trunc-cli`.
 
 ```sh
 trunc plan big.zip -C out               # how much space each mode needs; changes nothing
-trunc x big.zip -C out --consume        # extract, deleting the archive as it goes
+trunc x big.zip -C out --consume        # extract, deleting the archive as it goes (asks first; --yes skips)
 trunc x big.tar.zst -C out --consume    # tarballs, ISO images and split parts work the same way
 trunc x disk.img.xz --consume           # a single compressed file: leaves disk.img
 trunc resume big.zip                    # continue after a crash, a kill or a full disk
@@ -105,7 +105,9 @@ option, including container images and trunc's own `.trnc` format.
 | Container images (`docker save`, OCI) | yes | no | — |
 | `.trnc` | yes | yes | after each batch of blocks |
 
-Details for each format are in the [user guide](docs/guide.md#supported-formats).
+Freeing space inside a file needs NTFS, ext4, XFS, btrfs or ZFS; elsewhere compressed archives
+give their space back at the end. Details for each format are in the
+[user guide](docs/guide.md#supported-formats).
 
 ## How it works
 
@@ -120,9 +122,10 @@ format stores blocks back to front, so it shrinks from the end:
                                           ▲  cut here once those files are on disk
 ```
 
-ZIP files, ISO images and tarballs aren't laid out for this, so trunc checks the whole archive
-first, keeps a small journal of its progress, and uses its own resumable decoders to free space
-every 64 MiB inside large files. The [user guide](docs/guide.md#what---consume-does) has the details.
+ZIP files, ISO images and plain tar archives are shortened from the end too. Compressed streams
+are read from the start, so trunc frees the bytes it has already decoded from inside the file,
+every 64 MiB of output. For these formats it scans the whole archive first and keeps a small
+journal next to it. The [user guide](docs/guide.md#what---consume-does) has the details.
 
 ## Safety
 
@@ -144,14 +147,15 @@ The [security checklist](docs/security.md) maps each rule to the code and test t
 
 ## FAQ
 
-**How much free space do I need?** Run `trunc plan <archive> -C <destination>`. It errs on the
-high side.
+**How much free space do I need?** About *output minus archive*, plus some working room, when
+both are on the same volume. `trunc plan <archive> -C <destination>` gives a conservative figure
+for your archive and filesystem.
 
 **What happens if my computer crashes halfway?** Run `trunc resume <archive>`. Finished files were
 on disk before their part of the archive was deleted; everything else is still in the archive.
 
-**What if the disk fills up anyway?** trunc stops cleanly with exit code 75, leaving a valid,
-shorter archive. Free some space and run `trunc resume`.
+**What if the disk fills up anyway?** trunc pauses with exit code 75 and keeps what it needs to
+resume. Free some space and run `trunc resume <archive>`.
 
 **Can other tools still open the archive afterwards?** Not once a consume has started; trunc says
 so before it begins. Without `--consume` the archive is untouched.
@@ -160,21 +164,21 @@ so before it begins. Without `--consume` the archive is untouched.
 
 Extracting a 10 GiB folder from a 5.81 GiB `.trnc` archive on NTFS (Ryzen 7 5800H, NVMe):
 
-| Command | Peak disk use | trunc's prediction | Time |
+| Command | Peak extra space | trunc's prediction | Time |
 |---|---|---|---|
 | `trunc x --consume` | **4.32 GiB** | 4.39 GiB | 53 s |
 | `trunc x` | 10.00 GiB | 10.07 GiB | 60 s |
+
+This is space needed beyond the archive already on disk; the chart above shows the total. See
+the [measurement notes](docs/spec/invariants.md#measured-10-gib-ntfs).
 
 Add `--profile run.json` to any command to see where the time goes; the user guide explains
 [parallel decoding](docs/guide.md#parallel-decoding) and [how to read a profile](docs/guide.md#performance-and-profiling).
 
 ## Documentation
 
-- [User guide](docs/guide.md): what `--consume` does and promises, supported formats, ZIP files,
-  compressed tarballs, ISO images, split archives, container images, parallel decoding,
-  profiling, and the full list of commands, options and exit codes
-- [Security checklist](docs/security.md): how hostile archives are handled, known gaps, and how to
-  verify downloads
+- [User guide](docs/guide.md): format details, commands, options, recovery and profiling
+- [Security checklist](docs/security.md): archive validation, known limits and download verification
 - [Format spec](docs/spec/trnc-format-v1.md): the `.trnc` v1 file format
 - [Crash-safety invariants](docs/spec/invariants.md): what must hold after any crash, and the test
   for each
@@ -183,9 +187,8 @@ Add `--profile run.json` to any command to see where the time goes; the user gui
 
 ## Platform support
 
-Windows (NTFS) and Linux (ext4, XFS, btrfs, ZFS) get every feature, and both are tested on every
-commit. Prebuilt binaries are available for Windows x64, Linux x64 and Linux ARM64; the Linux
-builds are static and run on any distribution.
+Windows (NTFS) and Linux (ext4, XFS, btrfs, ZFS) get every feature. CI tests both on x64 and
+cross-compiles for ARM64; releases cover x64 and ARM64 on both, and the Linux builds are static.
 
 FAT32 and exFAT drives work with `--allow-unjournaled`. On filesystems that can't free space inside
 a file, compressed tarballs still consume safely but give their space back only at the end, and a
