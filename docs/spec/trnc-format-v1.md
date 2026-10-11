@@ -1,6 +1,6 @@
 # `.trnc` format, version 1
 
-Status: **draft**. Frozen at the 0.1.0 release (plan phase 6.4). Until then, breaking changes are allowed and must update this file, `trunc-core`, and the layout snapshot tests together.
+Status: **draft**. Frozen at the 0.1.0 release. Until then, breaking changes are allowed and must update this file, `trunc-core`, and the layout snapshot tests together.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -166,7 +166,7 @@ Paths are relative, `/`-separated, NFC-normalized UTF-8. A path MUST be rejected
 - a component contains a control character (`< 0x20` or `0x7F`), `\`, `:`, `<`, `>`, `"`, `|`, `?` or `*`;
 - a component ends in `.` or a space;
 - a component's stem (the text before its first `.`, with trailing spaces removed) is a reserved Windows device name: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9`, `COM¹`–`COM³`, `LPT0`–`LPT9` or `LPT¹`–`LPT³`, in any ASCII case;
-- its first component starts with `.trunc-stage-` (compared with the key below), the prefix of the extractor's staging directory.
+- its first component starts with `.trunc-stage-` (compared with the key below), the prefix of the extractor's staging folder.
 
 Two entries MUST NOT have paths with equal collision keys. The key maps each character to its simple uppercase and that to its simple lowercase, keeping a character whose mapping is not exactly one character. This joins every pair NTFS's upcase table joins (`ı`/`i`, `ſ`/`s`, `ς`/`σ`) and every pair simple Unicode case folding joins (as on APFS). No entry may be nested under a non-directory entry.
 
