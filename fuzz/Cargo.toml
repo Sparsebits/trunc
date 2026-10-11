@@ -81,3 +81,10 @@ path = "fuzz_targets/zstd.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sevenz"
+path = "fuzz_targets/sevenz.rs"
+test = false
+doc = false
+bench = false
