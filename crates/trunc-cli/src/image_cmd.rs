@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Args;
 use trunc_engine::extract::TrustPolicy;
-use trunc_engine::image::{self, ImageFormat, ImageInfo, ImageOptions, ImageScan};
+use trunc_engine::image::{self, ImageFormat, ImageInfo, ImageOptions, ImageScan, Skipped};
 use trunc_engine::preflight;
 use trunc_fs::OsFs;
 use trunc_legacy::tar::Kind;
@@ -84,6 +84,25 @@ fn name_line(info: &ImageInfo) -> String {
     } else {
         info.names.join(", ")
     }
+}
+
+/// Skipped paths `trunc x` lists before "and N more".
+const SKIPPED_SHOWN: usize = 10;
+
+/// One skipped path: a directory with a trailing `/` and the entries left out with it.
+fn skipped_line(s: &Skipped) -> String {
+    if s.dir {
+        format!("{}/ ({} entries; {})", s.path, s.entries, s.reason)
+    } else {
+        format!("{} ({})", s.path, s.reason)
+    }
+}
+
+/// "N paths (M entries)" for the skipped list.
+fn skipped_count(skipped: &[Skipped]) -> String {
+    let entries: usize = skipped.iter().map(|s| s.entries).sum();
+    let paths = if skipped.len() == 1 { "path" } else { "paths" };
+    format!("{} {paths} ({entries} entries)", skipped.len())
 }
 
 /// Short form of a digest for tables.
@@ -162,6 +181,21 @@ pub fn extract(
             s.specials_skipped
         );
     }
+    if !s.skipped.is_empty() {
+        println!(
+            "skipped   {} whose names this computer cannot create:",
+            skipped_count(&s.skipped)
+        );
+        for k in s.skipped.iter().take(SKIPPED_SHOWN) {
+            println!("            {}", skipped_line(k));
+        }
+        if s.skipped.len() > SKIPPED_SHOWN {
+            println!(
+                "            ... and {} more (`trunc inspect --entries` lists them all)",
+                s.skipped.len() - SKIPPED_SHOWN
+            );
+        }
+    }
     println!("time      {:.2}s", t.elapsed().as_secs_f64());
     Ok(ExitCode::SUCCESS)
 }
@@ -194,6 +228,14 @@ pub fn verify(
         scan.tree.len() - files,
         bytes(scan.content_bytes())
     );
+    if !scan.skipped.is_empty() {
+        println!(
+            "skipped: {} whose names this computer cannot create would not be written by \
+             `trunc x`; their digests and tar headers were checked like the rest (`trunc \
+             inspect --entries` lists them)",
+            skipped_count(&scan.skipped)
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -260,6 +302,16 @@ pub fn inspect(
                 _ => format!("{:>12}", "<device>"),
             };
             println!("{size}  L{:<3} {}", w.layer + 1, e.name);
+        }
+        if !s.skipped.is_empty() {
+            println!();
+            println!(
+                "skipped    {} whose names this computer cannot create (checked, not written):",
+                skipped_count(&s.skipped)
+            );
+            for k in &s.skipped {
+                println!("  {}", skipped_line(k));
+            }
         }
     } else {
         println!("digests    not checked; `trunc verify` checks every blob and layer");

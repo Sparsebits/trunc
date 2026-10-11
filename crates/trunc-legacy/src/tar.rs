@@ -103,6 +103,9 @@ pub struct Reader {
     entries: Vec<Entry>,
     seen: HashSet<String>,
     name_bytes: usize,
+    /// Names must be valid on this computer and are compared as it compares them; otherwise
+    /// only the safety rules apply and names are compared exactly.
+    host_names: bool,
 }
 
 impl Default for Reader {
@@ -122,6 +125,27 @@ impl Reader {
             entries: Vec::new(),
             seen: HashSet::new(),
             name_bytes: 0,
+            host_names: true,
+        }
+    }
+
+    /// A reader that checks names against the safety rules alone
+    /// ([`trunc_core::path::validate_safe`]) and compares them exactly, so `a:b` is accepted on
+    /// Windows and `E` and `e` are two entries everywhere. For callers that decide themselves
+    /// what to do with names this computer cannot create (container image layers).
+    pub fn with_safe_names() -> Self {
+        Self {
+            host_names: false,
+            ..Self::new()
+        }
+    }
+
+    /// Key for the duplicate and nesting checks.
+    fn key(&self, name: &str) -> String {
+        if self.host_names {
+            trunc_core::path::host_key(name)
+        } else {
+            name.to_owned()
         }
     }
 
@@ -226,7 +250,7 @@ impl Reader {
         if self.pos == 0 {
             return Err(TarError::NotTar);
         }
-        check_nesting(&self.entries)?;
+        check_nesting(&self.entries, &|n| self.key(n))?;
         Ok(self.entries)
     }
 
@@ -337,7 +361,7 @@ impl Reader {
         if kind == Kind::File && raw_name.ends_with(b"/") && size == 0 {
             kind = Kind::Dir;
         }
-        let name = normalize_name(&raw_name, at)?;
+        let name = normalize_name(&raw_name, at, self.host_names)?;
         let mode = number(&h[100..108]).and_then(|m| u32::try_from(m & 0o7777).ok());
         let (mtime_unix, mtime_nanos) = match pending.pax_mtime {
             Some(t) => t,
@@ -362,10 +386,15 @@ impl Reader {
             return Ok(());
         };
         self.state = body(None, kind == Kind::File, size);
-        if !self.seen.insert(trunc_core::path::host_key(&name)) {
+        if !self.seen.insert(self.key(&name)) {
             return Err(TarError::Name {
                 name,
-                reason: DUPLICATE.into(),
+                reason: if self.host_names {
+                    DUPLICATE
+                } else {
+                    "duplicate entry"
+                }
+                .into(),
             });
         }
         if self.entries.len() >= MAX_ENTRIES {
@@ -491,8 +520,9 @@ fn cstr(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 
-/// Validate and normalize an entry name; `None` for the archive root itself.
-fn normalize_name(raw: &[u8], at: u64) -> Result<Option<String>> {
+/// Validate and normalize an entry name (`host`: for this computer, else for safety only);
+/// `None` for the archive root itself.
+fn normalize_name(raw: &[u8], at: u64, host: bool) -> Result<Option<String>> {
     let s = std::str::from_utf8(raw).map_err(|_| TarError::Name {
         name: String::from_utf8_lossy(raw).into_owned(),
         reason: "not valid UTF-8".into(),
@@ -505,7 +535,12 @@ fn normalize_name(raw: &[u8], at: u64) -> Result<Option<String>> {
         return Ok(None);
     }
     let name: String = s.nfc().collect();
-    trunc_core::path::validate_host(&name).map_err(|e| TarError::Name {
+    let valid = if host {
+        trunc_core::path::validate_host(&name)
+    } else {
+        trunc_core::path::validate_safe(&name)
+    };
+    valid.map_err(|e| TarError::Name {
         name: name.clone(),
         reason: format!("{e} (at byte {at})"),
     })?;
@@ -557,16 +592,16 @@ fn parse_pax_time(v: &str) -> Option<(i64, u32)> {
 }
 
 /// No entry may live under a file entry ("a" plus "a/b").
-fn check_nesting(entries: &[Entry]) -> Result<()> {
+fn check_nesting(entries: &[Entry], key: &dyn Fn(&str) -> String) -> Result<()> {
     let files: HashSet<String> = entries
         .iter()
         .filter(|e| e.kind != Kind::Dir)
-        .map(|e| trunc_core::path::host_key(&e.name))
+        .map(|e| key(&e.name))
         .collect();
     for e in entries {
         let mut parent = trunc_core::path::parent(&e.name);
         while let Some(pp) = parent {
-            if files.contains(&trunc_core::path::host_key(pp)) {
+            if files.contains(&key(pp)) {
                 return Err(TarError::Name {
                     name: e.name.clone(),
                     reason: "nested under a file".into(),
@@ -685,15 +720,34 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(
-            normalize_name(b"./a/b/", 0).unwrap().as_deref(),
+            normalize_name(b"./a/b/", 0, true).unwrap().as_deref(),
             Some("a/b")
         );
-        assert_eq!(normalize_name(b"./", 0).unwrap(), None);
-        assert_eq!(normalize_name(b".", 0).unwrap(), None);
-        assert!(normalize_name(b"../etc/passwd", 0).is_err());
-        assert!(normalize_name(b"/etc/passwd", 0).is_err());
-        assert!(normalize_name(b"a/../../b", 0).is_err());
-        assert!(normalize_name(b"\xff", 0).is_err());
+        assert_eq!(normalize_name(b"./", 0, true).unwrap(), None);
+        assert_eq!(normalize_name(b".", 0, true).unwrap(), None);
+        assert!(normalize_name(b"../etc/passwd", 0, true).is_err());
+        assert!(normalize_name(b"/etc/passwd", 0, true).is_err());
+        assert!(normalize_name(b"a/../../b", 0, true).is_err());
+        assert!(normalize_name(b"\xff", 0, true).is_err());
+        // Safety rules alone: names only Windows forbids pass, hostile ones never do.
+        for ok in ["man3/IO::File.3pm", "inc/aux.h", "dots.", "a\\x2db"] {
+            let got = normalize_name(ok.as_bytes(), 0, false).unwrap();
+            assert_eq!(got.as_deref(), Some(ok));
+            assert_eq!(
+                normalize_name(ok.as_bytes(), 0, true).is_err(),
+                cfg!(windows)
+            );
+        }
+        for bad in [
+            "../etc/passwd",
+            "/etc/passwd",
+            "a/../../b",
+            "C:/x",
+            "a\0b",
+            "a//b",
+        ] {
+            assert!(normalize_name(bad.as_bytes(), 0, false).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

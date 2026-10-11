@@ -446,3 +446,137 @@ fn media_type_must_match_the_blob() {
     ls[0].media_type = "application/vnd.oci.image.layer.v1.tar+gzip+encrypted".into();
     refused(&ib::oci_archive(&[("linux/amd64", ls)]), "not supported");
 }
+
+/// Layers with names Windows forbids and case-only twins, as real Debian images have.
+fn unfriendly_layers() -> Vec<Layer> {
+    vec![
+        ib::layer(
+            &[
+                Spec::file("etc/hostname", b"h"),
+                Spec::file("usr/share/man/man3/IO::File.3pm", b"perl"),
+                Spec::file("usr/share/terminfo/E/foo", b"E foo"),
+                Spec::file("usr/share/terminfo/e/bar", b"e bar"),
+                Spec::file("usr/include/aux.h", b"aux"),
+                Spec::file("usr/share/doc/pkg./README", b"trailing dot"),
+                Spec::file("lib/system-systemd\\x2dcryptsetup.slice", b"unit"),
+                Spec::file("usr/lib/old:file", b"deleted by the next layer"),
+            ],
+            Compression::Gzip,
+        ),
+        ib::layer(
+            &[
+                Spec::file("usr/lib/.wh.old:file", b""),
+                Spec::file("etc/motd", b"m"),
+            ],
+            Compression::Zstd,
+        ),
+    ]
+}
+
+#[test]
+fn names_this_computer_cannot_create_are_skipped_and_reported() {
+    let t = tempfile::tempdir().unwrap();
+    let arc = write(
+        t.path(),
+        "img.tar",
+        &ib::oci_archive(&[("linux/amd64", unfriendly_layers())]),
+    );
+    let dest = t.path().join("root");
+    let s = extract(&arc, &dest, &opts()).unwrap();
+    let scan = image::verify_image(&OsFs::new(), &arc, t.path(), &opts()).unwrap();
+    assert_eq!(scan.skipped, s.skipped);
+
+    let f = |b: &[u8]| Node::File(b.to_vec());
+    let mut want = BTreeMap::from([
+        ("etc".to_owned(), Node::Dir),
+        ("etc/hostname".into(), f(b"h")),
+        ("etc/motd".into(), f(b"m")),
+        ("lib".into(), Node::Dir),
+        ("usr".into(), Node::Dir),
+        ("usr/include".into(), Node::Dir),
+        ("usr/lib".into(), Node::Dir),
+        ("usr/share".into(), Node::Dir),
+        ("usr/share/doc".into(), Node::Dir),
+        ("usr/share/man".into(), Node::Dir),
+        ("usr/share/man/man3".into(), Node::Dir),
+        ("usr/share/terminfo".into(), Node::Dir),
+    ]);
+    let skipped: Vec<(&str, bool, usize)> = s
+        .skipped
+        .iter()
+        .map(|k| (k.path.as_str(), k.dir, k.entries))
+        .collect();
+    // The twins: the directory node both share is counted with the name it was first given.
+    let twins = [
+        ("usr/share/terminfo/E", true, 2),
+        ("usr/share/terminfo/e", true, 1),
+    ];
+    if cfg!(windows) {
+        assert_eq!(
+            skipped,
+            [
+                ("lib/system-systemd\\x2dcryptsetup.slice", false, 1),
+                ("usr/include/aux.h", false, 1),
+                ("usr/share/doc/pkg.", true, 2),
+                ("usr/share/man/man3/IO::File.3pm", false, 1),
+                twins[0],
+                twins[1],
+            ]
+        );
+        let reasons: Vec<&str> = s.skipped.iter().map(|k| k.reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            [
+                "character not allowed on Windows",
+                "reserved Windows device name",
+                "trailing '.' or space (stripped by Windows)",
+                "character not allowed on Windows",
+                "differs only in case from \"usr/share/terminfo/e\"",
+                "differs only in case from \"usr/share/terminfo/E\"",
+            ]
+        );
+        assert_eq!(s.stats.skipped, 8);
+    } else {
+        want.extend([
+            (
+                "lib/system-systemd\\x2dcryptsetup.slice".to_owned(),
+                f(b"unit"),
+            ),
+            ("usr/include/aux.h".into(), f(b"aux")),
+            ("usr/share/doc/pkg.".into(), Node::Dir),
+            ("usr/share/doc/pkg./README".into(), f(b"trailing dot")),
+            ("usr/share/man/man3/IO::File.3pm".into(), f(b"perl")),
+        ]);
+        if cfg!(target_os = "macos") {
+            assert_eq!(skipped, twins);
+        } else {
+            assert_eq!(skipped, []);
+            want.extend([
+                ("usr/share/terminfo/E".to_owned(), Node::Dir),
+                ("usr/share/terminfo/E/foo".into(), f(b"E foo")),
+                ("usr/share/terminfo/e".into(), Node::Dir),
+                ("usr/share/terminfo/e/bar".into(), f(b"e bar")),
+            ]);
+        }
+    }
+    assert_eq!(snapshot(&dest), want);
+    // The whiteout of a skipped name applied: the deleted file is neither written nor reported.
+    assert!(!s.skipped.iter().any(|k| k.path.contains("old")));
+}
+
+#[test]
+fn hostile_names_are_refused_even_beside_skipped_ones() {
+    for hostile in ["../escape", "/abs/path", "a/../../b", "C:/x"] {
+        let mut ls = unfriendly_layers();
+        ls.push(ib::layer(&[Spec::file(hostile, b"x")], Compression::None));
+        refused(
+            &ib::oci_archive(&[("linux/amd64", ls)]),
+            "unsafe or invalid entry name",
+        );
+    }
+    for whiteout in ["usr/.wh..", "usr/.wh.a\\b", "usr/.wh.x/inside"] {
+        let mut ls = unfriendly_layers();
+        ls.push(ib::layer(&[Spec::file(whiteout, b"")], Compression::None));
+        refused(&ib::oci_archive(&[("linux/amd64", ls)]), "whiteout");
+    }
+}

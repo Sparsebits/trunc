@@ -47,6 +47,35 @@ pub fn validate_host(path: &str) -> Result<(), FormatError> {
     validate_with(path, cfg!(windows))
 }
 
+/// Validate a path against the safety rules alone, which apply on every computer: what
+/// [`validate_host`] checks off Windows. A path that passes this but not [`validate_host`] is
+/// harmless but has a name this computer cannot create; [`host_unusable`] says which part.
+pub fn validate_safe(path: &str) -> Result<(), FormatError> {
+    validate_with(path, false)
+}
+
+/// For a path that passes [`validate_safe`]: the shortest leading part of it (whole components)
+/// whose last name this computer cannot create, with the reason, or `None` if it can create
+/// them all. Always `None` off Windows, where [`validate_host`] is [`validate_safe`].
+pub fn host_unusable(path: &str) -> Option<(&str, &'static str)> {
+    unusable_with(path, cfg!(windows))
+}
+
+fn unusable_with(path: &str, portable: bool) -> Option<(&str, &'static str)> {
+    if !portable {
+        return None;
+    }
+    let mut start = 0usize;
+    for comp in path.split('/') {
+        let end = start + comp.len();
+        if let Err(FormatError::Path { reason, .. }) = validate_component(path, comp, true) {
+            return Some((&path[..end], reason));
+        }
+        start = end + 1;
+    }
+    None
+}
+
 fn validate_with(path: &str, portable: bool) -> Result<(), FormatError> {
     if path.is_empty() {
         return Err(err(path, "empty"));
@@ -239,6 +268,42 @@ mod tests {
             host_key("Makefile") == host_key("makefile"),
             cfg!(any(windows, target_os = "macos"))
         );
+    }
+
+    #[test]
+    fn unusable_part_is_the_shallowest_name_windows_forbids() {
+        let cases = [
+            (
+                "usr/share/man/man3/IO::File.3pm.gz",
+                Some("usr/share/man/man3/IO::File.3pm.gz"),
+            ),
+            ("a/trailing./b/c", Some("a/trailing.")),
+            ("inc/aux.h", Some("inc/aux.h")),
+            ("x\\y/z", Some("x\\y")),
+            ("CON/a:b", Some("CON")),
+            ("usr/share/terminfo/E/foo", None),
+        ];
+        for (p, want) in cases {
+            validate_safe(p).unwrap_or_else(|e| panic!("{p}: {e}"));
+            assert_eq!(unusable_with(p, true).map(|(u, _)| u), want, "{p:?}");
+            assert_eq!(unusable_with(p, false), None, "{p:?}");
+            assert_eq!(host_unusable(p).is_some(), cfg!(windows) && want.is_some());
+            assert_eq!(
+                validate_host(p).is_err(),
+                host_unusable(p).is_some(),
+                "{p:?}"
+            );
+        }
+        for p in [
+            "../up",
+            "/abs",
+            "a//b",
+            "C:/x",
+            "nul\0byte",
+            ".trunc-stage-x",
+        ] {
+            assert!(validate_safe(p).is_err(), "accepted {p:?}");
+        }
     }
 
     #[test]

@@ -122,3 +122,35 @@ fn staging_directory_names_are_refused_at_the_top() {
     let tar = tarbuild::tar(&[Spec::file("dir/.trunc-stage-0011", b"x")]);
     assert!(parse(&tar, 512).is_ok());
 }
+
+#[test]
+fn safe_names_reader_compares_exactly_and_keeps_safety() {
+    let parse_safe = |tar: &[u8]| {
+        let mut r = Reader::with_safe_names();
+        r.feed(tar)?;
+        r.finish()
+    };
+    let tar = tarbuild::tar(&[
+        Spec::dir("t/E"),
+        Spec::file("t/E/foo", b"1"),
+        Spec::dir("t/e"),
+        Spec::file("t/e/bar", b"2"),
+        Spec::file("man3/IO::File.3pm", b"3"),
+        Spec::file("inc/aux.h", b"4"),
+    ]);
+    assert_eq!(parse_safe(&tar).unwrap().len(), 6);
+    assert_eq!(
+        parse(&tar, 512).is_err(),
+        cfg!(any(windows, target_os = "macos"))
+    );
+    // Exact duplicates are still refused.
+    let dup = tarbuild::tar(&[Spec::file("a", b"1"), Spec::file("a", b"2")]);
+    assert!(matches!(parse_safe(&dup), Err(TarError::Name { .. })));
+    for bad in ["../up", "/abs", "a/../../b", "C:/x", ".trunc-stage-x"] {
+        let tar = tarbuild::tar(&[Spec::file(bad, b"x")]);
+        assert!(
+            matches!(parse_safe(&tar), Err(TarError::Name { .. })),
+            "{bad:?}"
+        );
+    }
+}
