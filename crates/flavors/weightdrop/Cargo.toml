@@ -1,0 +1,32 @@
+[package]
+name = "weightdrop"
+description = "Unpack model weights and datasets on GPU boxes with small disks. Built on trunc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "weightdrop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weightdrop"
+path = "src/main.rs"
+
+[dependencies]
+trunc-core.workspace = true
+trunc-engine.workspace = true
+trunc-fs.workspace = true
+trunc-legacy.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+trunc-testkit.workspace = true
+
+[lints]
+workspace = true

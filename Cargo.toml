@@ -14,6 +14,7 @@ members = [
     "crates/trunc-cli",
     "crates/trunc-testkit",
     "crates/flavors/layerless",
+    "crates/flavors/weightdrop",
 ]
 exclude = ["fuzz"]
 

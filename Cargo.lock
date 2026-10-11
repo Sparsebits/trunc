@@ -1311,6 +1311,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "weightdrop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tempfile",
+ "trunc-core",
+ "trunc-engine",
+ "trunc-fs",
+ "trunc-legacy",
+ "trunc-testkit",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
