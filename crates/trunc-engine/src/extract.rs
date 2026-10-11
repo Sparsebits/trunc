@@ -318,54 +318,94 @@ fn create_output(p: &Path, overwrite: bool) -> Result<File> {
             Err(e) => Err(e).ctx(at("creating", p)),
         };
     }
+    let not_regular = || {
+        Error::Refused(format!(
+            "{} exists and is not a regular file; not overwriting",
+            p.display()
+        ))
+    };
     if let Ok(md) = fs::symlink_metadata(p) {
-        if !overwrite {
-            return Err(Error::Refused(format!("{} already exists", p.display())));
-        }
         if !md.file_type().is_file() {
-            return Err(Error::Refused(format!(
-                "{} exists and is not a regular file; not overwriting",
-                p.display()
-            )));
+            return Err(not_regular());
         }
-        let mut perms = md.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            fs::set_permissions(p, perms).ctx(at("making writable", p))?;
+        if md.permissions().readonly() {
+            make_writable(p, &md)?;
         }
     }
-    let mut oo = OpenOptions::new();
-    oo.read(true).write(true);
-    if overwrite {
-        oo.create(true).truncate(true);
-    } else {
-        oo.create_new(true);
+    // Through the backend's open, which never follows a link as the final component (a link
+    // swapped in since the check above is refused, not truncated through).
+    match trunc_fs::OsFs::new().open_file(
+        p,
+        trunc_fs::OpenMode::CreateOrTruncate,
+        trunc_fs::Share::Shared,
+    ) {
+        Ok(f) => Ok(f),
+        Err(trunc_fs::FsError::Link { .. }) => Err(not_regular()),
+        Err(e) => Err(e.into()),
     }
-    oo.open(p).ctx(at("creating", p))
+}
+
+/// Clear the read-only state of an existing file to overwrite it, without following a link.
+#[cfg(unix)]
+fn make_writable(p: &Path, md: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use trunc_fs::FsBackend;
+    let mode = md.permissions().mode() | 0o222;
+    trunc_fs::OsFs::new().set_mode(p, mode)?;
+    Ok(())
+}
+
+/// Clear the read-only attribute of an existing file to overwrite it, through a handle on the
+/// file itself (never a link's target).
+#[cfg(not(unix))]
+fn make_writable(p: &Path, _md: &fs::Metadata) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let f = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(p)
+        .ctx(at("making writable", p))?;
+    let md = f.metadata().ctx(at("reading metadata of", p))?;
+    if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !md.is_file() {
+        return Err(Error::Refused(format!(
+            "{} exists and is not a regular file; not overwriting",
+            p.display()
+        )));
+    }
+    let mut perms = md.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    f.set_permissions(perms).ctx(at("making writable", p))
 }
 
 fn finish_file(f: &File, p: &Path, e: &trunc_core::Entry) -> Result<()> {
     f.set_modified(system_time(e.mtime_unix, e.mtime_nanos))
         .ctx(at("setting mtime of", p))?;
-    apply_mode(p, e.mode)
+    apply_mode(f, p, e.mode)
 }
 
+/// Through the open handle: a path could lead somewhere else by now.
 #[cfg(unix)]
-fn apply_mode(p: &Path, mode: u32) -> Result<()> {
+fn apply_mode(f: &File, p: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     // Never restore setuid/setgid/sticky bits from an archive.
-    fs::set_permissions(p, fs::Permissions::from_mode(mode & 0o777)).ctx(at("setting mode of", p))
+    f.set_permissions(fs::Permissions::from_mode(mode & 0o777))
+        .ctx(at("setting mode of", p))
 }
 
 #[cfg(not(unix))]
-fn apply_mode(p: &Path, mode: u32) -> Result<()> {
+fn apply_mode(f: &File, p: &Path, mode: u32) -> Result<()> {
     if mode & 0o222 == 0 {
-        let mut perms = fs::metadata(p)
+        let mut perms = f
+            .metadata()
             .ctx(at("reading metadata of", p))?
             .permissions();
         perms.set_readonly(true);
-        fs::set_permissions(p, perms).ctx(at("setting read-only", p))?;
+        f.set_permissions(perms).ctx(at("setting read-only", p))?;
     }
     Ok(())
 }

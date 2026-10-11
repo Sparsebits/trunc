@@ -21,6 +21,35 @@ impl OsFs {
     pub fn new() -> Self {
         OsFs
     }
+
+    /// [`FsBackend::open`] for callers that want a plain [`File`]: a link as the final component
+    /// is refused with [`FsError::Link`], and anything but a regular file is refused.
+    pub fn open_file(&self, path: &Path, mode: OpenMode, share: Share) -> Result<File> {
+        let _prof = trunc_prof::span("fs.open");
+        let file = self.open_unchecked(path, mode, share)?;
+        check_opened(&file, path, mode, share)?;
+        Ok(file)
+    }
+
+    fn open_unchecked(&self, path: &Path, mode: OpenMode, share: Share) -> Result<File> {
+        match open_options(mode, share).open(path) {
+            Ok(f) => Ok(f),
+            // Opening a directory junction as a file fails with a generic access error; report
+            // what is actually there.
+            Err(e) => {
+                if let Ok(Some(Meta {
+                    kind: NodeKind::Link,
+                    ..
+                })) = self.metadata(path)
+                {
+                    return Err(FsError::Link {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(FsError::from_io("opening", path, e))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +132,18 @@ fn finish_open(
     mode: OpenMode,
     share: Share,
 ) -> Result<Box<dyn FileHandle>> {
+    check_opened(&file, path, mode, share)?;
+    Ok(Box::new(OsFile {
+        file,
+        path: path.to_path_buf(),
+        #[cfg(windows)]
+        sparse: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(any(windows, target_os = "linux"))]
+        uncached: std::sync::Mutex::new(Uncached::Untried),
+    }))
+}
+
+fn check_opened(file: &File, path: &Path, mode: OpenMode, share: Share) -> Result<()> {
     let md = file.metadata().map_err(err("reading metadata of", path))?;
     #[cfg(windows)]
     {
@@ -122,7 +163,7 @@ fn finish_open(
     }
     #[cfg(target_os = "linux")]
     if share == Share::Exclusive
-        && !crate::linux::lock(&file, mode.writes()).map_err(err("locking", path))?
+        && !crate::linux::lock(file, mode.writes()).map_err(err("locking", path))?
     {
         return Err(FsError::Busy {
             path: path.to_path_buf(),
@@ -130,14 +171,7 @@ fn finish_open(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (mode, share);
-    Ok(Box::new(OsFile {
-        file,
-        path: path.to_path_buf(),
-        #[cfg(windows)]
-        sparse: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(any(windows, target_os = "linux"))]
-        uncached: std::sync::Mutex::new(Uncached::Untried),
-    }))
+    Ok(())
 }
 
 /// Errors from the confined Linux calls: EXDEV means the path tried to leave the root.
@@ -374,23 +408,7 @@ fn pin_dir(dir: &Path) -> Result<Pinned> {
 impl FsBackend for OsFs {
     fn open(&self, path: &Path, mode: OpenMode, share: Share) -> Result<Box<dyn FileHandle>> {
         let _prof = trunc_prof::span("fs.open");
-        let file = match open_options(mode, share).open(path) {
-            Ok(f) => f,
-            // Opening a directory junction as a file fails with a generic access error; report
-            // what is actually there.
-            Err(e) => {
-                if let Ok(Some(Meta {
-                    kind: NodeKind::Link,
-                    ..
-                })) = self.metadata(path)
-                {
-                    return Err(FsError::Link {
-                        path: path.to_path_buf(),
-                    });
-                }
-                return Err(FsError::from_io("opening", path, e));
-            }
-        };
+        let file = self.open_unchecked(path, mode, share)?;
         finish_open(file, path, mode, share)
     }
 

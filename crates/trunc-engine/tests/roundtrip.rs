@@ -367,6 +367,50 @@ fn existing_outputs_need_overwrite() {
     .unwrap();
 }
 
+/// `--overwrite` makes read-only outputs writable without going through a path that could be a
+/// link, and refuses (never truncates through) an output that was replaced by a symlink.
+#[test]
+fn overwrite_handles_read_only_outputs_and_links() {
+    fn first_file(dir: &Path) -> Option<PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        entries
+            .into_iter()
+            .find_map(|p| if p.is_dir() { first_file(&p) } else { Some(p) })
+    }
+    let (_d, src) = fixture(|r| fixtures::small_files(r, 5, 2));
+    let (w, arc) = make_archive(&src, &CreateOptions::default());
+    let a = Archive::open(&arc).unwrap();
+    let out = w.path().join("out");
+    extract::extract(&a, &out, &ExtractOptions::default()).unwrap();
+    let over = ExtractOptions {
+        overwrite: true,
+        ..Default::default()
+    };
+    let victim = first_file(&out).unwrap();
+    let mut perms = std::fs::metadata(&victim).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&victim, perms).unwrap();
+    extract::extract(&a, &out, &over).unwrap();
+    tree::assert_same(&src, &out.join("src"));
+
+    #[cfg(unix)]
+    {
+        let outside = w.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::fs::remove_file(&victim).unwrap();
+        std::os::unix::fs::symlink(&outside, &victim).unwrap();
+        assert!(matches!(
+            extract::extract(&a, &out, &over),
+            Err(Error::Refused(_))
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+}
+
 /// Hand-build an archive whose manifest names a path outside the destination.
 #[test]
 fn hostile_manifest_is_rejected_at_open() {
