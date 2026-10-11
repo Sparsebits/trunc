@@ -18,6 +18,8 @@ trunc-testkit = { path = "../crates/trunc-testkit" }
 bzip2 = "0.6"
 liblzma = { version = "0.4", features = ["static"] }
 zstd = { version = "0.13", default-features = false }
+# Reference DEFLATE encoder and decoder for the inflate differential target.
+flate2 = "1"
 
 [[bin]]
 name = "header"
@@ -78,6 +80,27 @@ bench = false
 [[bin]]
 name = "zstd"
 path = "fuzz_targets/zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate_diff"
+path = "fuzz_targets/inflate_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parallel_equiv"
+path = "fuzz_targets/parallel_equiv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resume_equiv"
+path = "fuzz_targets/resume_equiv.rs"
 test = false
 doc = false
 bench = false

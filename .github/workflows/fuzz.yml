@@ -11,7 +11,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [header, footer, manifest, zip, tar, inflate, bzip2, xz, zstd]
+        target:
+          [header, footer, manifest, zip, tar, inflate, inflate_diff, bzip2, xz, zstd, parallel_equiv, resume_equiv]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
