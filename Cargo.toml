@@ -23,7 +23,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/sparsebits/trunc"
+repository = "https://github.com/Sparsebits/trunc"
+homepage = "https://github.com/Sparsebits/trunc"
 publish = false
 
 [workspace.dependencies]

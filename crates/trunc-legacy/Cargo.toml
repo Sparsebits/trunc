@@ -1,6 +1,6 @@
 [package]
 name = "trunc-legacy"
-description = "Destructive extraction support for existing archive formats (ZIP first)."
+description = "Readers and resumable decoders for existing archive formats (ZIP, tar, ISO 9660, 7z; gzip, bzip2, xz, zstd) used by trunc."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

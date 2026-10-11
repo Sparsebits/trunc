@@ -208,8 +208,9 @@ cargo test --workspace
 ```
 
 The parsers are fuzzed with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). On Linux with
-a nightly toolchain, run `cargo +nightly fuzz run zip` (the targets are `zip`, `tar`,
-`inflate`, `bzip2`, `xz`, `zstd`, `manifest`, `header` and `footer`).
+a nightly toolchain, run `cargo +nightly fuzz run zip` from `fuzz/`; `cargo +nightly fuzz list`
+shows every target (archive parsers, decoders, and differential checks of parallel and resumed
+decoding).
 
 <details>
 <summary><b>Repository layout</b></summary>

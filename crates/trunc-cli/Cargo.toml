@@ -1,11 +1,15 @@
 [package]
 name = "trunc-cli"
-description = "The trunc command-line tool."
+description = "Extract archives bigger than your free space: trunc deletes the archive as it extracts, crash-safely."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["archive", "extract", "zip", "tar", "decompression"]
+categories = ["command-line-utilities", "compression", "filesystem"]
 publish.workspace = true
 
 [[bin]]
