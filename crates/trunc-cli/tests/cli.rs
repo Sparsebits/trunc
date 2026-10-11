@@ -718,3 +718,62 @@ fn profile_writes_a_trace_and_a_summary() {
     let out = trunc(&["verify", "a.tar.gz"], w);
     assert!(!String::from_utf8_lossy(&out.stderr).contains("profile:"));
 }
+
+#[test]
+fn container_images() {
+    use trunc_testkit::imagebuild::{self as ib, Compression};
+    use trunc_testkit::tarbuild::{self, Spec};
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let layers = vec![
+        ib::layer(
+            &[
+                Spec::file("etc/hostname", b"base"),
+                Spec::file("tmp/junk", b"junk"),
+            ],
+            Compression::Gzip,
+        ),
+        ib::layer(
+            &[
+                Spec::file("etc/hostname", b"top"),
+                Spec::file("tmp/.wh.junk", b""),
+                Spec::symlink("bin", "usr/bin"),
+            ],
+            Compression::Zstd,
+        ),
+    ];
+    let raw = ib::docker_archive(&[(&["demo/app:2"], "linux/amd64", layers)]);
+    std::fs::write(w.join("img.tar"), &raw).unwrap();
+    std::fs::write(w.join("img.tar.gz"), tarbuild::gzip(&raw, 6)).unwrap();
+
+    let s = ok(&trunc(&["inspect", "img.tar"], w));
+    assert!(s.contains("docker save image"), "{s}");
+    assert!(s.contains("demo/app:2"), "{s}");
+    assert!(s.contains("linux/amd64"), "{s}");
+    assert!(s.contains("zstd"), "{s}");
+
+    let s = ok(&trunc(&["inspect", "img.tar.gz", "--entries"], w));
+    assert!(s.contains("gzip-compressed"), "{s}");
+    assert!(s.contains("etc/hostname"), "{s}");
+    assert!(!s.contains("junk"), "{s}");
+
+    let s = ok(&trunc(&["verify", "img.tar"], w));
+    assert!(s.starts_with("ok:"), "{s}");
+
+    let s = ok(&trunc(&["x", "img.tar", "-C", "root"], w));
+    assert!(s.contains("symlinks  1 skipped"), "{s}");
+    assert_eq!(std::fs::read(w.join("root/etc/hostname")).unwrap(), b"top");
+    assert!(w.join("root/tmp").is_dir());
+    assert!(!w.join("root/tmp/junk").exists());
+
+    // Not repeated over an existing tree; never consumed.
+    assert!(!trunc(&["x", "img.tar", "-C", "root"], w).status.success());
+    let c = trunc(&["x", "img.tar", "-C", "other", "--consume", "--yes"], w);
+    assert!(!c.status.success());
+    assert!(String::from_utf8_lossy(&c.stderr).contains("not supported for container images"));
+    assert!(w.join("img.tar").exists());
+
+    // --raw still gives the outer tar of a compressed image.
+    ok(&trunc(&["x", "img.tar.gz", "--raw", "-C", "rawout"], w));
+    assert_eq!(std::fs::read(w.join("rawout/img.tar")).unwrap(), raw);
+}

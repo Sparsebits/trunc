@@ -37,6 +37,26 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(data).into()
 }
 
+/// Incremental SHA-256, for content addressed by others (container image digests).
+#[derive(Debug, Clone, Default)]
+pub struct Sha256Hasher(sha2::Sha256);
+
+impl Sha256Hasher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        use sha2::Digest as _;
+        self.0.update(data);
+    }
+
+    pub fn finalize(self) -> [u8; 32] {
+        use sha2::Digest as _;
+        self.0.finalize().into()
+    }
+}
+
 /// A writer adapter that BLAKE3-hashes everything written through it.
 #[derive(Debug)]
 pub struct HashSink<W> {
@@ -102,6 +122,15 @@ mod tests {
                 0xe4, 0x1f, 0x32, 0x62
             ]
         );
+    }
+
+    #[test]
+    fn sha256_incremental_matches_one_shot() {
+        let mut h = Sha256Hasher::new();
+        h.update(b"ab");
+        h.update(b"c");
+        assert_eq!(h.finalize(), sha256(b"abc"));
+        assert_eq!(sha256(b"abc")[..4], [0xba, 0x78, 0x16, 0xbf]);
     }
 
     #[test]

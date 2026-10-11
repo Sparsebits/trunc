@@ -17,6 +17,7 @@ use trunc_legacy::stream::Codec;
 
 mod consume_cmd;
 mod fmt;
+mod image_cmd;
 mod stream_cmd;
 mod zip_cmd;
 use fmt::{bytes, parse_size};
@@ -120,6 +121,8 @@ struct ExtractArgs {
     consume_flags: consume_cmd::ConsumeFlags,
     #[command(flatten)]
     stream: stream_cmd::StreamArgs,
+    #[command(flatten)]
+    image: image_cmd::ImageArgs,
     /// Replace existing files at destination paths.
     #[arg(long)]
     overwrite: bool,
@@ -161,6 +164,8 @@ struct InspectArgs {
     blocks: bool,
     #[command(flatten)]
     stream: stream_cmd::StreamArgs,
+    #[command(flatten)]
+    image: image_cmd::ImageArgs,
 }
 
 #[derive(Debug, Args)]
@@ -170,6 +175,8 @@ struct VerifyArgs {
     trust: TrustArgs,
     #[command(flatten)]
     stream: stream_cmd::StreamArgs,
+    #[command(flatten)]
+    image: image_cmd::ImageArgs,
     #[arg(long, default_value_t = 0)]
     threads: usize,
 }
@@ -334,6 +341,19 @@ fn create(a: CreateArgs) -> Result<ExitCode> {
 }
 
 fn extract(a: ExtractArgs) -> Result<ExitCode> {
+    if image_cmd::detect(&a.archive, &a.stream) {
+        image_cmd::refuse_flags(&a.trust.policy()?, a.allow_symlinks)?;
+        return image_cmd::extract(
+            &a.archive,
+            &a.dest,
+            a.consume,
+            a.overwrite,
+            a.consume_flags.ignore_space,
+            &a.image,
+            &a.stream,
+            a.threads,
+        );
+    }
     if a.consume {
         if a.overwrite || a.allow_symlinks {
             anyhow::bail!("--overwrite and --allow-symlinks are not supported with --consume");
@@ -478,6 +498,9 @@ fn signer_line(archive: &Archive) -> String {
 }
 
 fn inspect(a: InspectArgs) -> Result<ExitCode> {
+    if image_cmd::detect(&a.archive, &a.stream) {
+        return image_cmd::inspect(&a.archive, a.entries, &a.image, &a.stream);
+    }
     match Kind::detect(&a.archive, a.stream.raw) {
         Kind::Stream(..) => {
             return stream_cmd::inspect(&a.archive, a.entries, &a.stream.options());
@@ -571,6 +594,10 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
 }
 
 fn verify(a: VerifyArgs) -> Result<ExitCode> {
+    if image_cmd::detect(&a.archive, &a.stream) {
+        image_cmd::refuse_flags(&a.trust.policy()?, false)?;
+        return image_cmd::verify(&a.archive, &a.image, &a.stream, a.threads);
+    }
     let kind = Kind::detect(&a.archive, a.stream.raw);
     refuse_trust_flags(&a.trust.policy()?, kind)?;
     match kind {
@@ -625,6 +652,11 @@ fn fits(f: Option<bool>) -> &'static str {
 }
 
 fn plan(a: PlanArgs) -> Result<ExitCode> {
+    if image_cmd::detect(&a.archive, &a.stream) {
+        anyhow::bail!(
+            "plan does not support container images yet; `trunc inspect` shows the layer sizes"
+        );
+    }
     match Kind::detect(&a.archive, a.stream.raw) {
         Kind::Stream(..) => {
             return stream_cmd::plan(&a.archive, &a.dest, &a.stream.options());

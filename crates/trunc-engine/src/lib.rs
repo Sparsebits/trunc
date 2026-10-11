@@ -9,12 +9,16 @@
 //! - [`zipconsume`] does the same for existing ZIP archives (with optional punch mode).
 //! - [`streamconsume`] does the same for compressed tarballs and files (`.tar.gz`, `.tar.zst`,
 //!   `.xz`, ...), freeing compressed bytes as they are decoded.
+//! - [`image`] extracts container image tarballs (`docker save`, OCI archives) to their merged
+//!   root filesystem.
 
 pub mod archive;
 pub mod consume;
 pub mod error;
 pub mod extract;
+pub mod image;
 mod io;
+mod json;
 pub mod keys;
 pub mod preflight;
 pub mod producer;
