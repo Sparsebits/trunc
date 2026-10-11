@@ -6,12 +6,20 @@
 # Environment:
 #   TRUNC_VERSION       release tag to install, e.g. v0.1.0 (default: the latest release)
 #   TRUNC_INSTALL_DIR   where to put the binary (default: ~/.local/bin)
+#   TRUNC_VERIFY_ATTESTATION
+#                       check the download's signed build provenance with the GitHub CLI
+#                       (`gh attestation verify`, see docs/security.md): 1 = required,
+#                       0 = skip, auto (default) = only when gh is installed, and a warning
+#                       rather than a failure when it cannot verify (e.g. gh is not logged in)
+#
+# The SHA-256 checksum is always verified.
 set -eu
 
 repo=Sparsebits/trunc
 base=${TRUNC_DOWNLOAD_BASE:-https://github.com/$repo/releases}
 version=${TRUNC_VERSION:-latest}
 dir=${TRUNC_INSTALL_DIR:-$HOME/.local/bin}
+attest=${TRUNC_VERIFY_ATTESTATION:-auto}
 
 say() { printf 'trunc-install: %s\n' "$*"; }
 die() {
@@ -28,6 +36,10 @@ case "$(uname -m)" in
 x86_64 | amd64) arch=x86_64 ;;
 aarch64 | arm64) arch=aarch64 ;;
 *) die "unsupported CPU $(uname -m)" ;;
+esac
+case "$attest" in
+0 | 1 | auto) ;;
+*) die "TRUNC_VERIFY_ATTESTATION must be 0, 1 or auto, not '$attest'" ;;
 esac
 
 name="trunc-$arch-unknown-linux-musl"
@@ -62,6 +74,23 @@ else
     die "sha256sum or shasum is required to verify the download"
 fi
 [ "$expected" = "$actual" ] || die "checksum mismatch for $asset: expected $expected, got $actual"
+
+# Build provenance: a Sigstore attestation from the release workflow, checked by the GitHub CLI.
+if [ "$attest" != 0 ]; then
+    if command -v gh >/dev/null 2>&1; then
+        if out=$(gh attestation verify "$tmp/$asset" --repo "$repo" \
+            --signer-workflow "$repo/.github/workflows/release.yml" 2>&1); then
+            say "verified the build provenance of $asset"
+        elif [ "$attest" = 1 ]; then
+            printf '%s\n' "$out" >&2
+            die "could not verify the build provenance of $asset"
+        else
+            say "warning: gh could not verify the build provenance of $asset (not logged in, or no attestation for this release); relying on the checksum. Set TRUNC_VERIFY_ATTESTATION=1 to require it." >&2
+        fi
+    elif [ "$attest" = 1 ]; then
+        die "TRUNC_VERIFY_ATTESTATION=1 needs the GitHub CLI (gh): https://cli.github.com"
+    fi
+fi
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$dir"

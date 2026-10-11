@@ -49,3 +49,19 @@ How each rule from the design (plan section 7) is enforced, and the test that sh
 - **Linux advisory locking.** `flock` stops a second trunc, but other programs can still modify staged outputs, and such changes are not detected: a resumed run does not re-read output that was already made durable.
 - **Integrity is not authenticity.** An unsigned archive can be replaced wholesale. Use signatures and `--trust-key` when the source matters.
 - **Lying storage.** A drive that acknowledges flushes without persisting data defeats any ordering. `--verify-media` reads data back, bypassing the OS cache, before releasing source bytes; the drive's own cache may still answer.
+
+## Verifying downloads
+
+Every release lists the SHA-256 of each file in `SHA256SUMS` (and `<asset>.sha256`); `install.sh` and `install.ps1` always check it. Each target also has a CycloneDX SBOM, `trunc-<target>.cdx.json`, listing the crates compiled into that binary.
+
+Releases built while the repository is public also carry signed build provenance (Sigstore, via GitHub artifact attestations), which ties each file to the commit and the `release.yml` run that built it. Check it with the [GitHub CLI](https://cli.github.com):
+
+```sh
+gh attestation verify trunc-x86_64-unknown-linux-musl.tar.gz --repo Sparsebits/trunc \
+  --signer-workflow Sparsebits/trunc/.github/workflows/release.yml
+# the SBOM bound to that archive:
+gh attestation verify trunc-x86_64-unknown-linux-musl.tar.gz --repo Sparsebits/trunc \
+  --predicate-type https://cyclonedx.org/bom
+```
+
+The install scripts run the first check themselves when `gh` is installed, warning (not failing) if it cannot verify, for example when gh is not logged in. Set `TRUNC_VERIFY_ATTESTATION=1` to make the check required, or `0` to skip it.
