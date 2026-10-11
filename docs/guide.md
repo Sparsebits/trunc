@@ -1,16 +1,59 @@
 # trunc user guide
 
-`trunc` extracts archives while consuming them: as each piece is safely extracted, the archive shrinks by that piece. You need about *output size − archive size* of free space instead of the full output size. It works with its own `.trnc` format and with existing ZIP files, tarballs compressed with gzip, bzip2, xz or zstd, single compressed files, and archives split into parts.
+trunc extracts archives while consuming them: as each piece is safely extracted, the archive shrinks by that piece. You need about *output size − archive size* of free space instead of the full output size. It works with its own `.trnc` format and with existing ZIP files, tarballs compressed with gzip, bzip2, xz or zstd, single compressed files, and archives split into parts. It also extracts container images to their root filesystem.
 
 ## Quick start
 
 ```sh
-trunc plan big.trnc -C D:\out                 # how much space each mode needs, and any warnings
-trunc x big.trnc -C D:\out --consume          # extract, destroying the archive as it goes
-trunc resume big.trnc                          # after a crash, power cut, kill or pause
+trunc plan big.trnc -C ./out              # how much space each mode needs, and any warnings
+trunc x big.trnc -C ./out --consume       # extract, destroying the archive as it goes
+trunc resume big.trnc                     # after a crash, power cut, kill or pause
 ```
 
 `trunc x` without `--consume` is an ordinary extraction that leaves the archive alone.
+
+## Commands and options
+
+| Command | What it does |
+|---|---|
+| `trunc create OUT INPUT...` | Pack files and directories into a `.trnc` archive |
+| `trunc extract ARCHIVE`, or `trunc x` | Extract an archive; destructive only with `--consume` |
+| `trunc resume ARCHIVE` | Continue an interrupted or paused consume |
+| `trunc inspect ARCHIVE` | Show the header, a summary of the contents and the space needed; `--entries` and `--blocks` list them |
+| `trunc verify ARCHIVE` | Check every hash without extracting |
+| `trunc plan ARCHIVE` | Report how much free space extracting and consuming need |
+| `trunc key gen FILE` | Generate a signing key and print its public key |
+| `trunc key show FILE` | Print the public key of a secret key file |
+
+Options for `trunc x`. `resume` takes the same options for consuming, `plan` takes `-C`, `--batch`, `--raw` and `--max-window`, and `verify` takes the trust, stream, image and `--threads` options.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-C`, `--dest DIR` | `.` | Destination folder. For `resume`, the one recorded when the consume started |
+| `--consume` | | Free the archive as files are extracted. The archive is gone afterwards |
+| `-y`, `--yes` | | Don't ask for confirmation before destroying the archive |
+| `--verify-media` | | Read extracted data back from the disk, bypassing the OS cache, before releasing the source |
+| `--batch SIZE` | `256M` | `.trnc`: output per batch, one flush and one truncation each. Smaller needs less space and flushes more often |
+| `--checkpoint-every SIZE` | `64M` | ZIP and compressed archives: output between checkpoints that free compressed data |
+| `--punch-min SIZE` | `256M` | ZIP: compressed size from which entries are punched while they decompress |
+| `--no-punch` | | ZIP: never free space inside an entry |
+| `--allow-overlap` | | ZIP: accept archives whose entries overlap |
+| `--allow-sync` | | Consume an archive inside a cloud-synced folder |
+| `--allow-unjournaled` | | Consume on a filesystem without a journal (FAT32, exFAT) or one trunc cannot identify |
+| `--ignore-space` | | Start even if the free-space check says it will not fit |
+| `--no-receipt` | | `.trnc`: delete the archive at the end instead of keeping `<archive>.receipt` |
+| `--raw` | | Compressed tarballs: decompress into one `.tar` file instead of unpacking it |
+| `--max-window SIZE` | `256M` | xz and zstd: refuse streams whose decoder would need more memory than this |
+| `--image NAME` | | Container images: which image to use, by tag or reference name |
+| `--platform OS/ARCH` | | Container images: which platform to use, as `OS/ARCH` or `OS/ARCH/VARIANT` |
+| `--overwrite` | | Replace existing files at the destination. Not with `--consume` |
+| `--allow-symlinks` | | `.trnc`: create symlink entries that resolve inside the destination. Not with `--consume` |
+| `--require-signed` | | `.trnc`: refuse unsigned archives |
+| `--trust-key HEX` | | `.trnc`: accept only archives signed by this public key. Repeatable |
+| `--threads N` | `0` (all cores) | `.trnc`: decode threads |
+| `--profile FILE` | | Any command: record where the time goes (see [Performance and profiling](#performance-and-profiling)) |
+
+Sizes take a suffix such as `4M` or `1G`. Run `trunc <command> --help` for the full list.
 
 ## Supported formats
 
@@ -23,21 +66,24 @@ trunc resume big.trnc                          # after a crash, power cut, kill 
 | `.tar.xz`, `.xz` | yes | yes | From the front, every 64 MiB, at the next LZMA2 chunk. Files with several blocks per stream (`xz -T0`): at the next block | `<archive>.trncj`, plus the decoder window read back from the output |
 | `.tar.zst`, `.zst` | yes | yes | From the front, every 64 MiB, at the next zstd block. Frames that declare their size, in files of several frames (`pzstd`): at the end of the frame | `<archive>.trncj`, plus the decoder window read back from the output |
 | Compressed tarball or file split into `.001` or `.aa` parts | yes | yes | As above, and each part is deleted once its data is safely extracted | `<archive>.trncj` |
-| ZIP or `.trnc` split into parts | yes | no | | |
+| ZIP or `.trnc` split into parts | yes | no | — | — |
+| Container images: `docker save` and OCI archives, plain or compressed | yes | no | — | — |
 
 Freeing from the end shrinks the file, which works on every filesystem. Freeing from the front, and punch mode inside ZIP entries, release space inside a file, which needs NTFS, ext4, XFS, btrfs or ZFS. On other filesystems, compressed archives still consume safely but give their space back only at the end, and a large ZIP entry only once it is finished. Deleting split parts works everywhere.
 
-Every format resumes with `trunc resume <archive>` or by running the same command again.
+Every format that can be consumed resumes with `trunc resume <archive>` or by running the same command again.
 
 ## Creating archives
 
 ```sh
-trunc create data.trnc ./folder ./file.txt    # zstd level 9, 8 MiB blocks
-trunc create data.trnc ./folder --codec lz4   # faster, larger
-trunc create data.trnc ./folder --dict train  # helps with many small similar files
-trunc key gen me.key                           # once
-trunc create data.trnc ./folder --sign me.key  # recipients can check it came from you
+trunc create data.trnc ./folder ./file.txt      # zstd level 9, 8 MiB blocks
+trunc create data.trnc ./folder --codec lz4     # faster, larger
+trunc create data.trnc ./folder --dict train    # helps with many small similar files
+trunc key gen me.key                            # once
+trunc create data.trnc ./folder --sign me.key   # recipients can check it came from you
 ```
+
+`--codec` takes `store`, `lz4`, `zstd` or `zstd:LEVEL` (from -7 to 22). `--dict` takes `train`, to train a zstd dictionary from the inputs, or the path of a dictionary file. `--force` replaces an existing output file.
 
 Smaller blocks (`--block-size 4M`) mean less extra space during `--consume`; larger blocks compress slightly better.
 
@@ -45,35 +91,55 @@ Smaller blocks (`--block-size 4M`) mean less extra space during `--consume`; lar
 
 - **Nothing is lost if it is interrupted.** Every byte is always either still in the archive or safely written at the destination. Run the same command again, or `trunc resume <archive>`, to continue. This is tested by crashing it at every single filesystem operation, under models where unflushed writes are lost or survive in any order.
 - **Nothing is destroyed until it has been verified and made durable.** Each piece's hash (or ZIP CRC) is checked before its source is released; compressed tarballs and files are decompressed and checked in full before anything is written. The output is flushed to disk, and only then is the source released.
-- **Files appear all at once at the end.** Output goes into a hidden `.trunc-stage-…` folder inside the destination and is moved into place when everything is done. Existing files at the destination are never overwritten. `--consume` refuses to start if a top-level name already exists.
+- **Files appear all at once at the end.** Output goes into a hidden staging folder, `.trunc-stage-…`, inside the destination and is moved into place when everything is done. Existing files at the destination are never overwritten: `--consume` refuses to start if a top-level name already exists.
 - **It stops safely when it can't continue.** If the disk fills up, or another program keeps the archive open, it pauses (exit code 75). Free some space or close the program, then resume.
-- **It tells you before risky situations.** It refuses to run on an archive inside a cloud-synced folder (the sync client could upload every truncation and replace your cloud copy), on FAT32/exFAT, which have no journal, or on a filesystem it cannot identify (network shares, FUSE, WSL's view of Windows drives). Override with `--allow-sync` or `--allow-unjournaled` if you are sure.
+- **It warns you about risky situations.** It refuses to run on an archive inside a cloud-synced folder (the sync client could upload every truncation and replace your cloud copy), on FAT32 or exFAT, which have no journal, or on a filesystem it cannot identify (network shares, FUSE, WSL's view of Windows drives). Override with `--allow-sync` or `--allow-unjournaled` if you are sure.
 
 ## What it does not promise
 
 - **The archive is gone afterwards.** For `.trnc`, a small `<archive>.receipt` (header and signed manifest) is kept unless you pass `--no-receipt`. For ZIP and compressed archives, nothing remains, and other tools cannot open the file once the first step has run.
 - **Space figures are upper bounds, not exact predictions.** Other programs writing to the same disk, filesystem compression and quotas are outside its view.
-- **Snapshots defeat it.** With System Restore / Volume Shadow Copies, Time Machine local snapshots, or btrfs/ZFS snapshots, truncated data stays allocated and no space is freed. `trunc plan` says when it could not check.
+- **Snapshots defeat it.** With System Restore (Volume Shadow Copies), Time Machine local snapshots, or btrfs and ZFS snapshots, truncated data stays allocated and no space is freed. `trunc plan` says when it could not check.
 - **Drives that ignore flush commands** (some cheap USB sticks and SD cards) can lose data on power loss no matter what software does. `--verify-media` reads extracted data back from disk, bypassing the OS cache, before releasing the source. It catches many such problems, at the cost of one extra read.
-- **It is designed for one machine and one user.** Don't extract destructively into a folder that other people can write to.
+- **It is designed for one machine and one user.** Don't consume an archive into a folder that other people can write to.
 
 ## ZIP files
 
-`trunc x file.zip -C out --consume` handles Stored and Deflate entries, Zip64, self-extracting archives and names in UTF-8 or the old DOS code page. Encrypted archives, other compression methods and spanned archives (`.z01`, `.z02`, …) are refused; parts cut by `split` or 7-Zip (`.001`) are read as one file (see [Split archives](#split-archives)).
+`trunc x file.zip -C out --consume` handles Stored and Deflate entries, Zip64, data descriptors, self-extracting archives, and names in UTF-8 or the old DOS code page. Encrypted archives, other compression methods and spanned archives (`.z01`, `.z02`, …) are refused; parts cut by `split` or 7-Zip (`.001`) are read as one file (see [Split archives](#split-archives)).
 
-For ZIPs containing a few very large files, **punch mode** frees space *inside* each large entry as it decompresses, on NTFS and other filesystems that support sparse files. It applies to entries whose compressed size is at least `--punch-min` (default 256 MiB). Each such entry is fully verified once before any of it is freed. `--no-punch` turns it off.
+ZIP files weren't designed to be taken apart from the end, so trunc does more work before it deletes anything:
+
+1. It reads the ZIP's index and checks every entry against it. It refuses archives whose entries overlap, a trick used by zip bombs, unless you pass `--allow-overlap`.
+2. It decompresses every entry once and checks its CRC.
+3. It saves the ZIP's layout to a small journal next to the archive (`<archive>.trncj`). The index lives at the end of the ZIP, so it is the first thing to go.
+4. It extracts entries from the end of the file to the start, shrinking the archive after each group of entries.
+
+From the first deletion on, other tools can no longer open the ZIP. trunc tells you this before it starts.
+
+### Punch mode
+
+A single 50 GB entry would normally need 50 GB of headroom, because the archive can't shrink until that entry is finished. **Punch mode** avoids this by freeing space *inside* the entry while it decompresses. It applies to entries whose compressed size is at least `--punch-min` (default 256 MiB). trunc decompresses such an entry with its own Deflate decoder, which can save its position: every 64 MiB of output, it saves its position in the journal and releases the compressed bytes it has already read. The file keeps its size, but those bytes stop taking up disk space.
+
+Each punched entry is fully verified once before any of it is freed. Punch mode needs a filesystem that supports sparse files (NTFS, ext4, XFS, btrfs, ZFS). `--no-punch` turns it off.
 
 ## Compressed tarballs and files
 
-`trunc x file.tar.gz -C out --consume` handles tar archives compressed with gzip, bzip2, xz or zstd (`.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`), from GNU tar, bsdtar, Python and most other writers: ustar, GNU long names, PAX headers, files over 8 GiB, several gzip members, bzip2 streams, xz streams or zstd frames back to back, and xz streams of many blocks (files from `pigz`, `pbzip2`, `pzstd`, `xz -T0` and `zstd --long` all work). The format is recognised from the content, not the name. Symlinks and device entries are skipped. Hard links, sparse files and multi-volume archives are refused for now.
+`trunc x file.tar.gz -C out --consume` handles tar archives compressed with gzip, bzip2, xz or zstd (`.tar.gz` or `.tgz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`), from GNU tar, bsdtar, Python and most other writers: ustar, GNU long names, PAX headers, files over 8 GiB, several gzip members, bzip2 streams, xz streams or zstd frames back to back, and xz streams of many blocks (files from `pigz`, `pbzip2`, `pzstd`, `xz -T0` and `zstd --long` all work). The format is recognized from the content, not the name. Symlinks and device entries are skipped. Hard links, sparse files and multi-volume archives are refused for now.
+
+A compressed stream can only be decoded from the start, so trunc frees space from the front of the archive, in two passes:
+
+1. It decompresses the whole archive once, writing nothing (the *scan*). This checks every checksum and tar header, validates every file name, and records a hash of each 64 MiB stretch of output.
+2. It decompresses again, this time writing files. Every 64 MiB of output (`--checkpoint-every`), it flushes the files, checks that the stretch it just wrote hashes the same as in the first pass, saves its position in a small journal, and releases the compressed bytes it has used.
+
+The file keeps its size, but the released bytes stop taking up disk space. That needs a filesystem that can free space inside a file (NTFS, ext4, XFS, btrfs, ZFS). Elsewhere `--consume` still works, but needs as much space as a normal extraction.
+
+Saving a position means saving the decompressor's state, which off-the-shelf libraries don't allow, so trunc has its own decoders for all four formats. They are tested and fuzzed against the reference implementations.
+
+xz and zstd decoders look back up to 8–128 MiB. When a consume resumes, trunc reads that window back from the files it has already written, plus a small gap log (`<archive>.trncg`) holding the tar headers, so the journal stays small. `--max-window` (default 256M) refuses archives that would need more memory than that.
+
+The first pass means the archive is decompressed twice. `trunc plan`, `inspect` and `verify` make the same pass, since compressed streams record no reliable sizes. Both passes use every core where the file allows it (see [Parallel decoding](#parallel-decoding)).
 
 A compressed file that is not a tar archive (`disk.img.xz`, `dump.sql.gz`) is decompressed into one file named without the suffix, in the destination: `trunc x disk.img.xz --consume` leaves `disk.img`. `.tgz`, `.txz` and the other short forms become `.tar`; a name without a known suffix gets `.out` added. `--raw` does the same for a tarball, so `trunc x big.tar.zst --raw --consume` turns it into `big.tar` in place.
-
-A compressed stream can only be decoded from the start, so trunc frees space from the front of the archive. It first decompresses the whole archive once to check every checksum and tar header, without writing anything. Then it extracts, and every 64 MiB of output (`--checkpoint-every`) it confirms the output matches that first pass, saves its position in a small journal, and frees the compressed bytes already used. The file keeps its size, but those bytes stop taking up disk space. That needs a filesystem that can free space inside a file (NTFS, ext4, XFS, btrfs, ZFS). Elsewhere `--consume` still works, but needs as much space as a normal extraction.
-
-xz and zstd decoders look back up to 8-128 MiB. When a consume resumes, trunc reads that window back from the files it has already written, plus a small sidecar (`<archive>.trncg`) holding the tar headers, so the journal stays small. `--max-window` (default 256M) refuses archives that would need more memory than that.
-
-The scan means the archive is decompressed twice. `trunc plan`, `inspect` and `verify` scan it too, since compressed streams record no reliable sizes. Both passes use every core where the file allows it (see [Parallel decoding](#parallel-decoding)).
 
 Signatures apply only to `.trnc` archives: `--require-signed` and `--trust-key` are refused for ZIP and compressed files rather than ignored.
 
@@ -81,11 +147,30 @@ Signatures apply only to `.trnc` archives: `--require-signed` and `--trust-key` 
 
 Pass the first part of a split archive (`big.tar.zst.001` or `big.tar.zst.aa`) and trunc reads the parts as one file: `x`, `inspect`, `verify` and `plan` work for every format. Naming a later part is an error that points at the first.
 
-With `--consume`, compressed tarballs and files delete each part as soon as its data is safely extracted. This frees space on any filesystem, FAT32 and exFAT included (which still need `--allow-unjournaled`). Split ZIP and `.trnc` archives can be extracted but not consumed yet.
+With `--consume`, compressed tarballs and files delete each part as soon as its data is safely extracted. This frees space on any filesystem, even on a USB stick formatted FAT32 or exFAT (which still needs `--allow-unjournaled`). Split ZIP and `.trnc` archives can be extracted but not consumed yet.
+
+## Container images
+
+```sh
+trunc x image.tar -C ./rootfs                                    # docker save, or skopeo copy … oci-archive:
+trunc x images.tar.zst -C ./rootfs --image app:1.4 --platform linux/arm64
+trunc inspect image.tar --entries                                # layers and their sizes, and the merged files
+trunc verify image.tar                                           # check every blob and layer digest
+```
+
+A tarball written by `docker save` or by `skopeo copy … oci-archive:` holds the image's metadata and one blob per layer. Extracting it as an ordinary tarball would give you those blobs; `trunc x` gives you the image's root filesystem instead: the layers applied in order, the files `docker export` of a container would give, without a container runtime. The outer tar may be plain or compressed with gzip, bzip2, xz or zstd, and layers may be plain or compressed with gzip or zstd. trunc recognizes an image from its content. `--raw` turns this off, so a compressed image can still be decompressed into its outer `.tar`.
+
+- **Choosing an image.** When the archive holds several images or platforms, `--image NAME` picks one by tag (`name:tag`) or OCI reference name, and `--platform OS/ARCH[/VARIANT]` by platform. Otherwise trunc uses the only one, or the one for this computer's architecture; anything still ambiguous is refused with a list of what is there.
+- **Everything is checked by digest.** Metadata and layer blobs are checked against the digests recorded for them, and every decoded layer against the image config's `diff_ids`, once while merging and again while writing. Only `sha256` digests are accepted, and encrypted layers are refused.
+- **Nothing is written twice or deleted.** trunc decodes every layer once to merge them, resolving deletions (whiteouts) and replacements in memory, and then again to write only the files that survive into a staging folder, which is moved into place at the end. A file that a later layer deletes or replaces is never written.
+- **The result is not a complete runtime root.** As for tarballs, symlinks, device nodes and FIFOs are not created (they are counted and reported), so images with a merged `/usr` lose `/bin`, `/lib` and the like. Ownership, directory modes and directory times are not applied, and hard links are refused. On Windows, Linux names that Windows cannot hold make the image refused (see [Names on Linux and macOS](#names-on-linux-and-macos)).
+- **Space.** You need room for the merged root filesystem. A compressed image is first decompressed into a temporary file (in the destination for `x`, next to the archive for `inspect` and `verify`), which is removed afterwards.
+
+`--consume` is refused for images. A later layer can delete or replace anything an earlier one added, so no layer can be freed until every layer after it is applied, and consuming would save no space over extracting and then deleting the archive. `--overwrite`, `--allow-symlinks`, `--require-signed` and `--trust-key` are refused too. `trunc plan` does not support images yet; `trunc inspect` shows the layer sizes.
 
 ## Names on Linux and macOS
 
-`.trnc` archives only hold names that work on Windows, macOS and Linux. Archives from other tools often don't: Linux tarballs contain names with backslashes or colons, and source trees have files that differ only in case (`Makefile` and `makefile`). For tar, ZIP and single compressed files, trunc follows the computer it runs on:
+`.trnc` archives only hold names that work on Windows, macOS and Linux. Archives from other tools often don't: Linux tarballs contain names with backslashes or colons, and source trees have files that differ only in case (`Makefile` and `makefile`). For tar, ZIP, single compressed files and container images, trunc follows the computer it runs on:
 
 - On Linux and macOS, names that only Windows forbids are accepted: `\`, `:`, `<>"|?*`, trailing dots or spaces, and device names like `CON`.
 - On Linux, names that differ only in case are separate files. macOS compares names without case, like Windows, so there the second one is refused.
@@ -111,11 +196,11 @@ What this means for space and memory:
 
 - **Space comes back a whole block or frame at a time.** An xz block or zstd frame decoded in parallel is decoded whole, so checkpoints fall only between them, and one larger than 64 MiB gives its space back only when it ends. `xz -T0` blocks are three times the dictionary size: 24 MiB at the default level, 192 MiB at `-9`. zstd frames are at most 128 MiB. If any block in an xz stream produces more than 256 MiB, that stream decodes on one core in the usual 64 MiB steps. `trunc plan` already counts all of this.
 - **Up to about 512 MiB of memory** holds parts decoded ahead and not yet written.
-- **The core count changes nothing else.** Which parts are decoded whole depends only on the file, so the scan, the consume and a resume on another computer stop at the same checkpoints.
+- **The core count changes nothing else.** Which parts are decoded whole depends only on the file, so the first pass, the consume and a resume on another computer stop at the same checkpoints.
 
 ## Performance and profiling
 
-`--profile FILE` (any command, or `TRUNC_PROFILE=FILE`) records where a run spends its time. When the command finishes, trunc prints a summary to stderr and writes a Chrome trace to `FILE`. `--profile -` prints the summary without writing a file. Profiling is off unless asked for; each span then costs one atomic read.
+`--profile FILE` (any command, or `TRUNC_PROFILE=FILE`) records where a run spends its time. When the command finishes, trunc prints a summary to stderr and writes a Chrome trace to `FILE`. `--profile -` prints the summary without writing a file. Profiling is off unless you ask for it; each span then costs one atomic read.
 
 ```console
 $ trunc --profile run.json x big.tar.zst -C out --consume --yes
@@ -158,7 +243,7 @@ Self time is where the time went; total time is what a phase cost. In the exampl
 
 Self times on different threads add up, so they can exceed the wall time. Flushes run on many threads at once: `fs.flush` shows 4.62 s of self time in a 3.71 s run, and the main thread's wait for them is the 356 ms total of `fs.flush_all`. Decoders working ahead (see [Parallel decoding](#parallel-decoding)), `.trnc` decoding and `create` also run on worker threads.
 
-*Hot paths* list the 15 call paths with the most self time, which shows who made the slow calls. The two `zstd.sequences` paths above split the decoder's time between the scan and the consume pass. A path starts at the outermost span on its own thread, so work done on worker threads has no parent: `fs.flush` here, and `fs.open`, because outputs are opened ahead of their data.
+*Hot paths* lists the 15 call paths with the most self time, which shows who made the slow calls. The two `zstd.sequences` paths above split the decoder's time between the first pass and the consume pass. A path starts at the outermost span on its own thread, so work done on worker threads has no parent: `fs.flush` here, and `fs.open`, because outputs are opened ahead of their data.
 
 Some patterns to look for:
 
@@ -191,12 +276,12 @@ Spans are named by layer:
 | `xz.chunk`, `xz.check` | one LZMA2 chunk; the block's CRC or SHA-256 check |
 | `zstd.frame_scan` | finding frames that declare their size, so they can decode in parallel |
 | `zstd.block`, `zstd.literals`, `zstd.sequences`, `zstd.checksum` | one zstd block, its literals and sequences sections, and the frame's XXH64 checksum |
-| `tar.parse` | reading tar headers during the scan |
+| `tar.parse` | reading tar headers during the first pass |
 | `stream.scan` | the read-only first pass over a compressed tarball or file |
-| `stream.consume` | a whole consume of a compressed tarball or file, scan included |
-| `stream.extract` | a whole extraction without `--consume`, scan included |
+| `stream.consume` | a whole consume of a compressed tarball or file, first pass included |
+| `stream.extract` | a whole extraction without `--consume`, first pass included |
 | `stream.route` | splitting decoded output into files |
-| `stream.checkpoint` | one checkpoint: `stream.flush_outputs` (flush the outputs and the gap log), `stream.verify_interval` (compare the content hash with the scan's), then `stream.free` (release compressed bytes, or delete finished parts) |
+| `stream.checkpoint` | one checkpoint: `stream.flush_outputs` (flush the outputs and the gap log), `stream.verify_interval` (compare the content hash with the first pass's), then `stream.free` (release compressed bytes, or delete finished parts) |
 | `stream.restore_window` | reading the decoder window back from the output on resume |
 | `stream.finish` | removing the archive, journal and gap log at the end |
 | `stage.build`, `stage.rename` | building the staging tree, and moving it into place |
