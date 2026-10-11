@@ -511,3 +511,217 @@ impl Lzma2 {
         self.win = window;
     }
 }
+
+// Raw LZMA (LZMA1), as 7z stores it. Additive: it reuses the range coder and the match, length
+// and distance code above, and keeps its own copy of the symbol loop so the LZMA2 path is
+// untouched.
+
+/// Input bytes kept ahead of the range coder: one LZMA symbol reads at most 48 bits, each of
+/// which normalizes at most once, so a symbol never reads further than this.
+pub(crate) const LZMA1_LOOKAHEAD: usize = 64;
+
+/// A raw LZMA stream: 5 property bytes (lc/lp/pb, dictionary size), one range-coded stream and a
+/// known output size, optionally followed by an end marker. The input is fed in pieces; output
+/// collects in `lz.win[lz.flushed..]` as with [`Lzma2`].
+pub(crate) struct Lzma1 {
+    pub(crate) lz: Lzma2,
+    range: u32,
+    code: u32,
+    started: bool,
+    /// The end marker was seen (no output may follow).
+    marker: bool,
+}
+
+impl std::fmt::Debug for Lzma1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lzma1")
+            .field("lz", &self.lz)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Lzma1 {
+    /// The dictionary size the properties declare (the caller checks it against its limit).
+    pub(crate) fn dict_size(props: &[u8]) -> Option<u32> {
+        Some(u32::from_le_bytes(props.get(1..5)?.try_into().ok()?))
+    }
+
+    pub(crate) fn new(props: &[u8]) -> stream::Result<Self> {
+        let (Some(&b), Some(dict)) = (props.first(), Self::dict_size(props)) else {
+            return Err(StreamError::Corrupt("LZMA properties too short".into()));
+        };
+        if props.len() != 5 || b >= 9 * 5 * 5 {
+            return Err(StreamError::Corrupt("bad LZMA properties".into()));
+        }
+        // Unlike LZMA2, LZMA1 allows lc + lp > 4 (up to 12: a 6 MiB probability table).
+        let mut lz = Lzma2::new(dict.max(4096));
+        let b = u32::from(b);
+        lz.lc = b % 9;
+        lz.lp = (b / 9) % 5;
+        lz.pb = b / 45;
+        lz.need_props = false;
+        lz.need_dict_reset = false;
+        lz.reset_state();
+        Ok(Self {
+            lz,
+            range: u32::MAX,
+            code: 0,
+            started: false,
+            marker: false,
+        })
+    }
+
+    /// Whether the end marker has been decoded.
+    pub(crate) fn saw_marker(&self) -> bool {
+        self.marker
+    }
+
+    /// Decode from `data` (the unread input; `last` if nothing follows it) until `want` more
+    /// bytes are produced, the end marker is met, or the input runs low. `left` is how much
+    /// output the stream may still produce in total; once that is reached only an end marker
+    /// (or the end of the input) may follow. Returns the input bytes consumed.
+    pub(crate) fn step(
+        &mut self,
+        data: &[u8],
+        last: bool,
+        want: usize,
+        left: u64,
+    ) -> stream::Result<usize> {
+        let mut rc = if self.started {
+            Rc {
+                data,
+                ip: 0,
+                range: self.range,
+                code: self.code,
+                overrun: false,
+            }
+        } else {
+            if data.len() < 5 && !last {
+                return Ok(0);
+            }
+            self.started = true;
+            Rc::new(data).map_err(|_| StreamError::Corrupt("bad LZMA stream start".into()))?
+        };
+        let start = self.lz.win.len();
+        let end = start + usize::try_from(left.min(want as u64)).expect("<= want");
+        let limit = start as u64 + left;
+        while !self.marker && (last || data.len().saturating_sub(rc.ip) >= LZMA1_LOOKAHEAD) {
+            if self.lz.win.len() >= end {
+                if self.lz.win.len() as u64 != limit {
+                    break;
+                }
+                // All output is here: the stream ends now, or an end marker follows.
+                rc.normalize();
+                if rc.ip >= data.len() {
+                    break;
+                }
+            }
+            self.symbol(&mut rc, limit)?;
+        }
+        if rc.overrun {
+            return Err(StreamError::Corrupt("truncated LZMA data".into()));
+        }
+        self.range = rc.range;
+        self.code = rc.code;
+        Ok(rc.ip)
+    }
+
+    /// Decode one symbol (literal, match, rep or end marker). `limit` caps `win.len()`.
+    fn symbol(&mut self, rc: &mut Rc<'_>, limit: u64) -> stream::Result<()> {
+        let lz = &mut self.lz;
+        let pb_mask = (1u64 << lz.pb) - 1;
+        let lp_mask = (1u64 << lz.lp) - 1;
+        let lc = lz.lc;
+        let dict = u64::from(lz.dict_size);
+        let room = limit - lz.win.len() as u64;
+        let after_end = || StreamError::Corrupt("LZMA data continues past its size".into());
+        let pos_state = (lz.pos & pb_mask) as usize;
+        let s = lz.state;
+        if rc.bit(&mut lz.probs[IS_MATCH + s * 16 + pos_state]) == 0 {
+            if room == 0 {
+                return Err(after_end());
+            }
+            let prev = if lz.pos > 0 {
+                u32::from(*lz.win.last().expect("pos > 0"))
+            } else {
+                0
+            };
+            let base = LITERAL
+                + 0x300 * ((((lz.pos & lp_mask) as usize) << lc) + (prev >> (8 - lc)) as usize);
+            let probs = &mut lz.probs[base..base + 0x300];
+            let mut sym = 1usize;
+            if s >= 7 {
+                let d = lz.reps[0] as usize + 1;
+                if d > lz.win.len() || d as u64 > lz.pos {
+                    return Err(corrupt("distance too far back"));
+                }
+                let mut mb = u32::from(lz.win[lz.win.len() - d]);
+                loop {
+                    let mbit = ((mb >> 7) & 1) as usize;
+                    mb <<= 1;
+                    let b = rc.bit(&mut probs[((1 + mbit) << 8) + sym]) as usize;
+                    sym = (sym << 1) | b;
+                    if mbit != b || sym >= 0x100 {
+                        break;
+                    }
+                }
+            }
+            while sym < 0x100 {
+                sym = (sym << 1) | rc.bit(&mut probs[sym]) as usize;
+            }
+            lz.win.push(sym as u8);
+            lz.pos += 1;
+            lz.state = if s < 4 {
+                0
+            } else if s < 10 {
+                s - 3
+            } else {
+                s - 6
+            };
+            return Ok(());
+        }
+        let len;
+        if rc.bit(&mut lz.probs[IS_REP + s]) == 0 {
+            len = lz.length(rc, LEN, pos_state);
+            lz.state = if s < 7 { 7 } else { 10 };
+            let dist = lz.distance(rc, len);
+            if dist == u32::MAX {
+                self.marker = true;
+                return Ok(());
+            }
+            lz.reps = [dist, lz.reps[0], lz.reps[1], lz.reps[2]];
+        } else if rc.bit(&mut lz.probs[IS_REP_G0 + s]) == 0 {
+            if rc.bit(&mut lz.probs[IS_REP0_LONG + s * 16 + pos_state]) == 0 {
+                if room == 0 {
+                    return Err(after_end());
+                }
+                lz.state = if s < 7 { 9 } else { 11 };
+                return lz.copy(1, dict);
+            }
+            len = lz.length(rc, REP_LEN, pos_state);
+            lz.state = if s < 7 { 8 } else { 11 };
+        } else {
+            let d;
+            if rc.bit(&mut lz.probs[IS_REP_G1 + s]) == 0 {
+                d = lz.reps[1];
+            } else {
+                if rc.bit(&mut lz.probs[IS_REP_G2 + s]) == 0 {
+                    d = lz.reps[2];
+                } else {
+                    d = lz.reps[3];
+                    lz.reps[3] = lz.reps[2];
+                }
+                lz.reps[2] = lz.reps[1];
+            }
+            lz.reps[1] = lz.reps[0];
+            lz.reps[0] = d;
+            len = lz.length(rc, REP_LEN, pos_state);
+            lz.state = if s < 7 { 8 } else { 11 };
+        }
+        let n = len as usize + 2;
+        if n as u64 > room {
+            return Err(after_end());
+        }
+        lz.copy(n, dict)
+    }
+}
