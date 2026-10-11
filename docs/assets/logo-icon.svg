@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" role="img" aria-label="trunc">
+  <!-- App icon / favicon: the mark in ink on an orange square. -->
+  <rect width="40" height="40" fill="#ff5b35"/>
+  <g fill="#080808">
+    <rect x="8" y="11" width="24" height="7"/>
+    <rect x="8" y="22" width="5" height="7"/>
+    <rect x="14.33" y="22" width="5" height="7"/>
+    <rect x="20.67" y="22" width="5" height="7"/>
+    <rect x="27" y="22" width="5" height="7"/>
+  </g>
+</svg>

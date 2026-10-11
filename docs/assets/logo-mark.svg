@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 92 60" role="img" aria-label="trunc">
+  <!-- One bar (the archive) above four blocks of the same total width (the files). -->
+  <rect x="0" y="0" width="92" height="24" fill="#ff5b35"/>
+  <rect x="0" y="36" width="20" height="24" fill="#ff5b35"/>
+  <rect x="24" y="36" width="20" height="24" fill="#ff5b35"/>
+  <rect x="48" y="36" width="20" height="24" fill="#ff5b35"/>
+  <rect x="72" y="36" width="20" height="24" fill="#ff5b35"/>
+</svg>

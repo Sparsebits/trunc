@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 72" role="img" aria-label="trunc">
+  <!-- Mark: one bar above four blocks of the same total width. -->
+  <g fill="#ff5b35">
+    <rect x="0" y="12" width="92" height="24"/>
+    <rect x="0" y="48" width="20" height="24"/>
+    <rect x="24" y="48" width="20" height="24"/>
+    <rect x="48" y="48" width="20" height="24"/>
+    <rect x="72" y="48" width="20" height="24"/>
+  </g>
+  <!-- Wordmark "trunc", drawn from square strokes 14 units wide (x-height 48, baseline 72). -->
+  <g fill="#111111" transform="translate(124 0)">
+    <!-- t -->
+    <rect x="10" y="4" width="14" height="68"/>
+    <rect x="0" y="24" width="34" height="14"/>
+    <!-- r -->
+    <rect x="44" y="24" width="14" height="48"/>
+    <rect x="44" y="24" width="36" height="14"/>
+    <!-- u -->
+    <rect x="90" y="24" width="14" height="48"/>
+    <rect x="120" y="24" width="14" height="48"/>
+    <rect x="90" y="58" width="44" height="14"/>
+    <!-- n -->
+    <rect x="144" y="24" width="14" height="48"/>
+    <rect x="174" y="24" width="14" height="48"/>
+    <rect x="144" y="24" width="44" height="14"/>
+    <!-- c -->
+    <rect x="198" y="24" width="14" height="48"/>
+    <rect x="198" y="24" width="40" height="14"/>
+    <rect x="198" y="58" width="40" height="14"/>
+  </g>
+</svg>
