@@ -882,3 +882,64 @@ fn container_images() {
     ok(&trunc(&["x", "img.tar.gz", "--raw", "-C", "rawout"], w));
     assert_eq!(std::fs::read(w.join("rawout/img.tar")).unwrap(), raw);
 }
+
+#[test]
+fn container_image_names_this_computer_cannot_create_are_listed() {
+    use trunc_testkit::imagebuild::{self as ib, Compression};
+    use trunc_testkit::tarbuild::Spec;
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let mut specs = vec![
+        Spec::file("etc/hostname", b"h"),
+        Spec::file("usr/share/terminfo/E/foo", b"1"),
+        Spec::file("usr/share/terminfo/e/bar", b"2"),
+    ];
+    let perl: Vec<String> = (0..12)
+        .map(|i| format!("usr/share/man/man3/IO::F{i:02}.3pm"))
+        .collect();
+    specs.extend(perl.iter().map(|p| Spec::file(p, b"perl")));
+    let layers = vec![ib::layer(&specs, Compression::Gzip)];
+    std::fs::write(
+        w.join("img.tar"),
+        ib::oci_archive(&[("linux/amd64", layers)]),
+    )
+    .unwrap();
+
+    let x = ok(&trunc(&["x", "img.tar", "-C", "root"], w));
+    let verify = ok(&trunc(&["verify", "img.tar"], w));
+    let inspect = ok(&trunc(&["inspect", "img.tar", "--entries"], w));
+    assert_eq!(std::fs::read(w.join("root/etc/hostname")).unwrap(), b"h");
+    if cfg!(windows) {
+        assert!(
+            x.contains("skipped   14 paths (15 entries) whose names this computer cannot create"),
+            "{x}"
+        );
+        assert!(
+            inspect.contains("usr/share/terminfo/E/ (2 entries; differs only in case"),
+            "{inspect}"
+        );
+        assert!(
+            x.contains("usr/share/man/man3/IO::F00.3pm (character not allowed"),
+            "{x}"
+        );
+        assert!(
+            x.contains("... and 4 more (`trunc inspect --entries`"),
+            "{x}"
+        );
+        assert!(!x.contains("IO::F11"), "{x}");
+        assert!(
+            verify.contains("their digests and tar headers were checked"),
+            "{verify}"
+        );
+        assert!(
+            inspect.contains("IO::F11.3pm (character not allowed"),
+            "{inspect}"
+        );
+        assert!(!w.join("root/usr/share/terminfo/e").exists());
+    } else {
+        assert!(w.join("root/usr/share/man/man3/IO::F11.3pm").exists());
+        assert!(!verify.contains("skipped"), "{verify}");
+        assert_eq!(x.contains("skipped"), cfg!(target_os = "macos"), "{x}");
+        assert_eq!(inspect.contains("skipped"), cfg!(target_os = "macos"));
+    }
+}

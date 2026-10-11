@@ -15,10 +15,12 @@
 //!    renamed into place. Files a later layer deletes or replaces are never written, so nothing
 //!    is ever deleted. Digests are checked again while decoding the second time.
 //!
-//! Symlinks, devices and FIFOs in the image are skipped (counted), as for tarballs.
+//! Symlinks, devices and FIFOs in the image are skipped (counted), as for tarballs. Paths this
+//! computer cannot create (names Windows forbids, names that differ only in case on Windows and
+//! macOS) are left out of the tree after the merge and reported; see [`Skipped`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use trunc_fs::{Dealloc, FileHandle, FileId, FsBackend, FsError, NodeKind, OpenMode, Share};
@@ -145,6 +147,24 @@ pub struct MergeStats {
     pub shadowed: usize,
     /// Bytes of file content in shadowed entries.
     pub shadowed_bytes: u64,
+    /// Paths of the merged tree left out because this computer cannot create them (see
+    /// [`Skipped`]), everything below a skipped directory included.
+    pub skipped: usize,
+}
+
+/// A path of the merged tree that this computer cannot create, left out with everything below
+/// it. Its layers are still decoded and checked; only writing is skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    /// The path, as the image names it.
+    pub path: String,
+    /// Whether it is a directory (or has paths below it in the tree).
+    pub dir: bool,
+    /// Paths of the merged tree left out with it, itself included. Can be 0 for one of a group
+    /// of names that differ only in case, when later layers deleted it.
+    pub entries: usize,
+    /// Why: the name this computer forbids, or the names it clashes with.
+    pub reason: String,
 }
 
 /// What the scan learned: every digest checked, every layer parsed, the final tree.
@@ -158,6 +178,8 @@ pub struct ImageScan {
     /// The merged root filesystem, sorted by path.
     pub tree: Vec<Winner>,
     pub stats: MergeStats,
+    /// Paths left out of `tree` because this computer cannot create them, sorted by path.
+    pub skipped: Vec<Skipped>,
 }
 
 impl ImageScan {
@@ -172,7 +194,7 @@ impl ImageScan {
 }
 
 /// What an extraction did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImageSummary {
     pub files: usize,
     pub dirs: usize,
@@ -180,6 +202,8 @@ pub struct ImageSummary {
     pub symlinks_skipped: usize,
     pub specials_skipped: usize,
     pub stats: MergeStats,
+    /// Paths not written because this computer cannot create them.
+    pub skipped: Vec<Skipped>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1132,11 +1156,77 @@ fn remove_children(tree: &mut BTreeMap<String, Node>, key: &str) -> Vec<Node> {
     keys.into_iter().filter_map(|k| tree.remove(&k)).collect()
 }
 
-fn case_clash(a: &str, b: &str) -> Error {
-    Error::Refused(format!(
-        "layers name the same path as {a:?} and {b:?}, which differ only in case on this \
-         computer; refusing to merge them"
-    ))
+/// Record that `a` and `b`, at tree key `key`, differ only in case on this computer.
+fn note_clash(clashes: &mut BTreeMap<String, BTreeSet<String>>, key: &str, a: &str, b: &str) {
+    let names = clashes.entry(key.to_owned()).or_default();
+    names.insert(a.to_owned());
+    names.insert(b.to_owned());
+}
+
+/// Take out of the tree what this computer cannot create, each with everything below it:
+/// paths with a name it forbids ([`trunc_core::path::host_unusable`]: on Windows `:`, trailing
+/// dots, device names like `aux.h`, ...), and every name of a group that differs only in case
+/// (`clashes`), since keeping one would silently change what the others hold.
+fn leave_out(
+    tree: &mut BTreeMap<String, Node>,
+    clashes: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Skipped> {
+    // Tree key of each path to leave out: its names, and why (`None`: a case clash).
+    let mut roots: BTreeMap<String, (BTreeSet<String>, Option<&'static str>)> = clashes
+        .iter()
+        .map(|(k, names)| (k.clone(), (names.clone(), None)))
+        .collect();
+    for n in tree.values() {
+        if let Some((part, why)) = trunc_core::path::host_unusable(&n.name) {
+            roots
+                .entry(trunc_core::path::host_key(part))
+                .or_insert_with(|| (BTreeSet::from([part.to_owned()]), Some(why)));
+        }
+    }
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let below_another = |key: &str| {
+        key.match_indices('/')
+            .any(|(i, _)| roots.contains_key(&key[..i]))
+    };
+    let mut out = Vec::new();
+    for (key, (names, why)) in &roots {
+        if below_another(key) {
+            continue;
+        }
+        let depth = key.split('/').count();
+        // Each name of the group, with its own part of the subtree: (dir, entries).
+        let mut per: BTreeMap<String, (bool, usize)> =
+            names.iter().map(|n| (n.clone(), (false, 0))).collect();
+        for n in remove_subtree(tree, key) {
+            let comps: Vec<&str> = n.name.split('/').collect();
+            let slot = per.entry(comps[..depth].join("/")).or_default();
+            slot.0 |= n.kind == Kind::Dir || comps.len() > depth;
+            slot.1 += 1;
+        }
+        for (path, &(dir, entries)) in &per {
+            let reason = match why {
+                Some(w) => (*w).to_owned(),
+                None => format!(
+                    "differs only in case from {}",
+                    per.keys()
+                        .filter(|o| *o != path)
+                        .map(|o| format!("{o:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            out.push(Skipped {
+                path: path.clone(),
+                dir,
+                entries,
+                reason,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }
 
 /// Merge the layers' entries in order with OCI whiteout semantics into the final tree.
@@ -1147,9 +1237,14 @@ fn case_clash(a: &str, b: &str) -> Error {
 /// replacing what is at their path (a directory over a directory keeps the contents below,
 /// anything else replaces the whole subtree). A path through a lower non-directory replaces it
 /// with a directory. Whiteout files themselves are never part of the tree.
-pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeStats)> {
+///
+/// Paths this computer cannot create are then left out of the tree and returned (see
+/// [`leave_out`]); whiteouts and opaque markers have applied to them as to any path.
+pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeStats, Vec<Skipped>)> {
     let mut tree: BTreeMap<String, Node> = BTreeMap::new();
     let mut stats = MergeStats::default();
+    // Tree keys that entries named in different case: every name each was given.
+    let mut clashes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let size_of = |n: &Node| -> u64 {
         match n.entry {
             Some(i) if n.kind == Kind::File => layers[n.layer][i].size,
@@ -1229,8 +1324,10 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
                 let a = &e.name[..end + i];
                 end += i + 1;
                 let key = trunc_core::path::host_key(a);
+                if let Some(n) = tree.get(&key).filter(|n| n.name != a) {
+                    note_clash(&mut clashes, &key, &n.name, a);
+                }
                 match tree.get(&key) {
-                    Some(n) if n.name != a => return Err(case_clash(&n.name, a)),
                     Some(n) if n.kind == Kind::Dir => continue,
                     Some(_) => {
                         let gone = remove_subtree(&mut tree, &key);
@@ -1251,7 +1348,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             let key = trunc_core::path::host_key(&e.name);
             if let Some(n) = tree.get(&key) {
                 if n.name != e.name {
-                    return Err(case_clash(&n.name, &e.name));
+                    note_clash(&mut clashes, &key, &n.name, &e.name);
                 }
                 let gone = if n.kind == Kind::Dir && e.kind == Kind::Dir {
                     tree.remove(&key).into_iter().collect()
@@ -1271,6 +1368,8 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             );
         }
     }
+    let skipped = leave_out(&mut tree, &clashes);
+    stats.skipped = skipped.iter().map(|s| s.entries).sum();
     let winners = tree
         .into_values()
         .map(|n| Winner {
@@ -1290,7 +1389,7 @@ pub fn merge_layers(layers: &[Vec<tar::Entry>]) -> Result<(Vec<Winner>, MergeSta
             },
         })
         .collect();
-    Ok((winners, stats))
+    Ok((winners, stats, skipped))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1396,7 +1495,8 @@ fn scan_outer(outer: &Outer, opts: &ImageOptions) -> Result<ImageScan> {
     let mut lens = Vec::with_capacity(info.layers.len());
     for (i, layer) in info.layers.iter().enumerate() {
         let what = format!("layer {} ({})", i + 1, layer.path);
-        let mut reader = tar::Reader::new();
+        // Names this computer cannot create are left out after the merge, not refused here.
+        let mut reader = tar::Reader::with_safe_names();
         let len = read_layer(outer, i, layer, opts, &mut |b| {
             reader.feed(b).map_err(tar_err(&what))
         })?;
@@ -1404,19 +1504,21 @@ fn scan_outer(outer: &Outer, opts: &ImageOptions) -> Result<ImageScan> {
         lens.push(len);
         all.push(entries);
     }
-    let (tree, stats) = merge_layers(&all)?;
+    let (tree, stats, skipped) = merge_layers(&all)?;
     Ok(ImageScan {
         layer_entries: all.iter().map(Vec::len).collect(),
         info,
         layer_tar_len: lens,
         tree,
         stats,
+        skipped,
     })
 }
 
 /// Check everything without writing (except the temporary copy of a compressed outer tar in
 /// `temp_dir`): every JSON blob, layer blob digest and diff_id, every layer's tar headers and
-/// names, and that the layers merge.
+/// names, and that the layers merge. Paths [`extract_image`] would skip are checked all the
+/// same and listed in [`ImageScan::skipped`].
 pub fn verify_image(
     fs: &dyn FsBackend,
     archive: &Path,
@@ -1586,6 +1688,7 @@ fn write_tree(
             .filter(|w| !matches!(w.entry.kind, Kind::File | Kind::Dir | Kind::Symlink))
             .count(),
         stats: scan.stats,
+        skipped: scan.skipped.clone(),
     })
 }
 
@@ -1615,10 +1718,9 @@ mod tests {
     }
 
     fn names(layers: &[Vec<tar::Entry>]) -> Vec<(String, usize, Kind)> {
-        merge_layers(layers)
-            .unwrap()
-            .0
-            .into_iter()
+        let (w, _, skipped) = merge_layers(layers).unwrap();
+        assert_eq!(skipped, vec![]);
+        w.into_iter()
             .map(|w| (w.entry.name, w.layer, w.entry.kind))
             .collect()
     }
@@ -1648,7 +1750,7 @@ mod tests {
 
     #[test]
     fn file_and_directory_replace_each_other() {
-        let (w, stats) = merge_layers(&[
+        let (w, stats, _) = merge_layers(&[
             vec![d("p"), f("p/1"), f("p/2"), f("q")],
             vec![f("p"), f("q/inner")],
         ])
@@ -1682,6 +1784,77 @@ mod tests {
         assert!(merge_layers(&[vec![d(".wh.x")]]).is_err());
         // aufs bookkeeping is ignored.
         assert_eq!(names(&[vec![f(".wh..wh.plnk")]]), vec![]);
+    }
+
+    #[test]
+    fn case_only_twins_are_all_left_out_where_names_ignore_case() {
+        let layers = [
+            vec![d("t"), d("t/E"), f("t/E/foo"), f("t/keep")],
+            vec![d("t/e"), f("t/e/bar"), f("t/e/baz")],
+        ];
+        let (w, stats, skipped) = merge_layers(&layers).unwrap();
+        let got: Vec<&str> = w.iter().map(|w| w.entry.name.as_str()).collect();
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(got, ["t", "t/keep"]);
+            let s: Vec<_> = skipped
+                .iter()
+                .map(|s| (s.path.as_str(), s.dir, s.entries))
+                .collect();
+            assert_eq!(s, [("t/E", true, 1), ("t/e", true, 3)]);
+            assert_eq!(skipped[0].reason, "differs only in case from \"t/e\"");
+            assert_eq!(stats.skipped, 4);
+        } else {
+            assert_eq!(
+                got,
+                ["t", "t/E", "t/E/foo", "t/e", "t/e/bar", "t/e/baz", "t/keep"]
+            );
+            assert_eq!(skipped, vec![]);
+        }
+        // A twin deleted before the other arrives is no clash.
+        let layers = [vec![d("E"), f("E/x")], vec![f(".wh.E"), d("e"), f("e/y")]];
+        let (w, _, skipped) = merge_layers(&layers).unwrap();
+        let got: Vec<&str> = w.iter().map(|w| w.entry.name.as_str()).collect();
+        assert_eq!(got, ["e", "e/y"]);
+        assert_eq!(skipped, vec![]);
+    }
+
+    #[test]
+    fn names_windows_forbids_are_left_out_there() {
+        let layers = [
+            vec![
+                f("man3/IO::File.3pm"),
+                f("man3/ok.3pm"),
+                d("dots."),
+                f("dots./a"),
+                f("dots./b:c"),
+                f("inc/aux.h"),
+                f("inc/gone:1"),
+            ],
+            // Whiteouts reach paths that are left out like any other.
+            vec![f("inc/.wh.gone:1"), f("dots./.wh..wh..opq")],
+        ];
+        let (w, stats, skipped) = merge_layers(&layers).unwrap();
+        let got: Vec<&str> = w.iter().map(|w| w.entry.name.as_str()).collect();
+        let s: Vec<_> = skipped
+            .iter()
+            .map(|s| (s.path.as_str(), s.dir, s.entries))
+            .collect();
+        if cfg!(windows) {
+            assert_eq!(got, ["inc", "man3", "man3/ok.3pm"]);
+            assert_eq!(
+                s,
+                [
+                    ("dots.", true, 1),
+                    ("inc/aux.h", false, 1),
+                    ("man3/IO::File.3pm", false, 1)
+                ]
+            );
+            assert_eq!(skipped[1].reason, "reserved Windows device name");
+            assert_eq!(stats.skipped, 3);
+        } else {
+            assert_eq!(got.len(), 6, "{got:?}");
+            assert_eq!(s, []);
+        }
     }
 
     #[test]

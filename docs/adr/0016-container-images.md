@@ -47,10 +47,36 @@ again and needs deletes, which a crash can leave half done.
   anything else replaces the whole subtree, and a path through a lower non-directory turns it
   into a directory. Whiteout names that are empty, `.` or `..`, entries inside a whiteout, and
   whiteouts that are directories are refused; other `.wh..wh.` names (aufs bookkeeping) are
-  ignored. Names that differ only in case on this computer are refused across layers as they
-  are within one. Then only the winning entries are written, into a staging directory renamed
+  ignored. Then only the winning entries are written, into a staging directory renamed
   into place (ADR-0003): a file a later layer deletes or replaces is never written, and nothing
   is ever deleted. Layer digests are checked again during this second decode.
+- **Names this computer cannot create are skipped, not refused** (unlike tarballs,
+  ADR-0014). Real Linux images routinely hold such names: Perl man pages with `:`
+  (`IO::File.3pm.gz`), terminfo's `E/` and `e/` directories, kernel headers that differ only
+  in case. Layer tars are therefore read with the safety rules alone
+  (`trunc_core::path::validate_safe`; duplicates compared exactly), the layers are merged as
+  usual, and only then is the final tree pruned:
+  - On Windows, a path whose name the portable rules forbid (`\`, `:`, `<>"|?*`, a trailing
+    dot or space, a device name such as `aux.h`; `trunc_core::path::host_unusable`) is left
+    out, and so is everything below it when it is a directory.
+  - On Windows and macOS (case-insensitive by default), when entries name one path in
+    different case, every name of the group is left out with its subtree. Keeping the first or
+    last would silently change what the image holds. The merge records a clash whenever it
+    meets one, so a group stays skipped even if a later layer deletes one of its names (on a
+    case-insensitive computer a whiteout deletes every spelling).
+  - Whiteouts and opaque markers apply to these paths as to any other before the pruning: a
+    whiteout of a skipped name deletes it (it is then neither written nor reported), and an
+    opaque marker inside a skipped directory changes nothing that is written.
+  - Hostile names are still refused before anything is written, on every platform, exactly
+    as before: absolute paths, `..`, empty components, control characters and NUL, a drive
+    prefix, trunc's staging-directory name, and malformed whiteouts (empty, `.`, `..`,
+    containing `\`, directories, entries inside a whiteout). Exact duplicates in one layer are
+    refused too.
+  - Skipped paths are only not written: their layers are hashed, decoded and their headers
+    parsed like the rest. `trunc x` reports how many paths (and tree entries) were skipped and
+    lists the first 10; `trunc verify` says how many would be skipped; `trunc inspect
+    --entries` lists them all. On Linux nothing is skipped (Linux can create every safe name;
+    case-insensitive `casefold` folders are caught when writing, ADR-0014).
 - **Policy as for tarballs.** Symlinks, devices and FIFOs in the image are not created
   (counted and reported). A symlink still shadows what lower layers had at its path. Top-level
   names that already exist in the destination are refused; `--overwrite` is not supported.
@@ -67,7 +93,8 @@ again and needs deletes, which a crash can leave half done.
 - Every layer is decoded twice (scan and write), as for compressed tarballs.
 - The root filesystem is not a faithful runtime root: no symlinks (merged-`/usr` images lose
   `/bin`, `/lib` and friends), no device nodes, no ownership, no hard links (refused until the
-  tar reader supports them), and directory modes and times are not applied. On Windows, Linux
-  names that are invalid there (`:` in Perl man pages, case-only twins in terminfo) make the
-  image refused, as for any tarball.
+  tar reader supports them), and directory modes and times are not applied. On Windows (and
+  for case-only twins on macOS) some paths are missing too, and listed.
+- The same image can give different trees on different computers; the difference is always
+  reported, never silent.
 - `plan` does not support images yet; `inspect` shows the layer sizes.
