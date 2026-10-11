@@ -20,7 +20,13 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// Maximum number of components.
 pub const MAX_DEPTH: usize = 256;
 
-const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+
+/// Prefix of the staging directory trunc creates at the top of the destination while consuming
+/// (`.trunc-stage-<archive id>`). Archive entries may not use it at the top level: one would
+/// pass the up-front "already exists" check (the staging directory does not exist yet) and only
+/// clash with it at the final rename, after the whole archive had been consumed.
+pub const STAGE_PREFIX: &str = ".trunc-stage-";
 
 fn err(path: &str, reason: &'static str) -> FormatError {
     FormatError::Path {
@@ -58,6 +64,9 @@ fn validate_with(path: &str, portable: bool) -> Result<(), FormatError> {
             return Err(err(path, "too deep"));
         }
         validate_component(path, comp, portable)?;
+        if depth == 1 && collision_key(comp).starts_with(STAGE_PREFIX) {
+            return Err(err(path, "name reserved for trunc's staging directory"));
+        }
         // "C:" first is a Windows absolute path, whatever this computer makes of it.
         let b = comp.as_bytes();
         if depth == 1 && b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
@@ -97,9 +106,13 @@ fn validate_component(path: &str, comp: &str, portable: bool) -> Result<(), Form
     // Windows reserves device names with or without an extension: "CON", "con.txt", "COM1.log".
     let stem = comp.split('.').next().unwrap_or(comp).trim_end_matches(' ');
     let upper = stem.to_ascii_uppercase();
-    let is_numbered_device = upper.len() == 4
-        && (upper.starts_with("COM") || upper.starts_with("LPT"))
-        && upper.as_bytes()[3].is_ascii_digit();
+    // COM0-COM9 and LPT0-LPT9, plus the superscript digits Windows also treats as devices.
+    let is_numbered_device = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+        .is_some_and(|n| {
+            (n.len() == 1 && n.as_bytes()[0].is_ascii_digit()) || matches!(n, "¹" | "²" | "³")
+        });
     if RESERVED.contains(&upper.as_str()) || is_numbered_device {
         return Err(err(path, "reserved Windows device name"));
     }
@@ -107,8 +120,30 @@ fn validate_component(path: &str, comp: &str, portable: bool) -> Result<(), Form
 }
 
 /// Key used to detect entries that would collide on a case-insensitive filesystem.
+///
+/// NTFS compares names through its upcase table, a simple one-to-one uppercase mapping
+/// (`ı`, `ſ` and `ς` upper-case to `I`, `S` and `Σ`); APFS and HFS+ use Unicode case folding
+/// (the Kelvin sign `K` folds to `k`). Each character is mapped to its simple uppercase and
+/// that to its simple lowercase, keeping a character whose mapping is not a single character
+/// (`ß`, `İ`), so two names NTFS or simple case folding treat as equal get the same key.
+/// Whole-string `to_lowercase` would not do: it leaves `ı`/`i`, `ſ`/`s` and `ς`/`σ` distinct,
+/// and turns a final `Σ` into `ς`.
 pub fn collision_key(path: &str) -> String {
-    path.to_lowercase()
+    if path.is_ascii() {
+        return path.to_ascii_lowercase();
+    }
+    path.chars().map(fold_char).collect()
+}
+
+fn fold_char(c: char) -> char {
+    let up = single(c.to_uppercase()).unwrap_or(c);
+    single(up.to_lowercase()).unwrap_or(up)
+}
+
+/// The only item of `it`, if it has exactly one.
+fn single(mut it: impl Iterator<Item = char>) -> Option<char> {
+    let c = it.next()?;
+    it.next().is_none().then_some(c)
 }
 
 /// Key used to detect entries that would be the same file on this computer: case-insensitive
@@ -218,6 +253,93 @@ mod tests {
         assert!(validate("console").is_ok());
         assert!(validate("COM10").is_ok());
         assert!(validate("auxiliary.txt").is_ok());
+        assert!(validate("CONIN").is_ok());
+        assert!(validate("CONOUT$x").is_ok());
+        assert!(validate("COM4\u{b2}").is_ok());
+        assert!(validate("COM\u{2074}").is_ok());
+    }
+
+    #[test]
+    fn rejects_every_windows_device_name() {
+        let bad = [
+            "CONIN$",
+            "conin$",
+            "CONOUT$",
+            "conout$.log",
+            "CONIN$.txt",
+            "dir/CONOUT$",
+            "CONIN$ .txt",
+            "COM0",
+            "lpt0.txt",
+            "COM\u{b9}",
+            "com\u{b2}.txt",
+            "dir/COM\u{b3}",
+            "LPT\u{b9}",
+            "lpt\u{b2}.log",
+            "LPT\u{b3} .txt",
+        ];
+        for p in bad {
+            assert!(validate(p).is_err(), "accepted {p:?}");
+            assert_eq!(validate_host(p).is_err(), cfg!(windows), "{p:?}");
+        }
+        // Trailing dots and spaces are refused on their own.
+        for p in ["CONIN$.", "COM\u{b9} "] {
+            assert!(validate(p).is_err(), "accepted {p:?}");
+        }
+    }
+
+    #[test]
+    fn collision_key_matches_ntfs_and_case_folding() {
+        let same = [
+            ("file", "F\u{131}LE"),
+            ("file", "f\u{131}le"),
+            ("Makefile", "makef\u{131}le"),
+            ("sea", "\u{17f}ea"),
+            ("dir/SEA", "dir/\u{17f}ea"),
+            ("\u{3b1}\u{3c3}", "\u{3b1}\u{3c2}"),
+            ("\u{391}\u{3a3}", "\u{3b1}\u{3c2}"),
+            ("\u{391}\u{3a3}", "\u{3b1}\u{3c3}"),
+            ("kelvin", "\u{212a}elvin"),
+            ("\u{212a}", "K"),
+            ("Stra\u{df}e", "STRA\u{df}E"),
+            ("\u{c9}t\u{e9}", "\u{e9}T\u{c9}"),
+        ];
+        for (a, b) in same {
+            assert_eq!(collision_key(a), collision_key(b), "{a:?} vs {b:?}");
+        }
+        let different = [
+            ("file", "fi1e"),
+            ("strasse", "stra\u{df}e"),
+            ("i", "\u{130}"),
+        ];
+        for (a, b) in different {
+            assert_ne!(collision_key(a), collision_key(b), "{a:?} vs {b:?}");
+        }
+        assert_eq!(
+            host_key("file") == host_key("f\u{131}le"),
+            cfg!(any(windows, target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn rejects_staging_directory_names_at_the_top() {
+        for p in [
+            ".trunc-stage-00112233445566778899aabbccddeeff",
+            ".trunc-stage-x/inner",
+            ".TRUNC-STAGE-x",
+            ".trunc-\u{17f}tage-x",
+        ] {
+            assert!(validate(p).is_err(), "accepted {p:?}");
+            assert!(validate_host(p).is_err(), "accepted {p:?}");
+        }
+        for p in [
+            "dir/.trunc-stage-x",
+            ".trunc-stage",
+            ".trunc-stagex",
+            "trunc-stage-x",
+        ] {
+            validate(p).unwrap_or_else(|e| panic!("{p}: {e}"));
+        }
     }
 
     #[test]

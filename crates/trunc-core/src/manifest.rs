@@ -538,6 +538,27 @@ pub(crate) mod tests {
         let mut m = sample();
         m.entries[3].path = "d/a/x".into();
         assert!(m.validate().is_err());
+
+        // Pairs NTFS upper-cases to the same name, which `to_lowercase` keeps apart.
+        for (a, b) in [
+            ("d/file", "d/f\u{131}le"),
+            ("d/sea", "d/\u{17f}ea"),
+            ("d/\u{3b1}\u{3c3}", "d/\u{391}\u{3c2}"),
+        ] {
+            let mut m = sample();
+            m.entries[1].path = a.into();
+            m.entries[2].path = b.into();
+            assert!(m.validate().is_err(), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_staging_directory_name_and_new_device_names() {
+        for bad in [".trunc-stage-0707", "CONIN$", "d/COM\u{b9}.txt", "LPT0"] {
+            let mut m = sample();
+            m.entries[3].path = bad.into();
+            assert!(m.validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

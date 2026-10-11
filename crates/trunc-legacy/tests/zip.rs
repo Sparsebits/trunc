@@ -158,6 +158,39 @@ fn rejects_hostile_names() {
     assert!(matches!(parse(&build(&nested)), Err(ZipError::Name { .. })));
 }
 
+#[test]
+fn names_ntfs_upper_cases_together_collide_up_front() {
+    // `to_lowercase` keeps these apart; NTFS's upcase table (and macOS case folding) do not.
+    for (a, b) in [
+        ("file", "f\u{131}le"),
+        ("sea.txt", "\u{17f}ea.txt"),
+        ("\u{3b1}\u{3c3}", "\u{3b1}\u{3c2}"),
+        ("kelvin", "\u{212a}elvin"),
+    ] {
+        let pair = [Spec::file(a, b"1"), Spec::file(b, b"2")];
+        assert_eq!(
+            matches!(parse(&build(&pair)), Err(ZipError::Name { .. })),
+            cfg!(any(windows, target_os = "macos")),
+            "{a:?} vs {b:?}"
+        );
+    }
+    // A file and a directory named like it, too.
+    let nested = [Spec::file("f\u{131}le", b"x"), Spec::file("FILE/b", b"y")];
+    assert_eq!(
+        matches!(parse(&build(&nested)), Err(ZipError::Name { .. })),
+        cfg!(any(windows, target_os = "macos"))
+    );
+}
+
+#[test]
+fn staging_directory_names_are_refused_at_the_top() {
+    for bad in [".trunc-stage-0011", ".TRUNC-STAGE-x/inner.txt"] {
+        let e = parse(&build(&[Spec::file(bad, b"x")])).unwrap_err();
+        assert!(matches!(e, ZipError::Name { .. }), "{bad:?}: {e}");
+    }
+    assert!(parse(&build(&[Spec::file("dir/.trunc-stage-0011", b"x")])).is_ok());
+}
+
 /// Offset of the first central-directory record in a built ZIP.
 fn cd_start(bytes: &[u8]) -> usize {
     bytes

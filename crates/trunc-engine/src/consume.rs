@@ -132,7 +132,11 @@ pub struct ConsumeSummary {
 
 /// The staging directory used for `archive_id` under `dest`.
 pub fn stage_dir(dest: &Path, archive_id: &[u8; 16]) -> PathBuf {
-    dest.join(format!(".trunc-stage-{}", hex::encode(archive_id)))
+    dest.join(format!(
+        "{}{}",
+        trunc_core::path::STAGE_PREFIX,
+        hex::encode(archive_id)
+    ))
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {

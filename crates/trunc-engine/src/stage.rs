@@ -193,20 +193,24 @@ pub(crate) fn flush_staging_tree(fs: &dyn FsBackend, stage: &Path, dest: &Path) 
     Ok(())
 }
 
-/// A top-level entry named like one of the archive's sidecar files (resume note, journal,
-/// receipt) when extracting next to the archive. The sidecar is created after the conflict
+/// A top-level entry named like one of the archive's sidecar files (resume note, journal, gap
+/// log, receipt) when extracting next to the archive. The sidecar is created after the conflict
 /// check and removed at the end, so such an entry would be refused or deleted.
 pub(crate) fn sidecar_conflict(archive: &Path, dest: &Path, tops: &[String]) -> Option<String> {
-    let same_dir = archive
-        .parent()
-        .is_some_and(|p| p == dest || std::path::absolute(p).ok().as_deref() == Some(dest));
+    let key = |p: &Path| trunc_core::path::host_key(&p.to_string_lossy());
+    let same_dir = archive.parent().is_some_and(|p| {
+        p == dest
+            || key(p) == key(dest)
+            || std::path::absolute(p).is_ok_and(|a| a == dest || key(&a) == key(dest))
+    });
     if !same_dir {
         return None;
     }
-    let base = archive.file_name()?.to_string_lossy().to_lowercase();
-    let sidecars = [".trncr", ".trncj", ".trncj.tmp", ".receipt"].map(|s| format!("{base}{s}"));
+    let base = archive.file_name()?.to_string_lossy().into_owned();
+    let sidecars = [".trncr", ".trncj", ".trncj.tmp", ".trncg", ".receipt"]
+        .map(|s| trunc_core::path::collision_key(&format!("{base}{s}")));
     tops.iter()
-        .find(|t| sidecars.contains(&t.to_lowercase()))
+        .find(|t| sidecars.contains(&trunc_core::path::collision_key(t)))
         .cloned()
 }
 
