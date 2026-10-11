@@ -750,7 +750,14 @@ pub fn stream_space(
             .max(layout.file_len - freed.min(layout.file_len) + map.data_before(end) + gap_bytes);
     }
     let margin = params.margin_fixed + content / 1_000_000 * params.margin_ppm;
-    let consume_peak = peak + slack + margin;
+    // At a checkpoint the file being written is allocated up to a whole cluster past its
+    // written length, which rounding its final size (in `slack`) does not cover. The gap log is
+    // one more file, with its own metadata and rounding.
+    let mut unlisted = if n > 0 { cluster - 1 } else { 0 };
+    if gaps {
+        unlisted += params.per_entry_overhead + cluster - 1;
+    }
+    let consume_peak = peak + slack + margin + unlisted;
     StreamSpace {
         archive_len: layout.file_len,
         content,
@@ -1855,6 +1862,10 @@ pub fn open_layout(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
+    use trunc_testkit::Rng;
+
     use super::*;
 
     fn file(name: &str, off: u64, size: u64) -> tar::Entry {
@@ -1982,5 +1993,367 @@ mod tests {
         assert_eq!(m.locate(612), Err(1536));
         assert_eq!(m.locate(2535), Ok((1, 999)));
         assert_eq!(m.locate(2536), Err(u64::MAX));
+    }
+
+    // Randomized checks of `stream_space` against a simulation of the consume loop.
+
+    fn pick<T: Copy>(rng: &mut Rng, xs: &[T]) -> T {
+        xs[usize::try_from(rng.below(xs.len() as u64)).unwrap()]
+    }
+
+    /// Inclusive range `lo..=hi`.
+    fn between(rng: &mut Rng, lo: u64, hi: u64) -> u64 {
+        lo + rng.below(hi - lo + 1)
+    }
+
+    fn round_up(x: u64, unit: u64) -> u64 {
+        x.div_ceil(unit) * unit
+    }
+
+    fn random_size(rng: &mut Rng) -> u64 {
+        match rng.below(20) {
+            0..=2 => 0,
+            3..=8 => between(rng, 1, 600),
+            9..=14 => between(rng, 1, 64 << 10),
+            15..=18 => between(rng, 1, 8 << 20),
+            _ => between(rng, 8 << 20, 1536 << 20),
+        }
+    }
+
+    struct StreamCase {
+        layout: StreamLayout,
+        can_dealloc: bool,
+        gran: u64,
+        parts: Vec<u64>,
+        params: SpaceParams,
+    }
+
+    /// Sorted values drawn from `lo..=hi`, without repeats.
+    fn sorted_distinct(rng: &mut Rng, n: u64, lo: u64, hi: u64) -> Vec<u64> {
+        let mut v: Vec<u64> = (0..n).map(|_| between(rng, lo, hi)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// A random tarball (512-byte headers, padded content, long-name and pax headers,
+    /// directories, links and specials) or single file, with a random checkpoint table.
+    fn random_stream_case(rng: &mut Rng) -> StreamCase {
+        let mode = if rng.below(4) == 0 {
+            Mode::Single
+        } else {
+            Mode::Tar
+        };
+        let mut entries = Vec::new();
+        let out_len = match mode {
+            Mode::Single => {
+                let size = random_size(rng);
+                entries.push(file("single", 0, size));
+                size
+            }
+            Mode::Tar => {
+                let n = match rng.below(4) {
+                    0 => between(rng, 0, 5),
+                    1 => between(rng, 1, 2000),
+                    _ => between(rng, 1, 200),
+                };
+                let mut pos = 0u64;
+                for i in 0..n {
+                    let kind = match rng.below(20) {
+                        0..=1 => Kind::Dir,
+                        2 => Kind::Symlink,
+                        3 => Kind::Special,
+                        _ => Kind::File,
+                    };
+                    let size = if kind == Kind::File {
+                        random_size(rng)
+                    } else {
+                        0
+                    };
+                    let data_offset = pos + 512 * pick(rng, &[1, 1, 1, 2, 3]);
+                    entries.push(tar::Entry {
+                        kind,
+                        ..file(&format!("e{i}"), data_offset, size)
+                    });
+                    pos = data_offset + size.div_ceil(512) * 512;
+                }
+                let padding = between(rng, 0, 18) * 512;
+                pos + 1024 + pick(rng, &[0, padding])
+            }
+        };
+        let file_len = match rng.below(3) {
+            0 => between(rng, 1, out_len / 100 + 64),
+            1 => between(rng, 1, out_len + 64),
+            _ => between(rng, out_len / 2 + 1, out_len + out_len / 64 + 64),
+        };
+        let n_ckpts = match rng.below(3) {
+            0 => between(rng, 0, 3),
+            1 => between(rng, 0, 30),
+            _ => between(rng, 0, 400),
+        };
+        // Checkpoint outputs and release points, both non-decreasing.
+        let outs = sorted_distinct(rng, n_ckpts, 1, out_len.max(1));
+        let mut frees: Vec<u64> = (0..outs.len()).map(|_| between(rng, 0, file_len)).collect();
+        frees.sort_unstable();
+        let ckpts = outs
+            .iter()
+            .zip(&frees)
+            .map(|(&out, &free_below)| CkptInfo {
+                free_below,
+                out,
+                hash: [0; 32],
+            })
+            .collect();
+        let parts = if rng.below(3) == 0 && file_len > 1 {
+            let n = between(rng, 1, 12);
+            let mut cuts = sorted_distinct(rng, n, 1, file_len - 1);
+            cuts.push(file_len);
+            let mut prev = 0;
+            cuts.iter()
+                .map(|&c| {
+                    let s = c - prev;
+                    prev = c;
+                    s
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        StreamCase {
+            layout: StreamLayout {
+                codec: pick(rng, &Codec::ALL),
+                mode,
+                file_len,
+                units: 1,
+                out_len,
+                entries,
+                every: 1 << 20,
+                ckpts,
+                tail_hash: [0; 32],
+            },
+            can_dealloc: rng.below(3) != 0,
+            gran: pick(rng, &[1, 512, 4096, 65536]),
+            parts,
+            params: SpaceParams {
+                cluster_size: pick(rng, &[1, 512, 4096, 65536]),
+                per_entry_overhead: pick(rng, &[0, 0, 1, 256, 4096]),
+                margin_fixed: pick(rng, &[0, 0, 0, 4096]),
+                margin_ppm: pick(rng, &[0, 0, 5_000]),
+                batch_max_u: 1,
+            },
+        }
+    }
+
+    /// One archive file (the whole archive, or one part): offset in the archive, size, whether
+    /// it still exists, and the ranges deallocated inside it.
+    struct HeldFile {
+        off: u64,
+        size: u64,
+        present: bool,
+        holes: Vec<Range<u64>>,
+    }
+
+    impl HeldFile {
+        fn occupied(&self) -> u64 {
+            if !self.present {
+                return 0;
+            }
+            self.size - self.holes.iter().map(|h| h.end - h.start).sum::<u64>()
+        }
+
+        /// What `deallocate(start, end)` frees: the whole units inside the range.
+        fn deallocate(&mut self, start: u64, end: u64, gran: u64) {
+            let (s, e) = (
+                start.div_ceil(gran) * gran,
+                end.min(self.size) / gran * gran,
+            );
+            if s >= e {
+                return;
+            }
+            let mut merged = s..e;
+            self.holes.retain(|h| {
+                let touches = h.start <= merged.end && merged.start <= h.end;
+                if touches {
+                    merged = merged.start.min(h.start)..merged.end.max(h.end);
+                }
+                !touches
+            });
+            self.holes.push(merged);
+        }
+    }
+
+    /// Mirror of `Held::free` (and `Parts::free`) for `[from, below)`.
+    fn release(
+        files: &mut [HeldFile],
+        split: bool,
+        dealloc: bool,
+        from: u64,
+        below: u64,
+        gran: u64,
+    ) {
+        for f in files {
+            if !split {
+                let below = below.min(f.size);
+                if dealloc {
+                    f.deallocate(from.min(below) / gran * gran, below, gran);
+                }
+            } else if f.off + f.size <= below {
+                f.present = false;
+            } else if f.off < below && dealloc && f.present {
+                let start = from.max(f.off) - f.off;
+                f.deallocate(start / gran * gran, below - f.off, gran);
+            }
+        }
+    }
+
+    /// Replay `consume_stream` from the start and return its highest occupancy: what is left
+    /// of the archive, plus each output's allocation (written length rounded up to whole
+    /// clusters; nothing is preallocated), plus the gap log, plus per-entry metadata.
+    /// Occupancy can only grow between checkpoints, so it is sampled at each one (after the
+    /// flush, before the release) and at the end.
+    fn simulate_stream(c: &StreamCase) -> u64 {
+        let l = &c.layout;
+        let cluster = c.params.cluster_size.max(1);
+        let gran = c.gran.max(1);
+        let split = !c.parts.is_empty();
+        let mut files: Vec<HeldFile> = Vec::new();
+        let mut off = 0;
+        let whole = [l.file_len];
+        for &size in if split { &c.parts[..] } else { &whole[..] } {
+            files.push(HeldFile {
+                off,
+                size,
+                present: true,
+                holes: Vec::new(),
+            });
+            off += size;
+        }
+        assert_eq!(off, l.file_len);
+        let gap_log = l.codec.needs_history() && l.mode == Mode::Tar;
+        let created = l.entries.iter().filter(|e| e.kind != Kind::Special).count() as u64;
+        let meta = (created + u64::from(gap_log)) * c.params.per_entry_overhead;
+
+        // Non-empty files in stream order; `done` of them are complete.
+        let data: Vec<&tar::Entry> = l
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::File && e.size > 0)
+            .collect();
+        let (mut done, mut done_alloc, mut done_bytes) = (0usize, 0u64, 0u64);
+        let mut peak = l.file_len + meta;
+        let mut freed_to = 0u64;
+        for k in 0..=l.ckpts.len() {
+            let end = l.ckpts.get(k).map_or(l.out_len, |p| p.out);
+            while done < data.len() && data[done].data_offset + data[done].size <= end {
+                done_alloc += round_up(data[done].size, cluster);
+                done_bytes += data[done].size;
+                done += 1;
+            }
+            let partial = data
+                .get(done)
+                .map_or(0, |e| end.saturating_sub(e.data_offset));
+            let gaps = if gap_log {
+                round_up(end - done_bytes - partial, cluster)
+            } else {
+                0
+            };
+            let archive: u64 = files.iter().map(HeldFile::occupied).sum();
+            let occ = archive + done_alloc + round_up(partial, cluster) + gaps + meta;
+            peak = peak.max(occ);
+            if let Some(p) = l.ckpts.get(k) {
+                release(
+                    &mut files,
+                    split,
+                    c.can_dealloc,
+                    freed_to,
+                    p.free_below,
+                    gran,
+                );
+                freed_to = p.free_below;
+            }
+        }
+        assert_eq!(done, data.len(), "every file completes");
+        peak
+    }
+
+    fn run_stream_case(seed: u64) {
+        let mut rng = Rng::new(seed);
+        let c = random_stream_case(&mut rng);
+        let sp = stream_space(&c.layout, c.can_dealloc, c.gran, &c.parts, &c.params);
+        assert_eq!(sp.consume_extra, sp.consume_peak - c.layout.file_len);
+        let peak = simulate_stream(&c);
+        assert!(
+            peak <= sp.consume_peak,
+            "seed {seed}: simulated peak {peak} > planned {} ({:?} {:?}, {} entries, {} \
+             checkpoints, archive {} -> {}, parts {:?}, dealloc {} gran {}, {:?})",
+            sp.consume_peak,
+            c.layout.codec,
+            c.layout.mode,
+            c.layout.entries.len(),
+            c.layout.ckpts.len(),
+            c.layout.file_len,
+            c.layout.out_len,
+            c.parts,
+            c.can_dealloc,
+            c.gran,
+            c.params
+        );
+    }
+
+    #[test]
+    fn stream_planner_never_underestimates_the_consume_peak() {
+        for seed in 0..3000 {
+            run_stream_case(seed);
+        }
+    }
+
+    /// Regression: at a checkpoint inside a file, the file is allocated a whole cluster past
+    /// its written length; and an xz/zstd tarball also keeps a gap log, a file the entry list
+    /// does not include. Neither was in the bound.
+    #[test]
+    fn stream_bound_covers_the_open_file_and_the_gap_log() {
+        // header | "a": 8192 bytes | end-of-archive blocks. One checkpoint, 1 byte into "a",
+        // after which the whole archive can go: occupancy peaks at that checkpoint.
+        let len = 24 * 4096;
+        let layout = StreamLayout {
+            codec: Codec::Zstd,
+            mode: Mode::Tar,
+            file_len: len,
+            units: 1,
+            out_len: 512 + 8192 + 1024,
+            entries: vec![file("a", 512, 8192)],
+            every: 1 << 20,
+            ckpts: vec![CkptInfo {
+                free_below: len,
+                out: 513,
+                hash: [0; 32],
+            }],
+            tail_hash: [0; 32],
+        };
+        let params = SpaceParams {
+            cluster_size: 4096,
+            per_entry_overhead: 100,
+            margin_fixed: 0,
+            margin_ppm: 0,
+            batch_max_u: 1,
+        };
+        let c = StreamCase {
+            layout,
+            can_dealloc: true,
+            gran: 4096,
+            parts: Vec::new(),
+            params,
+        };
+        // The archive, 1 byte of "a" in one cluster, 512 header bytes in a one-cluster gap log,
+        // and metadata for "a" and the gap log.
+        let peak = simulate_stream(&c);
+        assert_eq!(peak, len + 4096 + 4096 + 200);
+        let sp = stream_space(&c.layout, true, 4096, &[], &params);
+        assert!(
+            peak <= sp.consume_peak,
+            "planned {} is short by {}",
+            sp.consume_peak,
+            peak.saturating_sub(sp.consume_peak)
+        );
     }
 }

@@ -117,7 +117,14 @@ pub fn bound(m: &Manifest, first_block_off: u64, consumed: usize, p: &SpaceParam
         peak = peak.max(before + written + batch_u);
         written += batch_u;
     }
-    let consume_peak = peak + slack + margin;
+    // A file that straddles a batch boundary is released half written, allocated up to a whole
+    // cluster past its written length: rounding its final size (in `slack`) does not cover that.
+    let in_progress = if groups.len() > 1 {
+        p.cluster_size.saturating_sub(1)
+    } else {
+        0
+    };
+    let consume_peak = peak + slack + margin + in_progress;
     SpaceBound {
         archive_len,
         remaining_u,
