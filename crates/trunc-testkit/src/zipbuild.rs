@@ -19,6 +19,9 @@ pub struct Spec {
     pub zip64: bool,
     pub unix_mode: Option<u32>,
     pub mtime_dos: (u16, u16),
+    /// ZIP method number overriding `deflate` (12 bzip2, 93 zstd, 95 xz; any other number
+    /// stores the data as is under that number).
+    pub method: Option<u16>,
 }
 
 impl Spec {
@@ -33,6 +36,7 @@ impl Spec {
             zip64: false,
             unix_mode: None,
             mtime_dos: (((2024 - 1980) << 9) | (5 << 5) | 17, (12 << 11) | (30 << 5)),
+            method: None,
         }
     }
 
@@ -44,6 +48,11 @@ impl Spec {
 
     pub fn stored(mut self) -> Self {
         self.deflate = false;
+        self
+    }
+    /// Use ZIP method number `m` (see the `method` field).
+    pub fn method(mut self, m: u16) -> Self {
+        self.method = Some(m);
         self
     }
     pub fn level(mut self, l: u32) -> Self {
@@ -100,6 +109,21 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
     e.finish().unwrap()
 }
 
+fn method_of(s: &Spec) -> u16 {
+    s.method.unwrap_or(if s.deflate { 8 } else { 0 })
+}
+
+/// An entry's payload for its method.
+fn encode(s: &Spec) -> Vec<u8> {
+    match method_of(s) {
+        8 => compress(&s.data, s.level),
+        12 => crate::tarbuild::bzip2(&s.data, s.level.clamp(1, 9)),
+        93 => crate::tarbuild::zstd(&s.data, i32::try_from(s.level.clamp(1, 19)).unwrap()),
+        95 => crate::tarbuild::xz(&s.data, s.level.min(9)),
+        _ => s.data.clone(),
+    }
+}
+
 fn u16le(v: &mut Vec<u8>, x: u16) {
     v.extend_from_slice(&x.to_le_bytes());
 }
@@ -145,18 +169,14 @@ impl ZipBuilder {
     /// Append an entry's local record and register it for the central directory.
     pub fn add(&mut self, spec: Spec) -> Placed {
         let lho = self.body.len() as u64;
-        let comp = if spec.deflate {
-            compress(&spec.data, spec.level)
-        } else {
-            spec.data.clone()
-        };
+        let comp = encode(&spec);
         let crc = crc32fast::hash(&spec.data);
         let (csize, usize_) = (comp.len() as u64, spec.data.len() as u64);
         let b = &mut self.body;
         u32le(b, 0x0403_4b50);
         u16le(b, if spec.zip64 { 45 } else { 20 });
         u16le(b, flags(&spec));
-        u16le(b, if spec.deflate { 8 } else { 0 });
+        u16le(b, method_of(&spec));
         u16le(b, spec.mtime_dos.1);
         u16le(b, spec.mtime_dos.0);
         let desc = spec.descriptor.is_some();
@@ -221,11 +241,7 @@ impl ZipBuilder {
     /// Register a central-directory record for `spec` whose local header is at `lho` (which must
     /// already contain a matching local record). Used to build overlapping entries.
     pub fn alias(&mut self, spec: Spec, lho: u64) {
-        let comp = if spec.deflate {
-            compress(&spec.data, spec.level)
-        } else {
-            spec.data.clone()
-        };
+        let comp = encode(&spec);
         let crc = crc32fast::hash(&spec.data);
         self.written.push(Written {
             spec,
@@ -258,7 +274,7 @@ impl ZipBuilder {
             u16le(&mut cd, made_by);
             u16le(&mut cd, if z { 45 } else { 20 });
             u16le(&mut cd, flags(s));
-            u16le(&mut cd, if s.deflate { 8 } else { 0 });
+            u16le(&mut cd, method_of(s));
             u16le(&mut cd, s.mtime_dos.1);
             u16le(&mut cd, s.mtime_dos.0);
             u32le(&mut cd, w.crc);

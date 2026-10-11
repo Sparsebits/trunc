@@ -600,3 +600,189 @@ fn top_level_symlink_does_not_wedge_recovery() {
         assert_complete(&fs, &want);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// bzip2 (12), zstd (93) and xz (95) entries.
+
+/// ZIP method numbers decoded by the stream decoders.
+const STREAM_METHODS: [u16; 3] = [12, 93, 95];
+
+fn mixed_specs(seed: u64) -> Vec<Spec> {
+    let mut rng = Rng::new(seed);
+    vec![
+        Spec::dir("m"),
+        Spec::file("m/deflate.txt", &fixtures::text_bytes(&mut rng, 30_000)),
+        Spec::file("m/stored.bin", &fixtures::noise_bytes(&mut rng, 5_000)).stored(),
+        Spec::file("m/bzip2.txt", &fixtures::text_bytes(&mut rng, 40_000)).method(12),
+        Spec::file("m/zstd.txt", &fixtures::text_bytes(&mut rng, 60_000)).method(93),
+        Spec::file("m/xz.txt", &fixtures::text_bytes(&mut rng, 50_000))
+            .method(95)
+            .descriptor(true),
+        Spec::file("m/zstd.noise", &fixtures::noise_bytes(&mut rng, 20_000))
+            .method(93)
+            .zip64(),
+        Spec::file("m/empty.bz2", b"").method(12),
+        Spec::file("m/empty.xz", b"").method(95).descriptor(false),
+    ]
+}
+
+fn extract(fs: &FaultFs) -> Result<ConsumeSummary, Error> {
+    zipconsume::extract_zip(fs, Path::new(ARC), Path::new(DEST), false)
+}
+
+/// Contents of `/out` plus the untouched archive.
+fn expected_with_archive(sp: &[Spec], bytes: &[u8]) -> BTreeMap<String, Option<Vec<u8>>> {
+    let mut want = expected(sp);
+    want.insert("a.zip".into(), Some(bytes.to_vec()));
+    want
+}
+
+#[test]
+fn bzip2_zstd_and_xz_entries_extract_and_consume() {
+    let sp = mixed_specs(20);
+    let bytes = build(&sp, b"sfx");
+    {
+        let fs = fresh(CrashModel::WriteThrough, &bytes);
+        let h = fs
+            .open(Path::new(ARC), OpenMode::Read, Share::Shared)
+            .unwrap();
+        let layout = zip::parse(h.as_ref()).unwrap();
+        let methods: Vec<zip::Method> = layout.entries.iter().map(|e| e.method).collect();
+        for m in [zip::Method::Bzip2, zip::Method::Zstd, zip::Method::Xz] {
+            assert!(methods.contains(&m), "{m:?} missing");
+        }
+        assert_eq!(zip::Layout::from_bytes(&layout.to_bytes()).unwrap(), layout);
+    }
+    // Plain extraction.
+    let fs = fresh(CrashModel::WriteThrough, &bytes);
+    let s = extract(&fs).unwrap();
+    assert_eq!(s.files, 8);
+    assert_complete(&fs, &expected_with_archive(&sp, &bytes));
+    // Consume, in entry mode and in punch mode (where only deflate and stored are punched).
+    for o in [opts(), punch_opts(8 << 10)] {
+        let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+        run(&fs, &o).unwrap();
+        assert_complete(&fs, &expected(&sp));
+        assert!(
+            fs.peak() <= guaranteed_peak(&bytes, &o),
+            "peak {}",
+            fs.peak()
+        );
+    }
+}
+
+#[test]
+fn big_stream_method_entries_are_not_punched() {
+    // In punch mode a large zstd entry is still extracted whole: its compressed bytes stay
+    // until the entry is complete, so the peak holds both.
+    let mut rng = Rng::new(21);
+    let big = fixtures::text_bytes(&mut rng, 2 << 20);
+    let sp = vec![Spec::file("big.zst.txt", &big).method(93)];
+    let bytes = build(&sp, b"");
+    let o = punch_opts(64 << 10);
+    let fs = fresh(CrashModel::LoseUnflushed, &bytes);
+    run(&fs, &o).unwrap();
+    assert_complete(&fs, &expected(&sp));
+    assert!(fs.peak() >= big.len() as u64 + bytes.len() as u64 / 2);
+    assert!(fs.peak() <= guaranteed_peak(&bytes, &o));
+}
+
+/// Offsets of the central-directory records.
+fn cd_records(bytes: &[u8]) -> Vec<usize> {
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == [0x50, 0x4b, 0x01, 0x02])
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[test]
+fn crc_or_payload_damage_in_stream_entries_is_refused() {
+    let mut rng = Rng::new(22);
+    let data = fixtures::text_bytes(&mut rng, 30_000);
+    for m in STREAM_METHODS {
+        let sp = vec![
+            Spec::file("first.txt", b"first entry, consumed before the damaged one"),
+            Spec::file("bad.txt", &data).method(m),
+        ];
+        let good = build(&sp, b"");
+        let cds = cd_records(&good);
+        assert_eq!(cds.len(), 2);
+        // The second entry's local header follows the first entry's record.
+        let second = ZipBuilder::local_record(&sp[0]).len();
+        assert_eq!(&good[second..second + 4], b"PK\x03\x04");
+
+        // Wrong CRC in both headers: the data decodes but does not match.
+        let mut crc = good.clone();
+        for at in [second + 14, cds[1] + 16] {
+            crc[at] ^= 0x01;
+        }
+        // Damaged payload: the decoder itself (or the CRC) catches it.
+        let mut payload = good.clone();
+        let data_at = second + 30 + "bad.txt".len();
+        payload[data_at + (cds[0] - data_at) / 3] ^= 0x5A;
+
+        for (what, bytes) in [("crc", &crc), ("payload", &payload)] {
+            let fs = fresh(CrashModel::WriteThrough, bytes);
+            match extract(&fs) {
+                Err(Error::Integrity(msg)) => assert!(msg.contains("bad.txt"), "{msg}"),
+                other => panic!("method {m} {what}: extract gave {other:?}"),
+            }
+            let fs = fresh(CrashModel::WriteThrough, bytes);
+            match run(&fs, &opts()) {
+                Err(Error::Integrity(msg)) => assert!(msg.contains("bad.txt"), "{msg}"),
+                other => panic!("method {m} {what}: consume gave {other:?}"),
+            }
+            let len = fs.get_file(Path::new(ARC)).unwrap().len();
+            assert!(
+                len >= cds[0],
+                "method {m} {what}: the damaged entry was released"
+            );
+        }
+    }
+}
+
+#[test]
+fn lzma_and_unknown_methods_are_refused_untouched() {
+    for (m, word) in [(14u16, "LZMA"), (98, "PPMd"), (200, "200")] {
+        let bytes = build(
+            &[
+                Spec::file("ok.txt", b"fine"),
+                Spec::file("odd.bin", b"not really compressed").method(m),
+            ],
+            b"",
+        );
+        let fs = fresh(CrashModel::WriteThrough, &bytes);
+        match run(&fs, &opts()) {
+            Err(Error::Input(msg)) => {
+                assert!(msg.contains(word) && msg.contains("supported"), "{msg}");
+            }
+            other => panic!("method {m}: {other:?}"),
+        }
+        assert_eq!(fs.snapshot().keys().collect::<Vec<_>>(), vec!["a.zip"]);
+        assert!(matches!(extract(&fs), Err(Error::Input(_))));
+    }
+}
+
+#[test]
+fn crash_sweep_mixed_methods() {
+    let mut rng = Rng::new(23);
+    let sp = vec![
+        Spec::file("d.txt", &fixtures::text_bytes(&mut rng, 24_000)),
+        Spec::file("b.txt", &fixtures::text_bytes(&mut rng, 6_000)).method(12),
+        Spec::file("z.txt", &fixtures::text_bytes(&mut rng, 20_000)).method(93),
+        Spec::file("x.txt", &fixtures::text_bytes(&mut rng, 6_000))
+            .method(95)
+            .descriptor(true),
+        Spec::file("s.bin", &fixtures::noise_bytes(&mut rng, 8_000)).stored(),
+    ];
+    let bytes = build(&sp, b"");
+    let want = expected(&sp);
+    let n = sweep(CrashModel::LoseUnflushed, &bytes, &want, &opts(), false);
+    assert!(n > 20, "{n} crash points");
+    sweep(CrashModel::WriteThrough, &bytes, &want, &opts(), false);
+    // Punch mode: deflate and stored entries punch, the others go whole.
+    let o = punch_opts(4 << 10);
+    sweep(CrashModel::WriteThrough, &bytes, &want, &o, false);
+}

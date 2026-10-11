@@ -91,22 +91,22 @@ pub fn inspect(archive: &Path, list: bool) -> Result<ExitCode> {
     let files = l.entries.iter().filter(|e| e.kind == Kind::File).count();
     let total: u64 = l.entries.iter().map(|e| e.size).sum();
     let stored: u64 = l.entries.iter().map(|e| e.compressed_size).sum();
-    let deflated = l
-        .entries
-        .iter()
-        .filter(|e| e.method == Method::Deflate)
-        .count();
+    let count = |m: Method| l.entries.iter().filter(|e| e.method == m).count();
+    let deflated = count(Method::Deflate);
+    let mut methods = format!("{deflated} deflated, {} stored", count(Method::Stored));
+    for m in [Method::Bzip2, Method::Zstd, Method::Xz] {
+        let n = count(m);
+        if n > 0 {
+            let _ = std::fmt::Write::write_fmt(&mut methods, format_args!(", {n} {}", m.name()));
+        }
+    }
     println!("archive    {} (ZIP)", archive.display());
     println!(
         "entries    {files} files, {} directories/links",
         l.entries.len() - files
     );
     println!("content    {}", bytes(total));
-    println!(
-        "stored     {} ({deflated} deflated, {} stored)",
-        bytes(stored),
-        l.entries.len() - deflated
-    );
+    println!("stored     {} ({methods})", bytes(stored));
     println!("file size  {}", bytes(l.file_len));
     if !l.overlaps.is_empty() {
         println!(
