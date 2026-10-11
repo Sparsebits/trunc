@@ -1,0 +1,30 @@
+[package]
+name = "layerless"
+description = "Pull a container image straight to a root filesystem: no tarball, no daemon, no double disk. Built on trunc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "layerless"
+path = "src/main.rs"
+
+[dependencies]
+trunc-engine.workspace = true
+trunc-fs.workspace = true
+trunc-hash.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+# Blocking HTTPS in pure Rust (rustls + ring, Mozilla's roots); no async runtime.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+trunc-testkit.workspace = true
+
+[lints]
+workspace = true
