@@ -50,6 +50,85 @@ fn corrupt(msg: impl Into<String>) -> ZipError {
 pub enum Method {
     Stored,
     Deflate,
+    /// Method 12: complete bzip2 streams.
+    Bzip2,
+    /// Method 93: zstd frames.
+    Zstd,
+    /// Method 95: a complete xz stream.
+    Xz,
+}
+
+impl Method {
+    /// The method for a ZIP method number, or why it is refused.
+    pub fn from_raw(m: u16) -> std::result::Result<Self, String> {
+        Ok(match m {
+            0 => Method::Stored,
+            8 => Method::Deflate,
+            12 => Method::Bzip2,
+            93 => Method::Zstd,
+            95 => Method::Xz,
+            m => {
+                let name = match m {
+                    1 => " (shrink)",
+                    2..=5 => " (reduce)",
+                    6 => " (implode)",
+                    9 => " (deflate64)",
+                    14 => " (LZMA)",
+                    96 => " (JPEG)",
+                    97 => " (WavPack)",
+                    98 => " (PPMd)",
+                    99 => " (AES encryption)",
+                    _ => "",
+                };
+                return Err(format!(
+                    "compression method {m}{name}; supported: stored, deflate, bzip2, zstd, xz"
+                ));
+            }
+        })
+    }
+
+    /// The ZIP method number.
+    pub fn raw(self) -> u16 {
+        match self {
+            Method::Stored => 0,
+            Method::Deflate => 8,
+            Method::Bzip2 => 12,
+            Method::Zstd => 93,
+            Method::Xz => 95,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Method::Stored => "stored",
+            Method::Deflate => "deflate",
+            Method::Bzip2 => "bzip2",
+            Method::Zstd => "zstd",
+            Method::Xz => "xz",
+        }
+    }
+
+    /// Code in the serialized layout (0 and 1 keep their original stored/deflate meaning).
+    fn code(self) -> u8 {
+        match self {
+            Method::Stored => 0,
+            Method::Deflate => 1,
+            Method::Bzip2 => 2,
+            Method::Zstd => 3,
+            Method::Xz => 4,
+        }
+    }
+
+    fn from_code(c: u8) -> Option<Self> {
+        Some(match c {
+            0 => Method::Stored,
+            1 => Method::Deflate,
+            2 => Method::Bzip2,
+            3 => Method::Zstd,
+            4 => Method::Xz,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,11 +383,7 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
         if flags & FLAG_ENCRYPTED != 0 {
             return Err(ZipError::Unsupported("encrypted entries".into()));
         }
-        let method = match method_raw {
-            0 => Method::Stored,
-            8 => Method::Deflate,
-            m => return Err(ZipError::Unsupported(format!("compression method {m}"))),
-        };
+        let method = Method::from_raw(method_raw).map_err(ZipError::Unsupported)?;
         if method == Method::Stored && csize != usize_ {
             return Err(corrupt(
                 "stored entry with different compressed and uncompressed sizes",
@@ -493,9 +568,8 @@ impl Layout {
                 Kind::Dir => 1,
                 Kind::Symlink => 2,
             };
-            let method = u8::from(e.method == Method::Deflate);
             b.push(kind);
-            b.push(method);
+            b.push(e.method.code());
             b.extend_from_slice(&e.crc32.to_le_bytes());
             for v in [
                 e.compressed_size,
@@ -528,11 +602,7 @@ impl Layout {
                 2 => Kind::Symlink,
                 _ => return None,
             };
-            let method = if r.take(1)?[0] == 1 {
-                Method::Deflate
-            } else {
-                Method::Stored
-            };
+            let method = Method::from_code(r.take(1)?[0])?;
             let crc32 = r.u32()?;
             let (compressed_size, size, region_start, data_offset, region_end) =
                 (r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?);

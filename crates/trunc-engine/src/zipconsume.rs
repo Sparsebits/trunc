@@ -12,7 +12,8 @@
 //! **Punch mode** frees space inside a large entry as it decompresses: after each checkpoint
 //! (output flushed, inflate state saved in the journal) the compressed bytes already consumed
 //! are deallocated. The entry's CRC is verified in a read-only pass first, because once bytes
-//! are punched a corrupt entry could no longer be retried.
+//! are punched a corrupt entry could no longer be retried. Only stored and deflate entries are
+//! punched; bzip2, zstd and xz entries are always extracted whole before their bytes are freed.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ use trunc_core::space::SpaceParams;
 use trunc_fs::{Dealloc, FileHandle, FsBackend, FsError, NodeKind, OpenMode, Share};
 use trunc_journal::Journal;
 use trunc_legacy::inflate::{Checkpoint, InflateError, Inflater, WINDOW};
+use trunc_legacy::stream::{self, Codec, Input, Limits, NoHistory, StreamError};
 use trunc_legacy::zip::{self, Entry, Kind, Layout, Method};
 
 use crate::consume::{ConsumeOptions, ConsumeSummary, Progress, stage_dir};
@@ -245,7 +247,42 @@ fn should_punch(layout: &Layout, e: &Entry, opts: &ConsumeOptions, can_dealloc: 
         && can_dealloc
         && layout.overlaps.is_empty()
         && e.kind == Kind::File
+        && can_punch(e.method)
         && e.compressed_size >= opts.zip.punch_min.max(1)
+}
+
+/// Methods whose decoders can checkpoint and resume inside an entry.
+fn can_punch(m: Method) -> bool {
+    matches!(m, Method::Stored | Method::Deflate)
+}
+
+/// The stream codec that decodes an entry, for methods other than stored and deflate.
+fn codec_of(m: Method) -> Option<Codec> {
+    match m {
+        Method::Stored | Method::Deflate => None,
+        Method::Bzip2 => Some(Codec::Bzip2),
+        Method::Zstd => Some(Codec::Zstd),
+        Method::Xz => Some(Codec::Xz),
+    }
+}
+
+fn not_punchable(m: Method) -> InflateError {
+    InflateError::Callback(format!(
+        "{} entries cannot be freed while they decompress (only stored and deflate can)",
+        m.name()
+    ))
+}
+
+/// Map a stream decoder error for entry `name`.
+fn stream_err(name: &str, e: StreamError, need_free: u64) -> Error {
+    match e {
+        StreamError::Fs(f) => nospace(f, need_free),
+        StreamError::Corrupt(m) | StreamError::Format(m) => {
+            Error::Integrity(format!("{name}: {m}"))
+        }
+        StreamError::Unsupported(m) => Error::Input(format!("{name}: {m}")),
+        StreamError::Stopped => Error::Integrity(format!("{name}: decoding stopped unexpectedly")),
+    }
 }
 
 /// Space needed to consume (or extract) a ZIP from its current length.
@@ -398,6 +435,51 @@ fn decode_entry(
                 off += n as u64;
             }
             (off, h.finalize())
+        }
+        // Some writers store an empty file as an empty payload whatever the method.
+        Method::Bzip2 | Method::Zstd | Method::Xz if e.compressed_size == 0 && e.size == 0 => {
+            (0, 0)
+        }
+        m @ (Method::Bzip2 | Method::Zstd | Method::Xz) => {
+            let codec = codec_of(m).expect("a stream method");
+            let region = crate::image::Region {
+                h: archive,
+                off: e.data_offset,
+                len: e.compressed_size,
+            };
+            let limits = Limits {
+                // Entries are already decoded side by side; only large ones get extra threads.
+                threads: if e.compressed_size >= 64 << 20 { 0 } else { 1 },
+                ..Limits::new(e.size)
+            };
+            let mut h = crc32fast::Hasher::new();
+            let mut total = 0u64;
+            let mut sink_err: Option<InflateError> = None;
+            let r = stream::decode(
+                codec,
+                Input {
+                    src: &region,
+                    len: e.compressed_size,
+                },
+                None,
+                &mut NoHistory,
+                limits,
+                0,
+                &mut |b| {
+                    h.update(b);
+                    total += b.len() as u64;
+                    sink(b).map_err(|x| {
+                        sink_err = Some(x);
+                        StreamError::Stopped
+                    })
+                },
+                &mut |_| Ok(()),
+            );
+            if let Some(x) = sink_err {
+                return Err(inflate_err(&e.name, x, need_free));
+            }
+            r.map_err(|x| stream_err(&e.name, x, need_free))?;
+            (total, h.finalize())
         }
     };
     if total != e.size || (check_crc && crc != e.crc32) {
@@ -584,6 +666,7 @@ fn extract_punching(
             )
             .map(|f| (f.out_total, f.crc, f.in_bits.div_ceil(8))),
         Method::Stored => copy_stored(archive, e, &start, &mut sink, every, &mut on_ckpt),
+        m @ (Method::Bzip2 | Method::Zstd | Method::Xz) => Err(not_punchable(m)),
     };
     if let Some(je) = journal_error {
         return Err(journal_err(je));
@@ -641,6 +724,7 @@ fn verify_checkpoints(
                 Ok(())
             },
         ),
+        m @ (Method::Bzip2 | Method::Zstd | Method::Xz) => Err(not_punchable(m)),
     }
     .map_err(|x| inflate_err(&e.name, x, need_free))?;
     if total != e.size || crc != e.crc32 || used > e.compressed_size {
@@ -1275,14 +1359,25 @@ mod tests {
                 Kind::File => random_size(rng, large_ok),
             };
             let method = if kind == Kind::File && rng.below(3) != 0 {
-                Method::Deflate
+                // Mostly deflate; sometimes a method that is never punched.
+                pick(
+                    rng,
+                    &[
+                        Method::Deflate,
+                        Method::Deflate,
+                        Method::Deflate,
+                        Method::Bzip2,
+                        Method::Zstd,
+                        Method::Xz,
+                    ],
+                )
             } else {
                 Method::Stored
             };
             let compressed_size = match method {
                 Method::Stored => size,
-                Method::Deflate if size == 0 => 2,
-                Method::Deflate => match rng.below(4) {
+                _ if size == 0 => 2,
+                _ => match rng.below(4) {
                     0 => between(rng, 1, size / 100 + 1),
                     1 => between(rng, 1, size),
                     2 => between(rng, size / 2 + 1, size),
@@ -1534,7 +1629,7 @@ mod tests {
                     while done < e.size {
                         let step = match e.method {
                             Method::Stored => 1 << 20,
-                            Method::Deflate => between(rng, 1, c.max_block),
+                            _ => between(rng, 1, c.max_block),
                         };
                         done += step.min(e.size - done);
                         if done == e.size || done - last_ck < every {
@@ -1627,16 +1722,17 @@ mod tests {
         let mut pos = between(rng, 0, 1 << 20);
         for e in &mut layout.entries {
             e.kind = Kind::File;
-            e.method = if rng.below(4) == 0 {
-                Method::Stored
-            } else {
-                Method::Deflate
+            e.method = match rng.below(8) {
+                0 | 1 => Method::Stored,
+                // Not punched: extracted whole even in punch mode.
+                2 => pick(rng, &[Method::Bzip2, Method::Zstd, Method::Xz]),
+                _ => Method::Deflate,
             };
             e.size = between(rng, 32 << 20, 1536 << 20);
             e.compressed_size = match e.method {
                 Method::Stored => e.size,
-                Method::Deflate if rng.below(4) == 0 => e.size + e.size / between(rng, 64, 4096),
-                Method::Deflate => e.size / between(rng, 1, 1000),
+                _ if rng.below(4) == 0 => e.size + e.size / between(rng, 64, 4096),
+                _ => e.size / between(rng, 1, 1000),
             };
             let hdr = e.data_offset - e.region_start;
             let dd = pick(rng, &[0, 12, 16, 24]);

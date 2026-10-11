@@ -188,10 +188,10 @@ pub struct ImageSummary {
 /// A read-only window `[off, off + len)` of another file, so a layer blob inside the outer tar
 /// can be handed to a decoder as a file of its own.
 #[derive(Debug)]
-struct Region<'a> {
-    h: &'a dyn FileHandle,
-    off: u64,
-    len: u64,
+pub(crate) struct Region<'a> {
+    pub(crate) h: &'a dyn FileHandle,
+    pub(crate) off: u64,
+    pub(crate) len: u64,
 }
 
 impl Region<'_> {
@@ -218,7 +218,7 @@ impl FileHandle for Region<'_> {
                 path: self.h.path().to_path_buf(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "read past the end of a layer blob",
+                    "read past the end of an embedded stream",
                 ),
             });
         }

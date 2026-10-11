@@ -48,6 +48,38 @@ fn content(h: &dyn FileHandle, e: &Entry) -> Vec<u8> {
             assert_eq!(f.crc, e.crc32);
             out
         }
+        Method::Bzip2 | Method::Zstd | Method::Xz => {
+            use trunc_legacy::stream::{self, Codec, Input, Limits, NoHistory};
+            let codec = match e.method {
+                Method::Bzip2 => Codec::Bzip2,
+                Method::Zstd => Codec::Zstd,
+                _ => Codec::Xz,
+            };
+            let mut packed = vec![0u8; e.compressed_size as usize];
+            h.read_exact_at(&mut packed, e.data_offset).unwrap();
+            let (fs, ph) = host(&packed);
+            let mut out = Vec::new();
+            stream::decode(
+                codec,
+                Input {
+                    src: ph.as_ref(),
+                    len: e.compressed_size,
+                },
+                None,
+                &mut NoHistory,
+                Limits::new(e.size),
+                0,
+                &mut |b| {
+                    out.extend_from_slice(b);
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            drop(fs);
+            assert_eq!(crc32fast::hash(&out), e.crc32);
+            out
+        }
     }
 }
 
@@ -66,6 +98,12 @@ fn sample_specs() -> Vec<Spec> {
         Spec::file("big64/zd.txt", &fixtures::text_bytes(&mut rng, 4000))
             .zip64()
             .descriptor(true),
+        Spec::file("m/bzip2.txt", &fixtures::text_bytes(&mut rng, 7000)).method(12),
+        Spec::file("m/zstd.txt", &fixtures::text_bytes(&mut rng, 7000)).method(93),
+        Spec::file("m/xz.txt", &fixtures::text_bytes(&mut rng, 7000))
+            .method(95)
+            .descriptor(true),
+        Spec::file("m/zstd_empty", b"").method(93),
     ]
 }
 
@@ -209,9 +247,22 @@ fn rejects_unsupported_and_inconsistent_archives() {
     enc[6] |= 1; // and local header
     assert!(matches!(parse(&enc), Err(ZipError::Unsupported(_))));
 
+    // Methods other than stored, deflate, bzip2, zstd and xz are refused by name.
+    for (m, word) in [(14u16, "LZMA"), (9, "deflate64"), (98, "PPMd"), (77, "77")] {
+        let mut method = base.clone();
+        method[cd + 10..cd + 12].copy_from_slice(&m.to_le_bytes());
+        method[8..10].copy_from_slice(&m.to_le_bytes());
+        match parse(&method) {
+            Err(ZipError::Unsupported(msg)) => {
+                assert!(msg.contains(word) && msg.contains("supported:"), "{msg}");
+            }
+            other => panic!("method {m}: {other:?}"),
+        }
+    }
+    // A method that disagrees with the local header is corrupt.
     let mut method = base.clone();
-    method[cd + 10] = 12; // bzip2
-    assert!(matches!(parse(&method), Err(ZipError::Unsupported(_))));
+    method[cd + 10] = 12;
+    assert!(matches!(parse(&method), Err(ZipError::Corrupt(_))));
 
     let mut name = base.clone();
     name[30] = b'b'; // local header name differs from the directory
