@@ -407,6 +407,92 @@ fn killed_iso_consume_resumes() {
     }
 }
 
+fn write_plain_tar(path: &Path, seed: u64) -> Vec<(String, Vec<u8>)> {
+    use trunc_testkit::tarbuild::{self, Spec};
+    let mut rng = trunc_testkit::Rng::new(seed);
+    let files = vec![
+        (
+            "pkg/readme.txt".to_string(),
+            fixtures::text_bytes(&mut rng, 20_000),
+        ),
+        (
+            "pkg/data/big.bin".to_string(),
+            fixtures::noise_bytes(&mut rng, 3 << 20),
+        ),
+        ("Top Level.txt".to_string(), b"top level".to_vec()),
+    ];
+    let mut specs: Vec<Spec> = files.iter().map(|(n, d)| Spec::file(n, d)).collect();
+    specs.push(Spec::symlink("pkg/link", "readme.txt"));
+    std::fs::write(path, tarbuild::tar(&specs)).unwrap();
+    files
+}
+
+#[test]
+fn plain_tar_inspect_verify_plan_extract_consume() {
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path();
+    let files = write_plain_tar(&w.join("a.tar"), 1);
+
+    let s = ok(&trunc(&["inspect", "a.tar", "--entries"], w));
+    assert!(
+        s.contains("(tar, uncompressed)") && s.contains("pkg/data/big.bin"),
+        "{s}"
+    );
+    assert!(ok(&trunc(&["verify", "a.tar"], w)).starts_with("ok:"));
+    let s = ok(&trunc(&["plan", "a.tar", "-C", "out"], w));
+    assert!(s.contains("consume (--consume)"), "{s}");
+
+    let s = ok(&trunc(&["x", "a.tar", "-C", "copy"], w));
+    assert!(s.contains("symlinks  1 skipped"), "{s}");
+    assert_files(&w.join("copy"), &files);
+    assert!(w.join("a.tar").exists());
+
+    let s = ok(&trunc(
+        &["x", "a.tar", "-C", "out", "--consume", "--yes"],
+        w,
+    ));
+    assert!(s.contains("consumed and removed"), "{s}");
+    assert_files(&w.join("out"), &files);
+    assert!(!w.join("a.tar").exists() && !w.join("a.tar.trncj").exists());
+}
+
+/// Kill a punch-mode plain tar consume at arbitrary points; `trunc resume` must finish it.
+#[test]
+fn killed_plain_tar_consume_resumes() {
+    for (round, delay_ms) in [10u64, 60, 150, 400].into_iter().enumerate() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path();
+        let files = write_plain_tar(&w.join("a.tar"), 20 + round as u64);
+        let flags = ["--yes", "--punch-min", "1", "--checkpoint-every", "64K"];
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trunc"))
+            .args([&["x", "a.tar", "-C", "out", "--consume"][..], &flags].concat())
+            .current_dir(w)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+        if w.join("a.tar.trncj").exists() {
+            let s = ok(&trunc(&["inspect", "a.tar"], w));
+            assert!(s.contains("being consumed"), "{s}");
+            ok(&trunc(&[&["resume", "a.tar"][..], &flags].concat(), w));
+        } else if w.join("a.tar").exists() {
+            ok(&trunc(
+                &[&["x", "a.tar", "-C", "out", "--consume"][..], &flags].concat(),
+                w,
+            ));
+        }
+        assert_files(&w.join("out"), &files);
+        assert!(!w.join("a.tar").exists(), "round {round}: tar left behind");
+        assert!(
+            !w.join("a.tar.trncj").exists(),
+            "round {round}: journal left behind"
+        );
+    }
+}
+
 /// A tiny ZIP whose directory claims 1 TiB of output is refused before anything is written.
 #[test]
 fn zip_bomb_is_refused_by_the_space_check() {

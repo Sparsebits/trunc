@@ -48,7 +48,11 @@ pub fn open_image(fs: &dyn FsBackend, archive: &Path) -> Result<Image> {
 }
 
 /// Fill in every file's CRC-32 by reading its data once.
-fn checksummed(h: &dyn FileHandle, mut layout: Layout, parallel: bool) -> Result<Layout> {
+pub(crate) fn checksummed(
+    h: &dyn FileHandle,
+    mut layout: Layout,
+    parallel: bool,
+) -> Result<Layout> {
     let _prof = trunc_prof::span("iso.checksum");
     let crc = |e: &trunc_legacy::zip::Entry| -> Result<u32> {
         let mut c = crc32fast::Hasher::new();

@@ -13,6 +13,7 @@
 //!   root filesystem.
 //! - [`isoconsume`] extracts, verifies and consumes ISO 9660 images through the ZIP machinery.
 //! - [`sevenz`] inspects, verifies and extracts 7z archives (not destructively yet).
+//! - [`tarconsume`] does the same for uncompressed tar archives.
 
 pub mod archive;
 pub mod consume;
@@ -29,6 +30,7 @@ pub mod sevenz;
 pub mod source;
 mod stage;
 pub mod streamconsume;
+pub mod tarconsume;
 mod walk;
 pub mod zipconsume;
 
