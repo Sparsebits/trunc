@@ -608,6 +608,7 @@ fn items_of(m: &Manifest) -> Vec<Item> {
                 EntryKind::Symlink { .. } => ItemKind::Symlink,
             },
             size: e.size,
+            len: e.size,
             mode: Some(e.mode),
             mtime_unix: e.mtime_unix,
             mtime_nanos: e.mtime_nanos,

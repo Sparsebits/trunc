@@ -15,6 +15,9 @@ pub(crate) enum ItemKind {
     File,
     Dir,
     Symlink,
+    /// A second name for a file, made once the file is complete (by the format's own code, not
+    /// by [`build_structure`]).
+    HardLink,
 }
 
 /// One archive entry, format-neutral.
@@ -23,6 +26,8 @@ pub(crate) struct Item {
     pub path: String,
     pub kind: ItemKind,
     pub size: u64,
+    /// Length on disk: a sparse file's real size (its holes included), else `size`.
+    pub len: u64,
     pub mode: Option<u32>,
     pub mtime_unix: i64,
     pub mtime_nanos: u32,
@@ -252,12 +257,26 @@ pub(crate) fn first_existing(
 }
 
 /// True if the entry's top-level item was already moved into the destination by an earlier run.
-fn already_moved(fs: &dyn FsBackend, dest: &Path, stage: &Path, rel: &str) -> Result<bool> {
+pub(crate) fn already_moved(
+    fs: &dyn FsBackend,
+    dest: &Path,
+    stage: &Path,
+    rel: &str,
+) -> Result<bool> {
     let top = rel.split('/').next().unwrap_or(rel);
     Ok(fs.metadata(&stage.join(top))?.is_none() && fs.metadata(&dest.join(top))?.is_some())
 }
 
-/// Create directories and empty files in the staging area (idempotent).
+/// Give a new file with no content its length as a hole. Deallocating first marks the file
+/// sparse where the filesystem needs that (NTFS), so the new length allocates nothing.
+pub(crate) fn extend_hollow(h: &dyn FileHandle, len: u64) -> Result<()> {
+    h.deallocate(0, len)?;
+    h.set_len(len)?;
+    Ok(())
+}
+
+/// Create directories and empty files in the staging area (idempotent). A sparse file with no
+/// data gets its length as a hole.
 pub(crate) fn build_structure(
     fs: &dyn FsBackend,
     items: &[Item],
@@ -304,7 +323,7 @@ pub(crate) fn build_structure(
     for e in items {
         match e.kind {
             ItemKind::Symlink => summary.symlinks_skipped += 1,
-            ItemKind::File => summary.files += 1,
+            ItemKind::File | ItemKind::HardLink => summary.files += 1,
             ItemKind::Dir => {}
         }
         if e.kind != ItemKind::File || e.size > 0 || already_moved(&e.path)? {
@@ -313,12 +332,26 @@ pub(crate) fn build_structure(
         let p = join_rel(stage, &e.path);
         match fs.open_beneath(stage, &p, OpenMode::CreateNew, Share::Exclusive) {
             Ok(h) => {
+                if e.len > 0 {
+                    extend_hollow(h.as_ref(), e.len)?;
+                }
                 h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
                 empty.push(h);
                 to_flush.insert(parent_of(&p));
             }
-            Err(FsError::AlreadyExists { .. }) => match fs.metadata(&p)?.map(|m| m.kind) {
-                Some(NodeKind::File) => check_exact_name(fs, &p)?,
+            Err(FsError::AlreadyExists { .. }) => match fs.metadata(&p)? {
+                Some(m) if m.kind == NodeKind::File => {
+                    check_exact_name(fs, &p)?;
+                    if m.len != e.len {
+                        // Created by an interrupted run that did not get to the length.
+                        let h =
+                            fs.open_beneath(stage, &p, OpenMode::ReadWrite, Share::Exclusive)?;
+                        h.set_len(0)?;
+                        extend_hollow(h.as_ref(), e.len)?;
+                        h.set_modified(system_time(e.mtime_unix, e.mtime_nanos))?;
+                        empty.push(h);
+                    }
+                }
                 _ => return Err(Error::Refused(format!("{} is not a file", p.display()))),
             },
             Err(e) => return Err(e.into()),
@@ -338,7 +371,11 @@ pub(crate) fn rename_into_place(
     dest: &Path,
     stage: &Path,
 ) -> Result<()> {
-    for e in items.iter().filter(|e| e.kind == ItemKind::File) {
+    // A hard link carries the mode of the file it names: the same file, or a copy of it.
+    for e in items
+        .iter()
+        .filter(|e| matches!(e.kind, ItemKind::File | ItemKind::HardLink))
+    {
         if let Some(mode) = e.mode {
             ignore_not_found(fs.set_mode(&join_rel(stage, &e.path), mode))?;
         }

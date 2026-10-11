@@ -1,5 +1,6 @@
-//! A tar writer for parser and consume tests: ustar headers, GNU long names, PAX records,
-//! base-256 sizes, raw entry types, and gzip output with a chosen block size or several members.
+//! A tar writer for parser and consume tests: ustar headers, GNU long names and links, PAX
+//! records, base-256 sizes, raw entry types, hard links, sparse files in the old GNU format and
+//! the PAX formats 0.0, 0.1 and 1.0, and gzip output with a chosen block size or several members.
 
 use std::io::Write;
 
@@ -19,6 +20,30 @@ pub struct Spec {
     pub name_via: NameVia,
     /// Extra PAX records to emit before this entry.
     pub pax: Vec<(String, String)>,
+    /// For a sparse file: how its map is written. `data` then holds only the stored segments.
+    pub sparse: Option<SparseSpec>,
+}
+
+/// How a sparse file is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseFormat {
+    /// Type `S` with the map in the header and extension headers (`tar --format=gnu`).
+    OldGnu,
+    /// PAX records `GNU.sparse.offset` / `GNU.sparse.numbytes`, repeated.
+    Pax00,
+    /// PAX record `GNU.sparse.map`.
+    Pax01,
+    /// The map at the start of the data (`tar --format=pax`).
+    Pax10,
+}
+
+/// A sparse file's map, written as given (so tests can also write bad ones).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseSpec {
+    pub format: SparseFormat,
+    pub real_size: u64,
+    /// `(offset, length)` of each stored segment.
+    pub map: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +63,7 @@ impl Spec {
             mtime: 1_700_000_000,
             name_via: NameVia::Header,
             pax: Vec::new(),
+            sparse: None,
         }
     }
 
@@ -56,6 +82,51 @@ impl Spec {
         }
     }
 
+    /// A hard link to `target`. A long target is stored like a long name (see [`via`](Self::via)).
+    pub fn hardlink(name: &str, target: &str) -> Self {
+        Self {
+            typeflag: b'1',
+            ..Self::file(name, target.as_bytes())
+        }
+    }
+
+    /// A sparse file of `real_size` bytes with data `segments` at their offsets, holes
+    /// elsewhere.
+    pub fn sparse(
+        name: &str,
+        real_size: u64,
+        segments: &[(u64, &[u8])],
+        format: SparseFormat,
+    ) -> Self {
+        let data: Vec<u8> = segments
+            .iter()
+            .flat_map(|(_, d)| d.iter().copied())
+            .collect();
+        Self {
+            sparse: Some(SparseSpec {
+                format,
+                real_size,
+                map: segments.iter().map(|(o, d)| (*o, d.len() as u64)).collect(),
+            }),
+            ..Self::file(name, &data)
+        }
+    }
+
+    /// The file's content once extracted: a sparse file with its holes filled with zeros.
+    pub fn content(&self) -> Vec<u8> {
+        let Some(sp) = &self.sparse else {
+            return self.data.clone();
+        };
+        let mut out = vec![0u8; usize::try_from(sp.real_size).expect("small test file")];
+        let mut at = 0usize;
+        for &(off, len) in &sp.map {
+            let (off, len) = (off as usize, len as usize);
+            out[off..off + len].copy_from_slice(&self.data[at..at + len]);
+            at += len;
+        }
+        out
+    }
+
     pub fn via(mut self, how: NameVia) -> Self {
         self.name_via = how;
         self
@@ -65,6 +136,32 @@ impl Spec {
 fn octal(field: &mut [u8], v: u64) {
     let s = format!("{:0width$o}\0", v, width = field.len() - 1);
     field.copy_from_slice(s.as_bytes());
+}
+
+/// A 12-byte number field: octal, or GNU base-256 when it does not fit in 11 octal digits.
+fn number12(field: &mut [u8], v: u64) {
+    if v < 0o777_7777_7777 {
+        octal(field, v);
+    } else {
+        field.fill(0);
+        field[0] = 0x80;
+        field[4..12].copy_from_slice(&v.to_be_bytes());
+    }
+}
+
+fn checksum(h: &mut [u8; 512]) {
+    h[148..156].fill(b' ');
+    let sum: u64 = h.iter().map(|&c| u64::from(c)).sum();
+    let s = format!("{sum:06o}\0 ");
+    h[148..156].copy_from_slice(s.as_bytes());
+}
+
+/// Old GNU sparse map entries (offset and length, 24 bytes each).
+fn gnu_sparse_entries(out: &mut [u8], map: &[(u64, u64)]) {
+    for (i, &(off, len)) in map.iter().enumerate() {
+        number12(&mut out[i * 24..i * 24 + 12], off);
+        number12(&mut out[i * 24 + 12..i * 24 + 24], len);
+    }
 }
 
 fn header(
@@ -81,13 +178,7 @@ fn header(
     octal(&mut h[100..108], u64::from(mode));
     octal(&mut h[108..116], 0);
     octal(&mut h[116..124], 0);
-    if size < 0o777_7777_7777 {
-        octal(&mut h[124..136], size);
-    } else {
-        // GNU base-256 for sizes that do not fit in 11 octal digits.
-        h[124] = 0x80;
-        h[128..136].copy_from_slice(&size.to_be_bytes());
-    }
+    number12(&mut h[124..136], size);
     octal(&mut h[136..148], mtime);
     h[156] = typeflag;
     let l = link.len().min(100);
@@ -95,10 +186,7 @@ fn header(
     h[257..263].copy_from_slice(b"ustar\0");
     h[263..265].copy_from_slice(b"00");
     h[345..345 + prefix.len()].copy_from_slice(prefix);
-    h[148..156].fill(b' ');
-    let sum: u64 = h.iter().map(|&c| u64::from(c)).sum();
-    let s = format!("{sum:06o}\0 ");
-    h[148..156].copy_from_slice(s.as_bytes());
+    checksum(&mut h);
     h
 }
 
@@ -121,6 +209,76 @@ pub fn tar(specs: &[Spec]) -> Vec<u8> {
     for s in specs {
         let name = s.name.as_bytes();
         let mut pax: String = s.pax.iter().map(|(k, v)| pax_record(k, v)).collect();
+        let link = (s.typeflag == b'1' || s.typeflag == b'2').then_some(&s.data[..]);
+        if let Some(l) = link.filter(|l| l.len() > 100) {
+            match s.name_via {
+                NameVia::GnuLong => {
+                    let mut long = l.to_vec();
+                    long.push(0);
+                    out.extend_from_slice(&header(
+                        b"././@LongLink",
+                        b"",
+                        b'K',
+                        long.len() as u64,
+                        0,
+                        0,
+                        b"",
+                    ));
+                    out.extend_from_slice(&long);
+                    pad(&mut out);
+                }
+                NameVia::Pax => {
+                    pax.push_str(&pax_record("linkpath", std::str::from_utf8(l).unwrap()));
+                }
+                NameVia::Header => panic!("link target too long for a header; use GnuLong or Pax"),
+            }
+        }
+        // Sparse files in a PAX format: map records, and for 1.0 the map text before the data.
+        let mut map_text = Vec::new();
+        let mut fake_name = None;
+        if let Some(sp) = s
+            .sparse
+            .as_ref()
+            .filter(|sp| sp.format != SparseFormat::OldGnu)
+        {
+            let n = sp.map.len();
+            let real = sp.real_size.to_string();
+            match sp.format {
+                SparseFormat::Pax00 => {
+                    pax.push_str(&pax_record("GNU.sparse.size", &real));
+                    pax.push_str(&pax_record("GNU.sparse.numblocks", &n.to_string()));
+                    for (off, len) in &sp.map {
+                        pax.push_str(&pax_record("GNU.sparse.offset", &off.to_string()));
+                        pax.push_str(&pax_record("GNU.sparse.numbytes", &len.to_string()));
+                    }
+                }
+                SparseFormat::Pax01 => {
+                    let map: Vec<String> = sp
+                        .map
+                        .iter()
+                        .flat_map(|(o, l)| [o.to_string(), l.to_string()])
+                        .collect();
+                    pax.push_str(&pax_record("GNU.sparse.size", &real));
+                    pax.push_str(&pax_record("GNU.sparse.numblocks", &n.to_string()));
+                    pax.push_str(&pax_record("GNU.sparse.map", &map.join(",")));
+                    pax.push_str(&pax_record("GNU.sparse.name", &s.name));
+                    fake_name = Some(b"GNUSparseFile.0/sparse".to_vec());
+                }
+                SparseFormat::Pax10 => {
+                    pax.push_str(&pax_record("GNU.sparse.major", "1"));
+                    pax.push_str(&pax_record("GNU.sparse.minor", "0"));
+                    pax.push_str(&pax_record("GNU.sparse.name", &s.name));
+                    pax.push_str(&pax_record("GNU.sparse.realsize", &real));
+                    fake_name = Some(b"GNUSparseFile.0/sparse".to_vec());
+                    map_text = format!("{n}\n").into_bytes();
+                    for (off, len) in &sp.map {
+                        map_text.extend_from_slice(format!("{off}\n{len}\n").as_bytes());
+                    }
+                    pad(&mut map_text);
+                }
+                SparseFormat::OldGnu => unreachable!(),
+            }
+        }
         let (hname, prefix): (Vec<u8>, Vec<u8>) = match s.name_via {
             NameVia::Header if name.len() <= 100 => (name.to_vec(), Vec::new()),
             NameVia::Header => {
@@ -166,16 +324,45 @@ pub fn tar(specs: &[Spec]) -> Vec<u8> {
             out.extend_from_slice(pax.as_bytes());
             pad(&mut out);
         }
-        let carries_data = matches!(s.typeflag, b'0' | 0 | b'7');
-        let (size, link) = if carries_data {
-            (s.data.len() as u64, &[][..])
-        } else {
-            (0, &s.data[..])
+        let (hname, prefix) = match fake_name {
+            Some(f) => (f, Vec::new()),
+            None => (hname, prefix),
         };
-        out.extend_from_slice(&header(
-            &hname, &prefix, s.typeflag, size, s.mode, s.mtime, link,
-        ));
+        let old_gnu = s
+            .sparse
+            .as_ref()
+            .filter(|sp| sp.format == SparseFormat::OldGnu);
+        let typeflag = if old_gnu.is_some() { b'S' } else { s.typeflag };
+        let carries_data = matches!(typeflag, b'0' | 0 | b'7' | b'S');
+        let size = if carries_data {
+            (map_text.len() + s.data.len()) as u64
+        } else {
+            0
+        };
+        let link_field = if carries_data { &[][..] } else { &s.data[..] };
+        let mut h = header(&hname, &prefix, typeflag, size, s.mode, s.mtime, link_field);
+        let mut ext = Vec::new();
+        if let Some(sp) = old_gnu {
+            // GNU header: no ustar prefix; the map, an "extended" flag and the real size there.
+            h[257..265].copy_from_slice(b"ustar  \0");
+            h[345..500].fill(0);
+            let (first, rest) = sp.map.split_at(sp.map.len().min(4));
+            gnu_sparse_entries(&mut h[386..482], first);
+            h[482] = u8::from(!rest.is_empty());
+            number12(&mut h[483..495], sp.real_size);
+            checksum(&mut h);
+            let chunks: Vec<&[(u64, u64)]> = rest.chunks(21).collect();
+            for (i, c) in chunks.iter().enumerate() {
+                let mut b = [0u8; 512];
+                gnu_sparse_entries(&mut b[..504], c);
+                b[504] = u8::from(i + 1 < chunks.len());
+                ext.extend_from_slice(&b);
+            }
+        }
+        out.extend_from_slice(&h);
+        out.extend_from_slice(&ext);
         if carries_data {
+            out.extend_from_slice(&map_text);
             out.extend_from_slice(&s.data);
             pad(&mut out);
         }
