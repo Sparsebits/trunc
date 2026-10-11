@@ -15,6 +15,7 @@ pub use faultfs::{CrashModel, Fault, FaultFs};
 
 pub mod faultfs;
 pub mod fixtures;
+pub mod isobuild;
 pub mod tarbuild;
 pub mod tree;
 pub mod zipbuild;

@@ -9,12 +9,14 @@
 //! - [`zipconsume`] does the same for existing ZIP archives (with optional punch mode).
 //! - [`streamconsume`] does the same for compressed tarballs and files (`.tar.gz`, `.tar.zst`,
 //!   `.xz`, ...), freeing compressed bytes as they are decoded.
+//! - [`isoconsume`] extracts, verifies and consumes ISO 9660 images through the ZIP machinery.
 
 pub mod archive;
 pub mod consume;
 pub mod error;
 pub mod extract;
 mod io;
+pub mod isoconsume;
 pub mod keys;
 pub mod preflight;
 pub mod producer;

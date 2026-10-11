@@ -458,21 +458,25 @@ pub fn parse(src: &dyn FileHandle) -> Result<Layout> {
         }
     }
 
-    let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by_key(|&i| (entries[i].region_start, entries[i].region_end));
-    let mut overlaps = Vec::new();
-    for w in order.windows(2) {
-        let (a, b) = (&entries[w[0]], &entries[w[1]]);
-        if a.region_end > b.region_start {
-            overlaps.push((w[0], w[1]));
-        }
-    }
+    let overlaps = overlaps(&entries);
     Ok(Layout {
         entries,
         cd_start,
         file_len,
         overlaps,
     })
+}
+
+/// Pairs of entries whose regions overlap, found among neighbours in order of region start.
+/// Not every overlapping pair is listed, but the list is empty only if no regions overlap.
+pub fn overlaps(entries: &[Entry]) -> Vec<(usize, usize)> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (entries[i].region_start, entries[i].region_end));
+    order
+        .windows(2)
+        .filter(|w| entries[w[0]].region_end > entries[w[1]].region_start)
+        .map(|w| (w[0], w[1]))
+        .collect()
 }
 
 impl Layout {
@@ -554,13 +558,7 @@ impl Layout {
         if r.i != b.len() {
             return None;
         }
-        let mut order: Vec<usize> = (0..entries.len()).collect();
-        order.sort_by_key(|&i| (entries[i].region_start, entries[i].region_end));
-        let overlaps = order
-            .windows(2)
-            .filter(|w| entries[w[0]].region_end > entries[w[1]].region_start)
-            .map(|w| (w[0], w[1]))
-            .collect();
+        let overlaps = overlaps(&entries);
         Some(Self {
             entries,
             cd_start,
