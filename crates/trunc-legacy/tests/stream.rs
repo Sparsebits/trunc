@@ -169,7 +169,140 @@ fn gzip_round_trips_and_resumes() {
             &tarbuild::gzip_members(&d, 30_000, 6),
             16 << 10,
         );
+        for chunk in [0xff00, 5000] {
+            check(Codec::Gzip, &d, &tarbuild::bgzf(&d, chunk, 6), 16 << 10);
+        }
+        // Safe points more often than members end: still only between BGZF members.
+        let bytes = tarbuild::bgzf(&d, 0xff00, 1);
+        let (_fs, h) = host(&bytes);
+        let (_, points, _) =
+            decode(Codec::Gzip, h.as_ref(), None, &mut NoHistory, 1 << 10).unwrap();
+        assert!(points.iter().all(|p| gzip_between_members(&p.0)));
+        check(Codec::Gzip, &d, &bytes, 1 << 10);
     }
+}
+
+/// A gzip cursor at a member boundary: its inflate checkpoint has produced nothing.
+fn gzip_between_members(cursor: &[u8]) -> bool {
+    cursor[24..32] == [0; 8]
+}
+
+/// A BGZF member around one DEFLATE stream of `data`, its header claiming `bsize`.
+fn bgzf_member_claiming(data: &[u8], bsize: u16) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+    e.write_all(data).unwrap();
+    let mut b = vec![
+        0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0xff, 6, 0, b'B', b'C', 2, 0,
+    ];
+    b.extend_from_slice(&bsize.to_le_bytes());
+    b.extend(e.finish().unwrap());
+    b.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    b
+}
+
+/// Decode with one thread and with eight: the same output, safe points or error.
+fn same_with_threads(bytes: &[u8], every: u64) -> Result<Vec<u8>, String> {
+    let (_fs, h) = host(bytes);
+    let run = |threads| {
+        decode_threads(
+            Codec::Gzip,
+            h.as_ref(),
+            None,
+            &mut NoHistory,
+            every,
+            threads,
+        )
+        .map(|(out, points, _)| (out, points))
+        .map_err(|e| e.to_string())
+    };
+    let one = run(1);
+    assert_eq!(one, run(8));
+    one.map(|r| r.0)
+}
+
+/// BGZF headers whose sizes are wrong, and damaged or truncated BGZF files: the same result
+/// with and without threads (a gzip decoder ignores the sizes, and so does trunc in the end).
+#[test]
+fn bgzf_with_wrong_sizes_or_damage() {
+    let mut rng = Rng::new(37);
+    let d = fixtures::text_bytes(&mut rng, 1_500_000);
+    let good = tarbuild::bgzf(&d, 20_000, 6);
+    // Member starts, from the sizes in the headers.
+    let mut starts = Vec::new();
+    let mut at = 0;
+    while at < good.len() {
+        starts.push(at);
+        at += usize::from(u16::from_le_bytes([good[at + 16], good[at + 17]])) + 1;
+    }
+    assert!(starts.len() > 40);
+    for k in [1, starts.len() / 2, starts.len() - 2] {
+        for delta in [1i32, -1, 3000] {
+            let mut bad = good.clone();
+            let s = starts[k] + 16;
+            let size = i32::from(u16::from_le_bytes([bad[s], bad[s + 1]])) + delta;
+            bad[s..s + 2].copy_from_slice(&(size as u16).to_le_bytes());
+            assert!(same_with_threads(&bad, 64 << 10).unwrap() == d);
+            check(Codec::Gzip, &d, &bad, 64 << 10);
+        }
+    }
+    // A member much larger than its header says: safe points inside it past the claimed size.
+    let mut lying = bgzf_member_claiming(&d[..1_000_000], 2000);
+    lying.extend(tarbuild::bgzf(&d[1_000_000..], 20_000, 6));
+    assert!(same_with_threads(&lying, 64 << 10).unwrap() == d);
+    check(Codec::Gzip, &d, &lying, 64 << 10);
+    let (_fs, h) = host(&lying);
+    let (_, points, _) = decode(Codec::Gzip, h.as_ref(), None, &mut NoHistory, 64 << 10).unwrap();
+    let inside = points
+        .iter()
+        .filter(|p| !gzip_between_members(&p.0))
+        .count();
+    assert!(inside >= 2, "{inside} safe points inside the first member");
+    for at in [good.len() / 3, good.len() / 2, good.len() - 32] {
+        let mut bad = good.clone();
+        bad[at] ^= 0x20;
+        assert!(same_with_threads(&bad, 64 << 10).is_err(), "flipped {at}");
+    }
+    for cut in [
+        starts[5],
+        starts[5] + 9,
+        starts[5] + 100,
+        good.len() - 30,
+        good.len() - 3,
+    ] {
+        let r = same_with_threads(&good[..cut], 64 << 10);
+        // Cut exactly between members, it is a shorter valid file.
+        assert!(r.is_err() || cut == starts[5], "cut at {cut}");
+    }
+    // More output than allowed: the same error, after the same output.
+    let (_fs, h) = host(&good);
+    let limited = |threads| {
+        let mut n = 0u64;
+        let r = stream::decode(
+            Codec::Gzip,
+            Input {
+                src: h.as_ref(),
+                len: good.len() as u64,
+            },
+            None,
+            &mut NoHistory,
+            Limits {
+                threads,
+                ..Limits::new(700_000)
+            },
+            64 << 10,
+            &mut |b| {
+                n += b.len() as u64;
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        );
+        (n, r.map_err(|e| e.to_string()))
+    };
+    let one = limited(1);
+    assert!(one.1.is_err());
+    assert_eq!(one, limited(8));
 }
 
 #[test]
@@ -410,6 +543,8 @@ fn parallel_decoding_matches_sequential() {
             },
             vec![mb(2) + 1..=mb(3), last_frame],
         ),
+        (Codec::Gzip, tarbuild::bgzf(&d, 0xff00, 6), vec![]),
+        (Codec::Gzip, tarbuild::bgzf(&d, 9000, 1), vec![]),
     ];
     for (codec, bytes, inside) in cases {
         let (_fs, h) = host(&bytes);
@@ -418,21 +553,20 @@ fn parallel_decoding_matches_sequential() {
         assert!(one.0 == d && many.0 == d, "{codec:?}: output");
         assert_eq!(one.1, many.1, "{codec:?}: safe points");
         assert!(one.1.len() > 5, "{codec:?}: {} safe points", one.1.len());
-        // Cursor tags between units: xz 3 (blocks of a multi-block stream), zstd 0 (frames);
-        // bzip2 cursors are always between blocks.
-        let between = match codec {
-            Codec::Xz => Some(3),
-            Codec::Zstd => Some(0),
-            _ => None,
+        // Cursors between units: xz tag 3 (blocks of a multi-block stream), zstd tag 0
+        // (frames), gzip at a member start; bzip2 cursors are always between blocks.
+        let between = |c: &[u8]| match codec {
+            Codec::Xz => c[0] == 3,
+            Codec::Zstd => c[0] == 0,
+            Codec::Gzip => gzip_between_members(c),
+            Codec::Bzip2 => true,
         };
-        if let Some(tag) = between {
-            for p in &one.1 {
-                assert!(
-                    p.0[0] == tag || inside.iter().any(|r| r.contains(&p.1)),
-                    "{codec:?}: a safe point inside a unit at {}",
-                    p.1
-                );
-            }
+        for p in &one.1 {
+            assert!(
+                between(&p.0) || inside.iter().any(|r| r.contains(&p.1)),
+                "{codec:?}: a safe point inside a unit at {}",
+                p.1
+            );
         }
         check(codec, &d, &bytes, 256 << 10);
     }

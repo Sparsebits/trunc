@@ -202,6 +202,39 @@ pub fn gzip_members(data: &[u8], chunk: usize, level: u32) -> Vec<u8> {
         .collect()
 }
 
+/// BGZF-compress `data` (as `bgzip` does): one gzip member per `chunk` input bytes (at most
+/// 65280, `bgzip`'s block), each with a `BC` extra subfield giving its size, then the empty
+/// member that marks the end.
+pub fn bgzf(data: &[u8], chunk: usize, level: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in data.chunks(chunk.clamp(1, 0xff00)) {
+        bgzf_member(&mut out, c, level);
+    }
+    bgzf_member(&mut out, &[], level);
+    out
+}
+
+fn bgzf_member(out: &mut Vec<u8>, data: &[u8], level: u32) {
+    let deflate = |level| {
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), Compression::new(level));
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    };
+    let mut cdata = deflate(level);
+    if cdata.len() + 26 > 1 << 16 {
+        // Incompressible: stored blocks always fit.
+        cdata = deflate(0);
+    }
+    let bsize = u16::try_from(cdata.len() + 25).unwrap();
+    out.extend_from_slice(&[
+        0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 0xff, 6, 0, b'B', b'C', 2, 0,
+    ]);
+    out.extend_from_slice(&bsize.to_le_bytes());
+    out.extend_from_slice(&cdata);
+    out.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+}
+
 /// bzip2-compress `data` as one stream (`level` 1-9 sets the block size).
 pub fn bzip2(data: &[u8], level: u32) -> Vec<u8> {
     let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(level));
