@@ -394,3 +394,45 @@ fn copy_like(packed: &[u8]) -> Vec<u8> {
     h.push(0x00);
     assemble(packed, &h)
 }
+
+/// Archives written by 7-Zip and other real tools, from the test data of
+/// github.com/bodgit/sevenzip (BSD-3-Clause, see `fixtures/7z/LICENSE-bodgit-sevenzip`).
+fn fixture(name: &str) -> Vec<u8> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/7z")
+        .join(name);
+    std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+#[test]
+fn real_archives_decode() {
+    // The same ten files compressed three ways (LZMA without an end marker, LZMA2, Delta alone).
+    let lzma = unpack(&fixture("lzma.7z")).unwrap();
+    assert_eq!(lzma.len(), 10);
+    assert_eq!(lzma["01"].len(), 3572);
+    assert_eq!(unpack(&fixture("lzma2.7z")).unwrap(), lzma);
+    assert_eq!(unpack(&fixture("delta.7z")).unwrap(), lzma);
+
+    let bcj = unpack(&fixture("bcj.7z")).unwrap();
+    assert_eq!(bcj["bcj"].len(), 8549);
+    for name in ["t0.7z", "t1.7z"] {
+        let t = unpack(&fixture(name)).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t["foo"].len(), 4);
+    }
+    let i = unpack(&fixture("issue87.7z")).unwrap();
+    assert_eq!(i["something.txt"].len(), 4);
+    assert!(i["empty.1.txt"].is_empty() && i["empty.2.txt"].is_empty());
+    let f = unpack(&fixture("file_and_empty.7z")).unwrap();
+    assert_eq!((f["large"].len(), f["empty"].len()), (21, 0));
+
+    let l = parse(&fixture("empty.7z")).unwrap();
+    assert_eq!(l.entries.iter().filter(|e| e.kind == Kind::Dir).count(), 5);
+    assert_eq!(l.entries.iter().filter(|e| e.kind == Kind::File).count(), 5);
+    // An empty archive with one empty folder and no files.
+    assert!(unpack(&fixture("empty2.7z")).unwrap().is_empty());
+
+    // Refusals name the reason.
+    assert!(err(&fixture("t2.7z")).contains("encrypted"));
+    assert!(err(&fixture("arm.7z")).contains("ARM"));
+}

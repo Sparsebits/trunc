@@ -9,6 +9,7 @@
 //! - [`zipconsume`] does the same for existing ZIP archives (with optional punch mode).
 //! - [`streamconsume`] does the same for compressed tarballs and files (`.tar.gz`, `.tar.zst`,
 //!   `.xz`, ...), freeing compressed bytes as they are decoded.
+//! - [`sevenz`] inspects, verifies and extracts 7z archives (not destructively yet).
 
 pub mod archive;
 pub mod consume;
@@ -18,6 +19,7 @@ mod io;
 pub mod keys;
 pub mod preflight;
 pub mod producer;
+pub mod sevenz;
 pub mod source;
 mod stage;
 pub mod streamconsume;

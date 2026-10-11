@@ -173,13 +173,16 @@ struct FolderGraph {
     chain: Vec<usize>,
 }
 
+/// Per folder: (size, crc) of each substream.
+type Substreams = Vec<Vec<(u64, Option<u32>)>>;
+
 #[derive(Default)]
 struct StreamsInfo {
     pack_pos: u64,
     pack_sizes: Vec<u64>,
     folders: Vec<RawFolder>,
     /// Per folder: (size, crc) of each substream.
-    substreams: Option<Vec<Vec<(u64, Option<u32>)>>>,
+    substreams: Option<Substreams>,
 }
 
 fn method_of(id: &[u8]) -> std::result::Result<Method, String> {
@@ -205,6 +208,10 @@ fn method_of(id: &[u8]) -> std::result::Result<Method, String> {
                 [0x03, 0x03, 0x04, 0x01] => "IA-64".into(),
                 [0x03, 0x03, 0x08, 0x05] => "SPARC".into(),
                 [0x04, 0xF7, 0x11, 0x01] => "Zstandard".into(),
+                [0x04, 0xF7, 0x11, 0x02] => "Brotli".into(),
+                [0x04, 0xF7, 0x11, 0x04] => "LZ4".into(),
+                [0x04, 0xF7, 0x11, 0x05] => "LZ5".into(),
+                [0x04, 0xF7, 0x11, 0x06] => "Lizard".into(),
                 other => {
                     let hex: Vec<String> = other.iter().map(|b| format!("{b:02X}")).collect();
                     format!("id {}", hex.join(" "))
@@ -830,7 +837,13 @@ fn read_header(r: &mut Rd<'_>, header_offset: u64, max_window: u64) -> Result<La
         id = r.u8()?;
         v
     } else {
-        if !folders.is_empty() {
+        // Folders may exist without files only if they hold no streams (7-Zip writes one such
+        // empty folder for an empty archive).
+        let streams = si
+            .substreams
+            .as_ref()
+            .map_or(folders.len(), |s| s.iter().map(Vec::len).sum());
+        if streams != 0 {
             return Err(corrupt("content without files"));
         }
         (Vec::new(), 0)

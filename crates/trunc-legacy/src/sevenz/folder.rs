@@ -77,7 +77,7 @@ enum FilterKind {
     Bcj(Bcj),
     Delta {
         dist: usize,
-        hist: [u8; 256],
+        hist: Box<[u8; 256]>,
         pos: u8,
     },
 }
@@ -343,7 +343,7 @@ fn stage<'a>(input: Box<dyn Stage + 'a>, c: &Coder) -> Result<Box<dyn Stage + 'a
             input,
             FilterKind::Delta {
                 dist: usize::from(c.props[0]) + 1,
-                hist: [0; 256],
+                hist: Box::new([0; 256]),
                 pos: 0,
             },
         ),
@@ -423,6 +423,10 @@ pub fn decode_folder(
     end: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<()> {
     let f = &layout.folders[index];
+    if f.entries.is_empty() {
+        // A folder holding no files (7-Zip writes an empty one for an empty archive).
+        return Ok(());
+    }
     let entries: Vec<(usize, &Entry)> =
         f.entries.iter().map(|&i| (i, &layout.entries[i])).collect();
     let mut cur = 0usize;
