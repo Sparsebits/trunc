@@ -144,7 +144,8 @@ pub fn run(
         && trunc_engine::source::split_parts(&fs, archive)?.is_some()
     {
         bail!(
-            "--consume does not support split {kind} archives yet; extract without --consume,              or join the parts into one file first"
+            "--consume does not support split {kind} archives yet; extract without --consume, \
+             or join the parts into one file first"
         );
     }
     if !flags.yes && !confirm(archive, dest, kind)? {
