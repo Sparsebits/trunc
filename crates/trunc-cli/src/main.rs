@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use trunc_codec::CodecChoice;
 use trunc_core::space::SpaceParams;
 use trunc_core::{CodecId, EntryKind};
@@ -225,8 +225,45 @@ fn parse_block_size(s: &str) -> Result<u64, String> {
     Ok(v)
 }
 
+/// The whole error chain on one line, each cause once. Some errors already end with the text of
+/// their source (`opening x: Access is denied`), which a plain `{:#}` would print twice.
+fn error_line(e: &anyhow::Error) -> String {
+    let mut line = String::new();
+    for cause in e.chain() {
+        let s = cause.to_string();
+        if s.is_empty() || line.ends_with(&s) {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push_str(": ");
+        }
+        line.push_str(&s);
+    }
+    line
+}
+
+/// Valued consume flags given on the command line (the rest may be taken from what a resumed
+/// consume recorded when it started).
+fn explicit_flags(m: Option<&clap::ArgMatches>) -> Vec<&'static str> {
+    let Some(m) = m else { return Vec::new() };
+    ["batch", "punch_min", "checkpoint_every"]
+        .into_iter()
+        .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+        .collect()
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    match &mut cli.cmd {
+        Cmd::Extract(a) => {
+            a.consume_flags.explicit = explicit_flags(matches.subcommand_matches("extract"));
+        }
+        Cmd::Resume(a) => {
+            a.consume_flags.explicit = explicit_flags(matches.subcommand_matches("resume"));
+        }
+        _ => {}
+    }
     let profile = cli
         .profile
         .clone()
@@ -246,7 +283,7 @@ fn main() -> ExitCode {
     let code = match run(cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {}", error_line(&e));
             ExitCode::FAILURE
         }
     };
@@ -281,7 +318,23 @@ fn write_profile(path: &std::path::Path) {
     }
 }
 
+/// Refuse a folder given where an archive belongs (opening one fails with a bare OS error).
+fn not_a_folder(archive: &std::path::Path) -> Result<()> {
+    if archive.is_dir() {
+        anyhow::bail!("{} is a folder, not an archive", archive.display());
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
+    match &cli.cmd {
+        Cmd::Extract(ExtractArgs { archive, .. })
+        | Cmd::Resume(ResumeArgs { archive, .. })
+        | Cmd::Inspect(InspectArgs { archive, .. })
+        | Cmd::Verify(VerifyArgs { archive, .. })
+        | Cmd::Plan(PlanArgs { archive, .. }) => not_a_folder(archive)?,
+        Cmd::Create(_) | Cmd::Key(_) => {}
+    }
     match cli.cmd {
         Cmd::Create(a) => create(a),
         Cmd::Extract(a) => extract(a),
@@ -344,6 +397,9 @@ fn create(a: CreateArgs) -> Result<ExitCode> {
 }
 
 fn extract(a: ExtractArgs) -> Result<ExitCode> {
+    if !a.consume {
+        consume_cmd::refuse_consumed(&a.archive)?;
+    }
     if image_cmd::detect(&a.archive, &a.stream) {
         image_cmd::refuse_flags(&a.trust.policy()?, a.allow_symlinks)?;
         match image_cmd::extract(
@@ -605,6 +661,8 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
     println!("file size  {}", bytes(archive.file_len()));
     if archive.is_complete() {
         println!("state      complete");
+    } else if consume_cmd::state(&a.archive) == consume_cmd::State::Receipt {
+        println!("state      consumed (receipt only, holds no file data)");
     } else {
         println!(
             "state      partially consumed: {} of {n} blocks consumed",
@@ -648,6 +706,7 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
 }
 
 fn verify(a: VerifyArgs) -> Result<ExitCode> {
+    consume_cmd::refuse_consumed(&a.archive)?;
     if image_cmd::detect(&a.archive, &a.stream) {
         image_cmd::refuse_flags(&a.trust.policy()?, false)?;
         match image_cmd::verify(&a.archive, &a.image, &a.stream, a.threads) {
@@ -714,6 +773,20 @@ fn fits(f: Option<bool>) -> &'static str {
 }
 
 fn plan(a: PlanArgs) -> Result<ExitCode> {
+    match consume_cmd::state(&a.archive) {
+        consume_cmd::State::Fresh => {}
+        consume_cmd::State::Receipt => return Err(consume_cmd::receipt_error(&a.archive)),
+        consume_cmd::State::Partly { dest } => {
+            println!("archive       {}", a.archive.display());
+            println!();
+            println!("free space needed at the destination:");
+            println!("  extract (keeps archive)   n/a (archive already partly consumed)");
+            return Err(consume_cmd::partly_consumed_error(
+                &a.archive,
+                dest.as_deref(),
+            ));
+        }
+    }
     if image_cmd::detect(&a.archive, &a.stream) {
         anyhow::bail!(
             "plan does not support container images yet; `trunc inspect` shows the layer sizes"

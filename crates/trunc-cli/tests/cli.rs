@@ -73,7 +73,36 @@ fn create_inspect_verify_plan_extract() {
     assert!(w.join("data.trnc.receipt").exists());
     // The receipt is a valid, fully consumed archive.
     let s = ok(&trunc(&["inspect", "data.trnc.receipt"], w));
-    assert!(s.contains("partially consumed"), "{s}");
+    assert!(
+        s.contains("consumed (receipt only, holds no file data)"),
+        "{s}"
+    );
+    let r = trunc(&["resume", "data.trnc.receipt"], w);
+    assert!(!r.status.success());
+    assert!(
+        String::from_utf8_lossy(&r.stderr)
+            .contains("this is the receipt of a finished consume; nothing to resume"),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let r = trunc(&["resume", "missing.trnc"], w);
+    assert!(!r.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&r.stderr).trim(),
+        "error: missing.trnc: not found"
+    );
+    // A folder where an archive belongs, and OS errors printed once.
+    let r = trunc(&["plan", "data"], w);
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("data is a folder, not an archive"),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let r = trunc(&["create", "new.trnc", "no-such-input"], w);
+    assert!(!r.status.success());
+    let err = String::from_utf8_lossy(&r.stderr).into_owned();
+    let first = err.trim().rsplit(": ").next().unwrap().to_owned();
+    assert_eq!(err.matches(first.as_str()).count(), 1, "{err}");
 }
 
 #[test]
@@ -281,8 +310,32 @@ fn killed_zip_consume_resumes() {
         let _ = child.wait();
         let punch = ["--yes", "--punch-min", "1", "--checkpoint-every", "64K"];
         if w.join("a.zip.trncj").exists() {
-            // Resume without -C: the destination comes from the journal.
-            ok(&trunc(&[&["resume", "a.zip"][..], &punch].concat(), w));
+            // A partly consumed ZIP is reported as such, not as a corrupt one.
+            for cmd in [&["x", "a.zip", "-C", "other"][..], &["verify", "a.zip"]] {
+                let r = trunc(cmd, w);
+                assert!(!r.status.success());
+                let err = String::from_utf8_lossy(&r.stderr);
+                assert!(
+                    err.contains("a.zip is partly consumed (interrupted while extracting into")
+                        && err.contains("Nothing is lost: run `trunc resume a.zip`."),
+                    "{err}"
+                );
+            }
+            let r = trunc(&["plan", "a.zip", "-C", "other"], w);
+            assert!(
+                String::from_utf8_lossy(&r.stdout)
+                    .contains("n/a (archive already partly consumed)")
+            );
+            // Resume without -C (the destination comes from the journal) and without the
+            // flags: they were recorded when the consume started.
+            let r = trunc(&["resume", "a.zip", "--yes"], w);
+            ok(&r);
+            let err = String::from_utf8_lossy(&r.stderr);
+            assert!(
+                err.contains("resuming with: --punch-min 1 --checkpoint-every 64K"),
+                "{err}"
+            );
+            assert!(!w.join("a.zip.trncj.opts").exists());
         } else if w.join("a.zip").exists() {
             // Killed before anything was recorded or destroyed: just run the command again.
             ok(&trunc(

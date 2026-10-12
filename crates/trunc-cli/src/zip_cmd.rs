@@ -149,45 +149,13 @@ pub fn plan_layout(
     label: &str,
     overlap: Option<&str>,
 ) -> Result<ExitCode> {
-    let fs = OsFs::new();
-    let largest = layout
-        .entries
-        .iter()
-        .max_by_key(|e| e.size)
-        .map(|e| (e.name.as_str(), e.size));
-    let vc = preflight::check_volumes(&fs, archive, dest, largest)?;
-    let opts = ConsumeOptions {
-        zip: ZipOptions {
-            punch: if punch {
-                PunchPolicy::Auto
-            } else {
-                PunchPolicy::Never
-            },
-            ..ZipOptions::default()
-        },
-        ..ConsumeOptions::default()
-    };
-    let can_dealloc = vc.archive_volume.supports_sparse && vc.archive_volume.sparse_granularity > 0;
-    let params = SpaceParams {
-        cluster_size: u64::from(vc.destination.cluster_size.max(1)),
-        ..SpaceParams::default()
-    };
-    let len = fs
-        .open(archive, trunc_fs::OpenMode::Read, trunc_fs::Share::Shared)?
-        .size()?;
-    let sp = zipconsume::zip_space(
-        layout,
+    let LayoutFigures {
+        vc,
+        sp,
         len,
-        &opts,
         can_dealloc,
-        u64::from(vc.archive_volume.sparse_granularity.max(1)),
-        &params,
-    );
-    let consume_needs = if vc.same_volume {
-        sp.consume_extra
-    } else {
-        sp.extract_extra
-    };
+        consume_needs,
+    } = layout_figures(archive, dest, punch, layout)?;
     let fits = |need: u64| match vc.destination.free_bytes {
         Some(f) if f >= need => "fits",
         Some(_) => "DOES NOT FIT",
@@ -241,6 +209,70 @@ pub fn plan_layout(
         (Some(false), Some(true)) => ExitCode::from(2),
         (Some(false), Some(false)) => ExitCode::from(3),
         _ => ExitCode::SUCCESS,
+    })
+}
+
+/// What `plan` computes for an archive described by a ZIP layout.
+pub struct LayoutFigures {
+    pub vc: preflight::VolumeCheck,
+    pub sp: zipconsume::ZipSpace,
+    pub len: u64,
+    pub can_dealloc: bool,
+    /// Free space a consume needs at the destination.
+    pub consume_needs: u64,
+}
+
+pub fn layout_figures(
+    archive: &Path,
+    dest: &Path,
+    punch: bool,
+    layout: &Layout,
+) -> Result<LayoutFigures> {
+    let fs = OsFs::new();
+    let largest = layout
+        .entries
+        .iter()
+        .max_by_key(|e| e.size)
+        .map(|e| (e.name.as_str(), e.size));
+    let vc = preflight::check_volumes(&fs, archive, dest, largest)?;
+    let opts = ConsumeOptions {
+        zip: ZipOptions {
+            punch: if punch {
+                PunchPolicy::Auto
+            } else {
+                PunchPolicy::Never
+            },
+            ..ZipOptions::default()
+        },
+        ..ConsumeOptions::default()
+    };
+    let can_dealloc = vc.archive_volume.supports_sparse && vc.archive_volume.sparse_granularity > 0;
+    let params = SpaceParams {
+        cluster_size: u64::from(vc.destination.cluster_size.max(1)),
+        ..SpaceParams::default()
+    };
+    let len = fs
+        .open(archive, trunc_fs::OpenMode::Read, trunc_fs::Share::Shared)?
+        .size()?;
+    let sp = zipconsume::zip_space(
+        layout,
+        len,
+        &opts,
+        can_dealloc,
+        u64::from(vc.archive_volume.sparse_granularity.max(1)),
+        &params,
+    );
+    let consume_needs = if vc.same_volume {
+        sp.consume_extra
+    } else {
+        sp.extract_extra
+    };
+    Ok(LayoutFigures {
+        vc,
+        sp,
+        len,
+        can_dealloc,
+        consume_needs,
     })
 }
 

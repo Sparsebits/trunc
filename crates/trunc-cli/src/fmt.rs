@@ -43,6 +43,17 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} overflows"))
 }
 
+/// Format a size the way it would be typed as a flag value (`16M`, `1G`, `4096`).
+pub fn size_flag(n: u64) -> String {
+    for (shift, unit) in [(30u32, 'G'), (20, 'M'), (10, 'K')] {
+        let m = 1u64 << shift;
+        if n >= m && n % m == 0 {
+            return format!("{}{unit}", n >> shift);
+        }
+    }
+    n.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +69,9 @@ mod tests {
         assert!(parse_size("").is_err());
         assert_eq!(bytes(512), "512 B");
         assert_eq!(bytes(8 << 20), "8.00 MiB");
+        assert_eq!(size_flag(16 << 20), "16M");
+        assert_eq!(size_flag(1 << 30), "1G");
+        assert_eq!(size_flag(1), "1");
+        assert_eq!(size_flag(1536), "1536");
     }
 }
