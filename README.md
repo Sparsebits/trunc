@@ -29,19 +29,25 @@ trunc extracts an archive and deletes it as it goes, so you need room for the co
 the contents plus the archive.
 
 <p align="center">
-  <img alt="Disk space used while unzipping a 2.8 GB ZIP into 4.25 GB of files: a regular unzip needs 7.0 GB at its peak, trunc needs 4.5 GB" src="docs/assets/disk-usage.svg" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/disk-usage-compare-dark.gif">
+    <img alt="Disk space used while unzipping a 3.3 GB ZIP into 5.0 GB of files: Windows' built-in unzip and 7-Zip both need 8.4 GB at their peak, trunc needs 5.3 GB" src="docs/assets/disk-usage-compare-light.gif" width="100%">
+  </picture>
 </p>
 
-<p align="center"><sub>Unzipping a 2.8 GB ZIP into 4.25 GB of files: a regular unzip needs 7.0 GB of disk at its peak, trunc needs 4.5 GB.</sub></p>
+<p align="center"><sub>Unzipping a 3.3 GB ZIP into 5.0 GB of files: Windows and 7-Zip both need 8.4 GB of disk at their peak, trunc needs 5.3 GB.</sub></p>
 
 <details>
 <summary>How this was measured</summary>
 
-702 files (a 1 GiB video, photos, a 1 GiB CSV and logs). The regular unzip is Windows'
-built-in `tar -xf`; trunc is `trunc x --consume`. The line is the space allocated to the
-archive and the extracted files, read every 100 ms with `GetCompressedFileSizeW`, so freed parts
-of the archive count as free. One run each, NTFS on a Samsung NVMe SSD, AMD Ryzen 7 5800H. The
-sampling slowed both runs, so the time axis is stretched.
+802 files (a 1.5 GB video, 500 photos, a 1 GB CSV and 300 logs). "Windows (built-in)" is
+PowerShell's `Expand-Archive` (Windows' `tar -xf` peaks at the same 8.4 GB); 7-Zip is `7za x`
+from 7-Zip 26.04; trunc is `trunc x --consume`. The line is the space allocated to the archive
+and the extracted files, read every 100 ms, so freed parts of the archive count as free. One run
+each on a fresh copy of the ZIP; every output was checked (file count, total size and five
+SHA-256 hashes). NTFS on a Samsung NVMe SSD, AMD Ryzen 7 5800H, Windows 11. GB means 1024³ bytes,
+as Windows shows it. Without sampling the runs took 35 s (trunc), 38 s (7-Zip), 49 s
+(`Expand-Archive`) and 44 s (`tar`); times vary by several seconds between runs.
 
 </details>
 
@@ -89,6 +95,12 @@ trunc x disk.img.xz --consume           # a single compressed file: leaves disk.
 trunc resume big.zip                    # continue after a crash, a kill or a full disk
 trunc x big.zip -C out                  # without --consume: an ordinary extractor
 ```
+
+<p align="center">
+  <img alt="Terminal: trunc plan shows the space needed, trunc x --consume extracts 5.02 GiB while the archive shrinks to 0 B, and the ZIP is gone afterwards" src="docs/assets/demo-terminal.gif" width="100%">
+</p>
+
+<p align="center"><sub>A real session, long waits shortened (<a href="docs/assets/demo.cast">asciinema recording</a>).</sub></p>
 
 `trunc inspect` lists what's inside and `trunc verify` checks every checksum without writing.
 See `trunc <command> --help` or the [user guide](docs/guide.md#commands-and-options) for every
