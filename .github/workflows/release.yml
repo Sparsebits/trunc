@@ -146,6 +146,26 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: SBOM serial numbers
+        # cargo-cyclonedx omits `serialNumber`, which actions/attest needs to recognise CycloneDX.
+        # A UUIDv5 of the commit and file name keeps the SBOMs reproducible.
+        run: |
+          for f in dist/*.cdx.json; do
+            python3 - "$f" "$GITHUB_SHA" <<'EOF'
+          import json, sys, uuid, os
+          path, sha = sys.argv[1], sys.argv[2]
+          with open(path, encoding="utf-8") as fh:
+              bom = json.load(fh)
+          if not bom.get("serialNumber"):
+              name = f"github.com/Sparsebits/trunc/{sha}/{os.path.basename(path)}"
+              bom = {"bomFormat": bom["bomFormat"], "specVersion": bom["specVersion"],
+                     "serialNumber": f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, name)}",
+                     **{k: v for k, v in bom.items() if k not in ("bomFormat", "specVersion")}}
+              with open(path, "w", encoding="utf-8") as fh:
+                  json.dump(bom, fh, indent=2)
+                  fh.write("\n")
+          EOF
+          done
       - name: checksums and release notes
         run: |
           (cd dist && sha256sum *.zip *.tar.gz *.cdx.json > SHA256SUMS && cat SHA256SUMS)
