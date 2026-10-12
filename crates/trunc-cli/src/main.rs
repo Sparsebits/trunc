@@ -665,8 +665,9 @@ fn inspect(a: InspectArgs) -> Result<ExitCode> {
         println!("state      consumed (receipt only, holds no file data)");
     } else {
         println!(
-            "state      partially consumed: {} of {n} blocks consumed",
-            archive.consumed()
+            "state      partially consumed: {} of {n} blocks consumed; run `trunc resume {}`",
+            archive.consumed(),
+            a.archive.display()
         );
     }
     if a.entries {
