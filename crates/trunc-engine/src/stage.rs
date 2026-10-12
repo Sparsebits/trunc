@@ -241,8 +241,16 @@ pub(crate) fn sidecar_conflict(archive: &Path, dest: &Path, tops: &[String]) -> 
         return None;
     }
     let base = archive.file_name()?.to_string_lossy().into_owned();
-    let sidecars = [".trncr", ".trncj", ".trncj.tmp", ".trncg", ".receipt"]
-        .map(|s| trunc_core::path::collision_key(&format!("{base}{s}")));
+    let sidecars = [
+        ".trncr",
+        ".trncj",
+        ".trncj.tmp",
+        ".trncj.opts",
+        ".trncj.opts.tmp",
+        ".trncg",
+        ".receipt",
+    ]
+    .map(|s| trunc_core::path::collision_key(&format!("{base}{s}")));
     tops.iter()
         .find(|t| sidecars.contains(&trunc_core::path::collision_key(t)))
         .cloned()
@@ -398,11 +406,63 @@ pub(crate) fn build_structure(
 
 /// Apply file modes, rename every top-level item from the staging directory into `dest`
 /// (skipping ones already moved), and remove the empty staging directory. Idempotent.
+/// Whether a rename failed only because another program briefly has a file open inside the
+/// staging folder (antivirus, search indexing, backup tools): Windows reports this as a sharing
+/// violation or as access denied. Never true elsewhere, nor under the fault-injecting test
+/// filesystem, which never reports these errors.
+fn held_open(e: &FsError) -> bool {
+    cfg!(windows)
+        && match e {
+            FsError::Busy { .. } => true,
+            FsError::Io { source, .. } => source.raw_os_error() == Some(5), // ERROR_ACCESS_DENIED
+            _ => false,
+        }
+}
+
+/// Run a rename or removal, retrying for up to about ten seconds while another program holds a
+/// file open inside the staging folder. The operation either happens once or not at all, so
+/// retrying cannot change what a crash leaves behind.
+fn retry_held(
+    mut op: impl FnMut() -> Result<(), FsError>,
+    what: &str,
+    stage: &Path,
+    archive: Option<&Path>,
+) -> Result<(), Error> {
+    const ATTEMPTS: u32 = 10;
+    let mut delay = std::time::Duration::from_millis(50);
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Err(e) if held_open(&e) => {
+                if attempt == ATTEMPTS {
+                    let next = match archive {
+                        Some(a) => format!("run `trunc resume {}`", a.display()),
+                        None => "run the same command again".to_string(),
+                    };
+                    return Err(Error::Input(format!(
+                        "could not {what}: another program, often antivirus or search indexing, \
+                         has a file open in {} ({e}); nothing is lost: close it or wait a \
+                         moment, then {next}",
+                        stage.display()
+                    )));
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_secs(2));
+                attempt += 1;
+            }
+            r => return r.map_err(Error::from),
+        }
+    }
+}
+
+/// Move the staged top-level names into `dest`. `archive` is the archive being consumed, named
+/// in the advice when a file stays held open (None for a plain extraction).
 pub(crate) fn rename_into_place(
     fs: &dyn FsBackend,
     items: &[Item],
     dest: &Path,
     stage: &Path,
+    archive: Option<&Path>,
 ) -> Result<()> {
     // A hard link carries the mode of the file it names: the same file, or a copy of it.
     for e in items
@@ -421,15 +481,17 @@ pub(crate) fn rename_into_place(
             continue; // already moved by an earlier run
         }
         let from = stage.join(name);
-        match fs.rename(&from, &dest.join(name)) {
+        let to = dest.join(name);
+        let what = format!("move {} into place", from.display());
+        match retry_held(|| fs.rename(&from, &to), &what, stage, archive) {
             Ok(()) => {}
-            Err(FsError::AlreadyExists { path }) => {
+            Err(Error::Fs(FsError::AlreadyExists { path })) => {
                 return Err(Error::Refused(format!(
                     "{} appeared during extraction; move it away and resume",
                     path.display()
                 )));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
     let present = fs.read_dir(dest)?;
@@ -443,7 +505,8 @@ pub(crate) fn rename_into_place(
     }
     fs.flush_dir(stage)?;
     fs.flush_dir(dest)?;
-    fs.remove_dir(stage)?;
+    let what = format!("remove the staging folder {}", stage.display());
+    retry_held(|| fs.remove_dir(stage), &what, stage, archive)?;
     fs.flush_dir(dest)?;
     Ok(())
 }

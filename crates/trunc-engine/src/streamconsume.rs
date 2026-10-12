@@ -2039,7 +2039,7 @@ pub fn consume_stream(
 
     progress(Progress::Renaming);
     trunc_prof::time("stage.rename", || {
-        rename_into_place(fs, &items, &dest, &stage)
+        rename_into_place(fs, &items, &dest, &stage, Some(archive_path))
     })?;
     let _finish = trunc_prof::span("stream.finish");
     remove_gap_log(fs, archive_path)?;

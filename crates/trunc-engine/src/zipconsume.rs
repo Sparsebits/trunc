@@ -1105,7 +1105,7 @@ pub(crate) fn consume_layout(
     }
 
     progress(Progress::Renaming);
-    rename_into_place(fs, &items, &dest, &stage)?;
+    rename_into_place(fs, &items, &dest, &stage, Some(archive_path))?;
     finish(fs, handle, archive_path, journal, &jpath)?;
     Ok(summary)
 }

@@ -2017,7 +2017,7 @@ fn write_tree(
             )));
         }
     }
-    rename_into_place(fs, items, dest, stage)?;
+    rename_into_place(fs, items, dest, stage, None)?;
     Ok(ImageSummary {
         files: cs.files,
         dirs: cs.dirs,

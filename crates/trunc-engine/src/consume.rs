@@ -375,7 +375,7 @@ pub fn consume(
 
     // Rename phase: every block is consumed and every output is durable.
     progress(Progress::Renaming);
-    rename_into_place(fs, &items, &dest, &stage)?;
+    rename_into_place(fs, &items, &dest, &stage, Some(archive_path))?;
     summary.receipt = finish(fs, archive, archive_path, opts)?;
     Ok(summary)
 }
