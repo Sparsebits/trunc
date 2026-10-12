@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="#installation">Installation</a> ·
-  <a href="#usage">Usage</a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="#supported-formats">Formats</a> ·
   <a href="#faq">FAQ</a> ·
   <a href="#how-it-works">How it works</a> ·
@@ -65,15 +65,24 @@ if the GitHub CLI is installed). Set `TRUNC_VERSION` to pin a version or `TRUNC_
 choose where it goes. You can also grab a [release](https://github.com/Sparsebits/trunc/releases)
 or run `cargo install --git https://github.com/Sparsebits/trunc trunc-cli`.
 
-## Usage
+## Quick start
+
+**1. Check it fits.** `trunc plan` reads the archive and your disk, and changes nothing:
 
 ```sh
-trunc plan big.zip -C out               # how much space each mode needs; changes nothing
-trunc x big.zip -C out --consume        # extract, deleting the archive as it goes (asks first; --yes skips)
-trunc x big.tar.zst -C out --consume    # tarballs, ISO images and split parts work the same way
-trunc x disk.img.xz --consume           # a single compressed file: leaves disk.img
-trunc resume big.zip                    # continue after a crash, a kill or a full disk
-trunc x big.zip -C out                  # without --consume: an ordinary extractor
+trunc plan big.zip -C out
+```
+
+**2. Extract it, freeing the archive as you go.** trunc asks before it deletes anything:
+
+```sh
+trunc x big.zip -C out --consume
+```
+
+**3. If it stops** (a crash, a power cut, a full disk), nothing is lost. Pick up where it left off:
+
+```sh
+trunc resume big.zip
 ```
 
 <p align="center">
@@ -82,7 +91,18 @@ trunc x big.zip -C out                  # without --consume: an ordinary extract
 
 <p align="center"><sub>A real session, long waits shortened (<a href="docs/assets/demo.cast">asciinema recording</a>).</sub></p>
 
-`trunc inspect` lists what's inside and `trunc verify` checks every checksum without writing.
+To keep the archive, leave off `--consume`: trunc is then an ordinary extractor.
+
+### More examples
+
+```sh
+trunc x big.tar.zst -C out --consume    # tarballs, ISO images and split parts work the same way
+trunc x disk.img.xz --consume           # a single compressed file: leaves disk.img
+trunc x big.7z -C out                   # 7z extracts (consuming it isn't supported yet)
+trunc inspect big.zip                   # list what's inside
+trunc verify big.zip                    # check every checksum without writing anything
+```
+
 See `trunc <command> --help` or the [user guide](docs/guide.md#commands-and-options) for every
 option, including container images and trunc's own `.trnc` format.
 
