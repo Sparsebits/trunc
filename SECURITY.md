@@ -7,13 +7,8 @@ outside the destination. Reports of that kind are especially welcome.
 
 Please do not open a public issue for a security problem.
 
-<!-- OWNER: enable private vulnerability reporting (Settings > Code security > Private
-vulnerability reporting) before making the repository public, and add a fallback contact
-below if you want one. Remove this comment when done. -->
-
 Report it privately through GitHub: open the repository's **Security** tab and choose
 **Report a vulnerability** (<https://github.com/Sparsebits/trunc/security/advisories/new>).
-<!-- OWNER: optional fallback contact, e.g. "or email security@<your-domain>" -->
 
 Include what you can: the trunc version (`trunc --version`), the OS and filesystem, the command
 you ran, and an archive or script that reproduces the problem. If the archive is large, describe
