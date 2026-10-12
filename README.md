@@ -52,8 +52,8 @@ as Windows shows it. Without sampling the runs took 35 s (trunc), 38 s (7-Zip), 
 </details>
 
 ```console
-$ trunc x dataset.zip -C dataset --consume --yes
-extracted 702 files, 5 directories, 4.25 GiB into dataset
+$ trunc x big.zip -C out --consume --yes
+extracted 802 files, 4 directories, 5.02 GiB into out
 archive   consumed and removed
 ```
 

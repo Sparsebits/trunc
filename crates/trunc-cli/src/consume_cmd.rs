@@ -550,11 +550,14 @@ pub fn run(
             archive_len,
         } => {
             if tty {
-                eprint!(
-                    "\r{blocks_done}/{blocks_total} {unit}  {} written  archive now {}   ",
+                let line = format!(
+                    "{blocks_done}/{blocks_total} {unit}  {} written  archive now {}",
                     bytes(bytes_written),
                     bytes(archive_len)
                 );
+                // Padded so a shorter update covers the tail of a longer one; no escape codes,
+                // which older Windows consoles print literally.
+                eprint!("\r{line:<78}");
             }
         }
         Progress::Renaming => {
