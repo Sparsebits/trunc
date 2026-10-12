@@ -35,27 +35,7 @@ the contents plus the archive.
   </picture>
 </p>
 
-<p align="center"><sub>Unzipping a 3.3 GB ZIP into 5.0 GB of files: Windows and 7-Zip both need 8.4 GB of disk at their peak, trunc needs 5.3 GB.</sub></p>
-
-<details>
-<summary>How this was measured</summary>
-
-802 files (a 1.5 GB video, 500 photos, a 1 GB CSV and 300 logs). "Windows (built-in)" is
-PowerShell's `Expand-Archive` (Windows' `tar -xf` peaks at the same 8.4 GB); 7-Zip is `7za x`
-from 7-Zip 26.04; trunc is `trunc x --consume`. The line is the space allocated to the archive
-and the extracted files, read every 100 ms, so freed parts of the archive count as free. One run
-each on a fresh copy of the ZIP; every output was checked (file count, total size and five
-SHA-256 hashes). NTFS on a Samsung NVMe SSD, AMD Ryzen 7 5800H, Windows 11. GB means 1024³ bytes,
-as Windows shows it. Without sampling the runs took 35 s (trunc), 38 s (7-Zip), 49 s
-(`Expand-Archive`) and 44 s (`tar`); times vary by several seconds between runs.
-
-</details>
-
-```console
-$ trunc x big.zip -C out --consume --yes
-extracted 802 files, 4 directories, 5.02 GiB into out
-archive   consumed and removed
-```
+<p align="center"><sub>Unzipping a 3.3 GB ZIP into 5.0 GB of files: Windows and 7-Zip both need 8.4 GB of disk at their peak, trunc needs 5.3 GB (<a href="#performance">how this was measured</a>).</sub></p>
 
 ## Highlights
 
@@ -175,15 +155,38 @@ so before it begins. Without `--consume` the archive is untouched.
 
 ## Performance
 
-Extracting a 10 GiB folder from a 5.81 GiB `.trnc` archive on NTFS (Ryzen 7 5800H, NVMe):
+The chart at the top, as numbers (one 3.3 GB ZIP, 5.0 GB of files once extracted):
+
+| Tool | Peak disk use | Time | Archive afterwards |
+|---|---|---|---|
+| Windows (built-in) | 8.4 GB | 49 s | kept |
+| 7-Zip 26.04 | 8.4 GB | 38 s | kept |
+| trunc `--consume` | **5.3 GB** | 35 s | gone |
+
+<details>
+<summary>How this was measured</summary>
+
+802 files (a 1.5 GB video, 500 photos, a 1 GB CSV and 300 logs). "Windows (built-in)" is
+PowerShell's `Expand-Archive` (Windows' `tar -xf` peaks at the same 8.4 GB); 7-Zip is `7za x`
+from 7-Zip 26.04; trunc is `trunc x --consume`. The line is the space allocated to the archive
+and the extracted files, read every 100 ms, so freed parts of the archive count as free. One run
+each on a fresh copy of the ZIP; every output was checked (file count, total size and five
+SHA-256 hashes). NTFS on a Samsung NVMe SSD, AMD Ryzen 7 5800H, Windows 11. GB means 1024³ bytes,
+as Windows shows it. Without sampling the runs took 35 s (trunc), 38 s (7-Zip), 49 s
+(`Expand-Archive`) and 44 s (`tar`); times vary by several seconds between runs.
+
+</details>
+
+With trunc's own `.trnc` format: extracting a 10 GiB folder from a 5.81 GiB archive on NTFS
+(Ryzen 7 5800H, NVMe):
 
 | Command | Peak extra space | trunc's prediction | Time |
 |---|---|---|---|
 | `trunc x --consume` | **4.32 GiB** | 4.39 GiB | 53 s |
 | `trunc x` | 10.00 GiB | 10.07 GiB | 60 s |
 
-This is space needed beyond the archive already on disk; the chart above shows the total. See
-the [measurement notes](docs/spec/invariants.md#measured-10-gib-ntfs).
+This counts space beyond the archive already on disk, where the table above counts the total.
+See the [measurement notes](docs/spec/invariants.md#measured-10-gib-ntfs).
 
 Add `--profile run.json` to any command to see where the time goes; the user guide explains
 [parallel decoding](docs/guide.md#parallel-decoding) and [how to read a profile](docs/guide.md#performance-and-profiling).
