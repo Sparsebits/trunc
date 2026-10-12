@@ -28,6 +28,14 @@ The first release.
   (exit code 75).
 - Files are written to a hidden staging folder and moved into place at the end.
   `--verify-media` re-reads them from the disk, not the cache, before anything is released.
+- Before deleting anything, trunc asks, showing the archive's size, where the files go, how much
+  space consuming saves and how to resume if interrupted; `--yes` skips the question.
+- `trunc resume` remembers the options a consume started with (`--verify-media`, `--batch`, the
+  `--allow-*` overrides and the rest) and prints them, so a resumed run is as careful as the first.
+- An interrupted archive is never reported as broken: `x`, `verify` and `plan` say it is partly
+  consumed and how to resume it, and a finished consume's receipt says so too.
+- On Windows, the final move into place waits and retries if antivirus or search indexing briefly
+  holds a file open, instead of failing.
 
 ### Existing ZIP files
 - `trunc x big.zip --consume` works on Stored and Deflate ZIPs, including Zip64 and data
