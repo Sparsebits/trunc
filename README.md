@@ -29,15 +29,16 @@ trunc extracts an archive and deletes it as it goes, so you need room for the co
 the contents plus the archive.
 
 <p align="center">
-  <img alt="Disk space over time while extracting a 2.76 GiB ZIP into 4.25 GiB of files: tar -xf peaks at 7.00 GiB, trunc x --consume at 4.50 GiB" src="docs/assets/disk-usage.svg" width="100%">
+  <img alt="Disk space used while unzipping a 2.8 GB ZIP into 4.25 GB of files: a regular unzip needs 7.0 GB at its peak, trunc needs 4.5 GB" src="docs/assets/disk-usage.svg" width="100%">
 </p>
 
-<p align="center"><sub>A 2.76 GiB ZIP into 4.25 GiB of files: <code>tar -xf</code> peaks at 7.00 GiB, <code>trunc x --consume</code> at 4.50 GiB.</sub></p>
+<p align="center"><sub>Unzipping a 2.8 GB ZIP into 4.25 GB of files: a regular unzip needs 7.0 GB of disk at its peak, trunc needs 4.5 GB.</sub></p>
 
 <details>
 <summary>How this was measured</summary>
 
-702 files (a 1 GiB video, photos, a 1 GiB CSV and logs). The line is the space allocated to the
+702 files (a 1 GiB video, photos, a 1 GiB CSV and logs). The regular unzip is Windows'
+built-in `tar -xf`; trunc is `trunc x --consume`. The line is the space allocated to the
 archive and the extracted files, read every 100 ms with `GetCompressedFileSizeW`, so freed parts
 of the archive count as free. One run each, NTFS on a Samsung NVMe SSD, AMD Ryzen 7 5800H. The
 sampling slowed both runs, so the time axis is stretched.
