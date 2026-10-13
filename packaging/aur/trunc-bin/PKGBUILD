@@ -1,0 +1,22 @@
+# Maintainer: Sparsebits <https://github.com/Sparsebits>
+pkgname=trunc-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Extract archives bigger than your free space: trunc deletes the archive as it extracts."
+arch=('x86_64' 'aarch64')
+url="https://github.com/Sparsebits/trunc"
+license=('MIT OR Apache-2.0')
+provides=('trunc')
+conflicts=('trunc')
+source_x86_64=("trunc-$pkgver-x86_64.tar.gz::https://github.com/Sparsebits/trunc/releases/download/v$pkgver/trunc-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("trunc-$pkgver-aarch64.tar.gz::https://github.com/Sparsebits/trunc/releases/download/v$pkgver/trunc-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('734676a330c1006394b0aafa9fd5ebce63038e23c7a5c7cfa6f95dd773aa53f5')
+sha256sums_aarch64=('20b8dd9620a75437d72528b0b53ea9ac90353bb27a5d1e771b8912cf288d8870')
+
+package() {
+  cd "trunc-$CARCH-unknown-linux-musl"
+  install -Dm755 trunc "$pkgdir/usr/bin/trunc"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+PackageIdentifier: Sparsebits.trunc
+PackageVersion: 0.1.0
+InstallerType: zip
+NestedInstallerType: portable
+Commands:
+- trunc
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-x86_64-pc-windows-msvc.zip
+  InstallerSha256: 8F90F6EBA434F8AA2C293CE17F113D1417E49936A1AC1702F4C2B2A498AD7852
+  NestedInstallerFiles:
+  - RelativeFilePath: trunc-x86_64-pc-windows-msvc\trunc.exe
+    PortableCommandAlias: trunc
+- Architecture: arm64
+  InstallerUrl: https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-aarch64-pc-windows-msvc.zip
+  InstallerSha256: 344873A6CC887BF3CF30228E4F06E8FE0DCD71A8A7E84BF70D7BAD0F0F6C2E80
+  NestedInstallerFiles:
+  - RelativeFilePath: trunc-aarch64-pc-windows-msvc\trunc.exe
+    PortableCommandAlias: trunc
+ManifestType: installer
+ManifestVersion: 1.9.0

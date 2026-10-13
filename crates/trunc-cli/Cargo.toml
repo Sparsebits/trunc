@@ -10,11 +10,23 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["archive", "extract", "zip", "tar", "decompression"]
 categories = ["command-line-utilities", "compression", "filesystem"]
-publish.workspace = true
 
 [[bin]]
 name = "trunc"
 path = "src/main.rs"
+
+# `cargo binstall trunc-cli` downloads the release archive instead of compiling. On Linux it
+# falls back from the gnu target to the static musl build.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/trunc-{ target }{ archive-suffix }"
+bin-dir = "trunc-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dependencies]
 trunc-prof.workspace = true

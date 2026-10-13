@@ -23,19 +23,18 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sparsebits/trunc"
 homepage = "https://github.com/Sparsebits/trunc"
-publish = false
 
 [workspace.dependencies]
-# internal
-trunc-prof = { path = "crates/trunc-prof" }
-trunc-hash = { path = "crates/trunc-hash" }
-trunc-core = { path = "crates/trunc-core" }
-trunc-codec = { path = "crates/trunc-codec" }
-trunc-chunk = { path = "crates/trunc-chunk" }
-trunc-fs = { path = "crates/trunc-fs" }
-trunc-journal = { path = "crates/trunc-journal" }
-trunc-legacy = { path = "crates/trunc-legacy" }
-trunc-engine = { path = "crates/trunc-engine" }
+# internal (exact versions: these crates only promise compatibility with each other at the same version)
+trunc-prof = { path = "crates/trunc-prof", version = "=0.1.0" }
+trunc-hash = { path = "crates/trunc-hash", version = "=0.1.0" }
+trunc-core = { path = "crates/trunc-core", version = "=0.1.0" }
+trunc-codec = { path = "crates/trunc-codec", version = "=0.1.0" }
+trunc-chunk = { path = "crates/trunc-chunk", version = "=0.1.0" }
+trunc-fs = { path = "crates/trunc-fs", version = "=0.1.0" }
+trunc-journal = { path = "crates/trunc-journal", version = "=0.1.0" }
+trunc-legacy = { path = "crates/trunc-legacy", version = "=0.1.0" }
+trunc-engine = { path = "crates/trunc-engine", version = "=0.1.0" }
 trunc-adapter = { path = "crates/trunc-adapter" }
 trunc-testkit = { path = "crates/trunc-testkit" }
 

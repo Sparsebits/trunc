@@ -1,0 +1,16 @@
+pkgbase = trunc-bin
+	pkgdesc = Extract archives bigger than your free space: trunc deletes the archive as it extracts.
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/Sparsebits/trunc
+	arch = x86_64
+	arch = aarch64
+	license = MIT OR Apache-2.0
+	provides = trunc
+	conflicts = trunc
+	source_x86_64 = trunc-0.1.0-x86_64.tar.gz::https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-x86_64-unknown-linux-musl.tar.gz
+	sha256sums_x86_64 = 734676a330c1006394b0aafa9fd5ebce63038e23c7a5c7cfa6f95dd773aa53f5
+	source_aarch64 = trunc-0.1.0-aarch64.tar.gz::https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-aarch64-unknown-linux-musl.tar.gz
+	sha256sums_aarch64 = 20b8dd9620a75437d72528b0b53ea9ac90353bb27a5d1e771b8912cf288d8870
+
+pkgname = trunc-bin

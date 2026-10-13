@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: Sparsebits.trunc
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Sparsebits
+PublisherUrl: https://github.com/Sparsebits
+PackageName: trunc
+PackageUrl: https://github.com/Sparsebits/trunc
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/Sparsebits/trunc/blob/main/LICENSE-MIT
+ShortDescription: Extract archives bigger than your free space: trunc deletes the archive as it extracts.
+Description: |-
+  trunc extracts ZIP, tar, compressed tarballs, ISO images and container images while deleting the
+  archive as it goes, so you only need free space for the extracted files. An interrupted run can
+  be resumed.
+Tags:
+- archive
+- extract
+- unzip
+- tar
+- zip
+- disk-space
+ReleaseNotesUrl: https://github.com/Sparsebits/trunc/releases/tag/v0.1.0
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0
