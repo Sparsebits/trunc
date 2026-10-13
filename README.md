@@ -63,7 +63,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Spa
 The scripts verify the download's SHA-256 (and its [build provenance](docs/security.md#verifying-downloads)
 if the GitHub CLI is installed). Set `TRUNC_VERSION` to pin a version or `TRUNC_INSTALL_DIR` to
 choose where it goes. You can also grab a [release](https://github.com/Sparsebits/trunc/releases)
-or run `cargo install --git https://github.com/Sparsebits/trunc trunc-cli`.
+or run `cargo install trunc-cli`.
 
 ## Quick start
 
