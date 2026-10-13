@@ -8,13 +8,13 @@ Commands:
 Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-x86_64-pc-windows-msvc.zip
-  InstallerSha256: 8F90F6EBA434F8AA2C293CE17F113D1417E49936A1AC1702F4C2B2A498AD7852
+  InstallerSha256: 4A17F18A262A33C35332F74FF21B354BC61B9D72B7582404F1939F6EBD69C34B
   NestedInstallerFiles:
   - RelativeFilePath: trunc-x86_64-pc-windows-msvc\trunc.exe
     PortableCommandAlias: trunc
 - Architecture: arm64
   InstallerUrl: https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-aarch64-pc-windows-msvc.zip
-  InstallerSha256: 344873A6CC887BF3CF30228E4F06E8FE0DCD71A8A7E84BF70D7BAD0F0F6C2E80
+  InstallerSha256: 4CE71969024B3475641CE51D4229CA9EBA0F28971FCDD35339FF232211D6E6BF
   NestedInstallerFiles:
   - RelativeFilePath: trunc-aarch64-pc-windows-msvc\trunc.exe
     PortableCommandAlias: trunc

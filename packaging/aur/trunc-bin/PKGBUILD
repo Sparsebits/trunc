@@ -10,8 +10,8 @@ provides=('trunc')
 conflicts=('trunc')
 source_x86_64=("trunc-$pkgver-x86_64.tar.gz::https://github.com/Sparsebits/trunc/releases/download/v$pkgver/trunc-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("trunc-$pkgver-aarch64.tar.gz::https://github.com/Sparsebits/trunc/releases/download/v$pkgver/trunc-aarch64-unknown-linux-musl.tar.gz")
-sha256sums_x86_64=('734676a330c1006394b0aafa9fd5ebce63038e23c7a5c7cfa6f95dd773aa53f5')
-sha256sums_aarch64=('20b8dd9620a75437d72528b0b53ea9ac90353bb27a5d1e771b8912cf288d8870')
+sha256sums_x86_64=('a7f8e7ff8146761bbac4d91837ba1fb2a1453bafc829e46adcb2913dbae7458a')
+sha256sums_aarch64=('dcce9f348d5b2c48742686396bbfa35d6de25cf265d15b887af9998ff21f5b5e')
 
 package() {
   cd "trunc-$CARCH-unknown-linux-musl"

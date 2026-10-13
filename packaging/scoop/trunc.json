@@ -6,12 +6,12 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-x86_64-pc-windows-msvc.zip",
-            "hash": "8f90f6eba434f8aa2c293ce17f113d1417e49936a1ac1702f4c2b2a498ad7852",
+            "hash": "4a17f18a262a33c35332f74ff21b354bc61b9d72b7582404f1939f6ebd69c34b",
             "extract_dir": "trunc-x86_64-pc-windows-msvc"
         },
         "arm64": {
             "url": "https://github.com/Sparsebits/trunc/releases/download/v0.1.0/trunc-aarch64-pc-windows-msvc.zip",
-            "hash": "344873a6cc887bf3cf30228e4f06e8fe0dcd71a8a7e84bf70d7bad0f0f6c2e80",
+            "hash": "4ce71969024b3475641ce51d4229ca9eba0f28971fcdd35339ff232211d6e6bf",
             "extract_dir": "trunc-aarch64-pc-windows-msvc"
         }
     },
